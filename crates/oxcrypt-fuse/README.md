@@ -250,3 +250,12 @@ MPL-2.0 - see the repository root for details.
 - [oxcrypt-desktop](../oxcrypt-desktop) - Desktop GUI
 - [Cryptomator](https://cryptomator.org/) - The original cross-platform encryption tool
 - [fuser](https://github.com/cberner/fuser) - Rust FUSE library used by this crate
+
+### Large writable files
+
+Writable handles retain the plaintext file in memory for random access. Flush snapshots
+share that allocation; a concurrent modification can require a copy. GCM writes of at
+least 1 MiB stream encrypted chunks to an atomic replacement file, avoiding a second
+whole-file ciphertext allocation. This reduces flush memory overhead, but does not make
+random-access writes constant-memory or eliminate whole-file rewrite I/O. Read-only
+handles use streaming reads. Benchmark representative file sizes before deployment.

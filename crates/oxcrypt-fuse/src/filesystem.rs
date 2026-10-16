@@ -157,7 +157,7 @@ fn read_result<T>(
 fn persist_write_buffer(
     handles: &FuseHandleTable,
     fh: u64,
-    persist: impl FnOnce(DirId, String, Vec<u8>) -> Result<PathBuf, c_int>,
+    persist: impl FnOnce(DirId, String, Arc<Vec<u8>>) -> Result<PathBuf, c_int>,
 ) -> Result<Option<(PathBuf, bool)>, c_int> {
     let mut handle = handles.get_mut(&fh).ok_or(libc::EBADF)?;
     let Some(buffer) = handle.as_write_buffer_mut().filter(|b| b.is_dirty()) else {
@@ -166,7 +166,7 @@ fn persist_write_buffer(
     let revision = buffer.revision();
     let dir_id = buffer.dir_id().clone();
     let name = buffer.filename().to_owned();
-    let content = buffer.content().to_vec();
+    let content = buffer.snapshot();
     drop(handle);
 
     let path = persist(dir_id, name, content)?;
@@ -5478,7 +5478,7 @@ mod tests {
             let (handles, fh) = dirty_handle();
             assert_eq!(
                 persist_write_buffer(&handles, fh, |_, _, content| {
-                    assert_eq!(content, b"important note");
+                    assert_eq!(content.as_slice(), b"important note");
                     Err(errno)
                 }),
                 Err(errno)
@@ -5490,7 +5490,7 @@ mod tests {
                 assert_eq!(buffer.content(), b"important note");
             }
             let result = persist_write_buffer(&handles, fh, |_, _, content| {
-                assert_eq!(content, b"important note");
+                assert_eq!(content.as_slice(), b"important note");
                 Ok(PathBuf::from("persisted.c9r"))
             })
             .unwrap();
@@ -5509,7 +5509,7 @@ mod tests {
         let result = persist_write_buffer(&handles, fh, |_, _, snapshot| {
             let mut handle = handles.get_mut(&fh).unwrap();
             handle.as_write_buffer_mut().unwrap().write(0, b"updated");
-            assert_eq!(snapshot, b"important note");
+            assert_eq!(snapshot.as_slice(), b"important note");
             Ok(PathBuf::from("persisted.c9r"))
         })
         .unwrap();

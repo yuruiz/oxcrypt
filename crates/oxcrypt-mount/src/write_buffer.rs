@@ -1,8 +1,8 @@
 //! Write buffer for random-access writes to vault files.
 //!
 //! This module provides a buffer for handling random-access writes to vault files.
-//! Since the underlying vault format uses AES-GCM with chunk numbers in AAD,
-//! chunks cannot be modified individually - the entire file must be rewritten.
+//! This buffer keeps an entire plaintext file in memory and commits it using
+//! atomic replacement. Flush snapshots share storage until a concurrent write.
 //!
 //! The [`WriteBuffer`] implements a read-modify-write pattern:
 //! 1. On open (without truncate): existing content is read into memory
@@ -10,11 +10,11 @@
 //! 3. On release: if modified, the entire buffer is written back to the vault
 
 use oxcrypt_core::vault::DirId;
+use std::sync::Arc;
 
 /// A buffer for random-access writes to vault files.
 ///
-/// This implements the read-modify-write pattern required because the vault's
-/// authenticated encryption (AES-GCM with chunk numbers) prevents in-place updates.
+/// This implements whole-file read-modify-write with copy-on-write snapshots.
 ///
 /// # Example
 ///
@@ -36,7 +36,7 @@ use oxcrypt_core::vault::DirId;
 #[derive(Debug)]
 pub struct WriteBuffer {
     /// The buffered file content.
-    content: Vec<u8>,
+    content: Arc<Vec<u8>>,
     /// Whether the buffer has been modified since creation.
     dirty: bool,
     /// Changes whenever buffered data changes.
@@ -57,7 +57,7 @@ impl WriteBuffer {
     /// * `existing_content` - Current file content, or empty for new files
     pub fn new(dir_id: DirId, filename: String, existing_content: Vec<u8>) -> Self {
         Self {
-            content: existing_content,
+            content: Arc::new(existing_content),
             dirty: false,
             revision: 0,
             dir_id,
@@ -82,7 +82,7 @@ impl WriteBuffer {
     /// * `capacity` - Expected maximum size of the file
     pub fn with_capacity(dir_id: DirId, filename: String, capacity: usize) -> Self {
         Self {
-            content: Vec::with_capacity(capacity),
+            content: Arc::new(Vec::with_capacity(capacity)),
             revision: 0,
             dirty: true, // New file needs to be written
             dir_id,
@@ -96,7 +96,7 @@ impl WriteBuffer {
     /// is written to the vault even if empty (creating an empty file).
     pub fn new_for_create(dir_id: DirId, filename: String) -> Self {
         Self {
-            content: Vec::new(),
+            content: Arc::new(Vec::new()),
             revision: 0,
             dirty: true, // Must write to create the file
             dir_id,
@@ -122,18 +122,19 @@ impl WriteBuffer {
         let offset = offset as usize;
         let end = offset + data.len();
 
+        let content = Arc::make_mut(&mut self.content);
         // Expand buffer if needed, using geometric growth to reduce reallocations
-        if end > self.content.len() {
+        if end > content.len() {
             // Use 1.5x growth factor, but at least fit the required end position
-            let new_capacity = std::cmp::max(end, (self.content.capacity() * 3) / 2);
-            if new_capacity > self.content.capacity() {
-                self.content.reserve(new_capacity - self.content.capacity());
+            let new_capacity = std::cmp::max(end, (content.capacity() * 3) / 2);
+            if new_capacity > content.capacity() {
+                content.reserve(new_capacity - content.len());
             }
-            self.content.resize(end, 0);
+            content.resize(end, 0);
         }
 
         // Copy data into buffer
-        self.content[offset..end].copy_from_slice(data);
+        content[offset..end].copy_from_slice(data);
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
 
@@ -164,7 +165,7 @@ impl WriteBuffer {
         #[allow(clippy::cast_possible_truncation)]
         let size = size as usize;
         if size != self.content.len() {
-            self.content.resize(size, 0);
+            Arc::make_mut(&mut self.content).resize(size, 0);
             self.dirty = true;
             self.revision = self.revision.wrapping_add(1);
         }
@@ -220,11 +221,17 @@ impl WriteBuffer {
         &self.content
     }
 
+    /// Share a stable flush snapshot without copying the entire plaintext.
+    /// Writes during a flush use copy-on-write to preserve the snapshot.
+    pub fn snapshot(&self) -> Arc<Vec<u8>> {
+        Arc::clone(&self.content)
+    }
+
     /// Consume the buffer and return its content.
     ///
     /// Use this when writing the buffer back to the vault.
     pub fn into_content(self) -> Vec<u8> {
-        self.content
+        Arc::unwrap_or_clone(self.content)
     }
 
     /// Mark the buffer as clean (after successful write-back).
@@ -249,7 +256,7 @@ impl WriteBuffer {
     /// multiple times before `release`. It avoids a full Vec copy.
     #[inline]
     pub fn take_content_for_flush(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.content)
+        Arc::unwrap_or_clone(std::mem::take(&mut self.content))
     }
 
     /// Restore content after a successful flush.
@@ -257,7 +264,7 @@ impl WriteBuffer {
     /// This puts the content back and marks the buffer as clean.
     #[inline]
     pub fn restore_content(&mut self, content: Vec<u8>) {
-        self.content = content;
+        self.content = Arc::new(content);
         self.revision = self.revision.wrapping_add(1);
         self.dirty = false;
     }
@@ -265,10 +272,21 @@ impl WriteBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::write_buffer::*;
 
     fn test_dir_id() -> DirId {
         DirId::from_raw("test-dir-id")
+    }
+
+    #[test]
+    fn snapshot_shares_storage_until_a_concurrent_write() {
+        let mut buffer = WriteBuffer::new(test_dir_id(), "large".into(), vec![7; 4 * 1024 * 1024]);
+        let snapshot = buffer.snapshot();
+        assert_eq!(snapshot.as_ptr(), buffer.content().as_ptr());
+        buffer.write(1024, &[9]);
+        assert_eq!(snapshot[1024], 7);
+        assert_eq!(buffer.content()[1024], 9);
+        assert_ne!(snapshot.as_ptr(), buffer.content().as_ptr());
     }
 
     #[test]
@@ -598,7 +616,7 @@ mod tests {
 /// These catch edge cases that manual tests miss by generating random inputs.
 #[cfg(test)]
 mod proptest_tests {
-    use super::*;
+    use crate::write_buffer::*;
     use proptest::prelude::*;
 
     fn test_dir_id() -> DirId {

@@ -1874,6 +1874,29 @@ impl VaultOperationsAsync {
     ) -> Result<PathBuf, VaultWriteError> {
         info!("Writing file to vault");
 
+        // Bound additional ciphertext memory for large GCM writes. The streaming
+        // writer commits by rename and holds the same directory/file locks.
+        if content.len() >= 1024 * 1024 && self.core.cipher_combo() == CipherCombo::SivGcm {
+            let mut writer = self.create_file(dir_id, filename).await?;
+            let context = VaultOpContext::new()
+                .with_dir_id(dir_id.as_str())
+                .with_filename(filename);
+            writer
+                .write(content)
+                .await
+                .map_err(|source| VaultWriteError::Streaming {
+                    source: Box::new(source),
+                    context: context.clone().into_box(),
+                })?;
+            return writer
+                .finish()
+                .await
+                .map_err(|source| VaultWriteError::Streaming {
+                    source: Box::new(source),
+                    context: context.into_box(),
+                });
+        }
+
         // Acquire locks in consistent order: directory first, then file.
         //
         // Note: We always acquire the directory write lock even for overwrites. While we could

@@ -1478,3 +1478,27 @@ async fn test_streaming_binary_data_with_null_bytes() {
         "Binary data with null bytes should roundtrip correctly"
     );
 }
+
+#[tokio::test]
+async fn large_buffered_write_and_partial_streaming_chunks_roundtrip() {
+    let (_path, ops) = setup_vault();
+    let root = DirId::root();
+    let content: Vec<u8> = (0..(2 * 1024 * 1024 + 123))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    for name in ["large.bin".to_owned(), "long".repeat(60)] {
+        ops.write_file(&root, &name, b"old data").await.unwrap();
+        let path = ops.write_file(&root, &name, &content).await.unwrap();
+        let sync = ops.as_sync().unwrap();
+        assert_eq!(sync.read_file(&root, &name).unwrap().content, content);
+        assert!(path.exists());
+    }
+    let mut writer = ops.create_file(&root, "split.bin").await.unwrap();
+    writer.write(&content[..17]).await.unwrap();
+    writer.write(&content[17..]).await.unwrap();
+    writer.finish().await.unwrap();
+    assert_eq!(
+        ops.read_file(&root, "split.bin").await.unwrap().content,
+        content
+    );
+}
