@@ -136,6 +136,9 @@ jobs:
             --exclude oxcrypt-fskit \
             --exclude DELETED \
             --exclude oxcrypt-desktop
+      - name: Run FUSE and write-buffer regressions (macOS, no mounts)
+        if: runner.os == 'macOS'
+        run: cargo nextest run --locked -p oxcrypt-fuse -p oxcrypt-mount --lib --no-default-features
       - name: Run unit tests (Windows, --profile unit)
         if: runner.os == 'Windows'
         # Additionally exclude FUSE (fuser is unix-only) and oxcrypt-bench
@@ -152,7 +155,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: junit-unit-${{ matrix.os }}
-          path: target/nextest/unit/junit.xml
+          path: |
+            target/nextest/unit/junit.xml
+            target/nextest/default/junit.xml
 
   # =============================================================================
   # Integration Tests - Linux
