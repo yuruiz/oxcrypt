@@ -11,7 +11,7 @@ keywords = ["cryptomator", "fuse", "encryption", "filesystem"]
 categories = ["filesystem", "cryptography"]
 
 [lib]
-test = false
+test = true
 
 [[bin]]
 name = "oxmount"

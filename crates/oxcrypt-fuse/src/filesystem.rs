@@ -141,6 +141,32 @@ const DEFAULT_FILE_PERM: u16 = 0o644;
 /// Default directory permissions (rwxr-xr-x).
 const DEFAULT_DIR_PERM: u16 = 0o755;
 
+/// Keep the authoritative buffer available until persistence succeeds. A timeout
+/// can drop the future, so recovery must not depend on that future returning data.
+fn persist_write_buffer(
+    handles: &FuseHandleTable,
+    fh: u64,
+    persist: impl FnOnce(DirId, String, Vec<u8>) -> Result<PathBuf, c_int>,
+) -> Result<Option<(PathBuf, bool)>, c_int> {
+    let mut handle = handles.get_mut(&fh).ok_or(libc::EBADF)?;
+    let Some(buffer) = handle.as_write_buffer_mut().filter(|b| b.is_dirty()) else {
+        return Ok(None);
+    };
+    let revision = buffer.revision();
+    let dir_id = buffer.dir_id().clone();
+    let name = buffer.filename().to_owned();
+    let content = buffer.content().to_vec();
+    drop(handle);
+
+    let path = persist(dir_id, name, content)?;
+    let clean = handles.get_mut(&fh).is_some_and(|mut handle| {
+        handle
+            .as_write_buffer_mut()
+            .is_some_and(|buffer| buffer.mark_clean_if_revision(revision))
+    });
+    Ok(Some((path, clean)))
+}
+
 struct HazardousHandler {
     /// Sync vault operations for direct blocking I/O in executor threads.
     /// Per the runtime spec, executor threads should NOT use tokio.
@@ -330,49 +356,25 @@ impl HazardousHandler {
     }
 
     fn flush_handle(&self, ino: u64, fh: u64) -> Result<Option<PathBuf>, c_int> {
-        let mut handle = self.handle_table.get_mut(&fh).ok_or(libc::EBADF)?;
-
-        if let Some(buffer) = handle.as_write_buffer_mut()
-            && buffer.is_dirty()
-        {
-            let ops = Arc::clone(&self.ops);
-            let dir_id = buffer.dir_id().clone();
-            let filename = buffer.filename().to_string();
-            let content = buffer.take_content_for_flush();
-            drop(handle);
-
-            let write_result = self.exec_with_timeout(
-                async move {
-                    ops.write_file(&dir_id, &filename, &content)
-                        .await
-                        .map(|path| (path, content))
-                },
+        let ops = Arc::clone(&self.ops);
+        let result = persist_write_buffer(&self.handle_table, fh, |dir_id, filename, content| {
+            self.exec_with_timeout(
+                async move { ops.write_file(&dir_id, &filename, &content).await },
                 self.write_timeout,
-            );
-
-            match write_result {
-                Ok(Ok((encrypted_path, returned_content))) => {
-                    if let Some(mut handle) = self.handle_table.get_mut(&fh)
-                        && let Some(buffer) = handle.as_write_buffer_mut()
-                    {
-                        buffer.restore_content(returned_content);
-                    }
-                    if let Some(ref shared) = self.scheduler_shared {
-                        shared.release_all_file_write_bytes(ino);
-                        shared.invalidate_read_cache_inode(ino);
-                    }
-                    self.attr_cache.invalidate(ino);
-                    return Ok(Some(encrypted_path));
-                }
-                Ok(Err(write_err)) => {
-                    return Err(crate::error::write_error_to_errno(&write_err));
-                }
-                Err(exec_err) => {
-                    return Err(exec_err.to_errno());
-                }
+            )
+            .map_err(|error| error.to_errno())?
+            .map_err(|error| crate::error::write_error_to_errno(&error))
+        })?;
+        if let Some((path, clean)) = result {
+            if clean && let Some(ref shared) = self.scheduler_shared {
+                shared.release_all_file_write_bytes(ino);
             }
+            if let Some(ref shared) = self.scheduler_shared {
+                shared.invalidate_read_cache_inode(ino);
+            }
+            self.attr_cache.invalidate(ino);
+            return Ok(Some(path));
         }
-
         Ok(None)
     }
 
@@ -1239,64 +1241,25 @@ impl CryptomatorFS {
     /// - `Err(errno)` on write failure
     #[allow(dead_code)]
     fn flush_handle(&self, ino: u64, fh: u64) -> Result<Option<PathBuf>, c_int> {
-        let mut handle = self.handle_table.get_mut(&fh).ok_or(libc::EBADF)?;
-
-        if let Some(buffer) = handle.as_write_buffer_mut()
-            && buffer.is_dirty()
-        {
-            let ops = self.ops_clone();
-            let dir_id = buffer.dir_id().clone();
-            let filename = buffer.filename().to_string();
-
-            // Move content out instead of copying (optimization)
-            let content = buffer.take_content_for_flush();
-
-            // Drop the handle lock before blocking I/O
-            drop(handle);
-
-            // Write to vault with extended timeout (5 minutes).
-            // Data operations get longer timeout than metadata ops to avoid data loss.
-            let write_result = self.exec_with_timeout(
-                async move {
-                    ops.write_file(&dir_id, &filename, &content)
-                        .await
-                        .map(|path| (path, content)) // Return both path and content
-                },
+        let ops = self.ops_clone();
+        let result = persist_write_buffer(&self.handle_table, fh, |dir_id, filename, content| {
+            self.exec_with_timeout(
+                async move { ops.write_file(&dir_id, &filename, &content).await },
                 self.write_timeout,
-            );
-
-            // Handle the result
-            match write_result {
-                Ok(Ok((encrypted_path, returned_content))) => {
-                    // Success - restore the (now clean) content
-                    if let Some(mut handle) = self.handle_table.get_mut(&fh)
-                        && let Some(buffer) = handle.as_write_buffer_mut()
-                    {
-                        buffer.restore_content(returned_content);
-                    }
-
-                    // Release all tracked write budget now that data is persisted.
-                    // We must release exactly what was tracked (via add_write_bytes),
-                    // not the full content_len, to prevent counter underflow when
-                    // a buffer accumulates writes across multiple flush cycles.
-                    if let Some(ref scheduler) = self.scheduler {
-                        scheduler.release_all_file_write_bytes(ino);
-                    }
-
-                    self.attr_cache.invalidate(ino);
-                    return Ok(Some(encrypted_path));
+            )
+            .map_err(|error| error.to_errno())?
+            .map_err(|error| crate::error::write_error_to_errno(&error))
+        })?;
+        if let Some((path, clean)) = result {
+            if let Some(ref scheduler) = self.scheduler {
+                if clean {
+                    scheduler.release_all_file_write_bytes(ino);
                 }
-                Ok(Err(write_err)) => {
-                    // Write error - can't restore content (was consumed)
-                    return Err(crate::error::write_error_to_errno(&write_err));
-                }
-                Err(exec_err) => {
-                    // Executor error (timeout, queue full, etc.)
-                    return Err(exec_err.to_errno());
-                }
+                scheduler.invalidate_read_cache_inode(ino);
             }
+            self.attr_cache.invalidate(ino);
+            return Ok(Some(path));
         }
-        // Readers or clean buffers don't need flushing
         Ok(None)
     }
 
@@ -2964,66 +2927,19 @@ impl Filesystem for CryptomatorFS {
                         // causing SIGBUS when applications (like SQLite WAL) mmap the
                         // extended region.
                         if new_size > old_size {
-                            // Take content for flush - resize to new_size before writing
-                            // so the file on disk matches what we report to the kernel.
-                            // This is critical for mmap consistency.
-                            let mut content = buffer.take_content_for_flush();
-                            // On 32-bit: file sizes beyond 4GB would fail earlier in allocation
-                            #[allow(clippy::cast_possible_truncation)]
-                            content.resize(new_size as usize, 0);
-                            let content_for_write = content.clone();
-                            let dir_id_write = dir_id.clone();
-                            let name_write = name.clone();
                             drop(handle);
-
-                            let ops = self.ops_clone();
-                            match self.exec(async move {
-                                ops.write_file(&dir_id_write, &name_write, &content_for_write)
-                                    .await
-                            }) {
-                                Ok(Ok(_)) => {
-                                    // Restore resized content and mark clean
-                                    if let Some(mut handle) = self.handle_table.get_mut(&fh)
-                                        && let Some(buffer) = handle.as_write_buffer_mut()
-                                    {
-                                        buffer.restore_content(content);
-                                    }
-                                    // Track buffer size for mmap consistency
+                            match self.flush_handle(ino, fh) {
+                                Ok(_) => {
                                     self.update_buffer_size(ino, new_size);
-                                    // Just modified file, so mtime = now is correct
                                     let attr = self.make_file_attr(ino, new_size, None);
                                     self.attr_cache.insert(ino, attr);
-                                    if let Some(ref scheduler) = self.scheduler {
-                                        scheduler.invalidate_read_cache_inode(ino);
-                                    }
                                     self.vault_stats.record_metadata_latency(start.elapsed());
-                                    // Use zero TTL - file has active buffer, kernel must not cache size
                                     reply.attr(&Duration::ZERO, &attr);
                                 }
-                                Ok(Err(e)) => {
-                                    // Restore content but mark dirty for retry
-                                    if let Some(mut handle) = self.handle_table.get_mut(&fh)
-                                        && let Some(buffer) = handle.as_write_buffer_mut()
-                                    {
-                                        buffer.restore_content(content);
-                                        buffer.mark_dirty();
-                                    }
+                                Err(errno) => {
                                     self.vault_stats.record_error();
                                     self.vault_stats.record_metadata_latency(start.elapsed());
-                                    reply.error(fuser::Errno::from_i32(
-                                        crate::error::write_error_to_errno(&e),
-                                    ));
-                                }
-                                Err(exec_err) => {
-                                    if let Some(mut handle) = self.handle_table.get_mut(&fh)
-                                        && let Some(buffer) = handle.as_write_buffer_mut()
-                                    {
-                                        buffer.restore_content(content);
-                                        buffer.mark_dirty();
-                                    }
-                                    self.vault_stats.record_error();
-                                    self.vault_stats.record_metadata_latency(start.elapsed());
-                                    reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
+                                    reply.error(fuser::Errno::from_i32(errno));
                                 }
                             }
                             return;
@@ -5486,7 +5402,63 @@ impl Filesystem for CryptomatorFS {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::filesystem::*;
+
+    fn dirty_handle() -> (FuseHandleTable, u64) {
+        let handles = FuseHandleTable::new_auto_id();
+        let mut buffer = WriteBuffer::new_for_create(DirId::root(), "note.md".into());
+        buffer.write(0, b"important note");
+        let fh = handles.insert_auto(FuseHandle::WriteBuffer(buffer));
+        (handles, fh)
+    }
+
+    #[test]
+    fn failed_flush_preserves_data_for_retry() {
+        for errno in [libc::ENOSPC, libc::EIO, libc::ETIMEDOUT, libc::ECANCELED] {
+            let (handles, fh) = dirty_handle();
+            assert_eq!(
+                persist_write_buffer(&handles, fh, |_, _, content| {
+                    assert_eq!(content, b"important note");
+                    Err(errno)
+                }),
+                Err(errno)
+            );
+            {
+                let mut handle = handles.get_mut(&fh).unwrap();
+                let buffer = handle.as_write_buffer_mut().unwrap();
+                assert!(buffer.is_dirty());
+                assert_eq!(buffer.content(), b"important note");
+            }
+            let result = persist_write_buffer(&handles, fh, |_, _, content| {
+                assert_eq!(content, b"important note");
+                Ok(PathBuf::from("persisted.c9r"))
+            })
+            .unwrap();
+            assert_eq!(result, Some((PathBuf::from("persisted.c9r"), true)));
+            assert!(
+                persist_write_buffer(&handles, fh, |_, _, _| panic!("clean buffer"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn flush_completion_preserves_concurrent_write() {
+        let (handles, fh) = dirty_handle();
+        let result = persist_write_buffer(&handles, fh, |_, _, snapshot| {
+            let mut handle = handles.get_mut(&fh).unwrap();
+            handle.as_write_buffer_mut().unwrap().write(0, b"updated");
+            assert_eq!(snapshot, b"important note");
+            Ok(PathBuf::from("persisted.c9r"))
+        })
+        .unwrap();
+        assert_eq!(result.unwrap().1, false);
+        let mut handle = handles.get_mut(&fh).unwrap();
+        let buffer = handle.as_write_buffer_mut().unwrap();
+        assert!(buffer.is_dirty());
+        assert_eq!(buffer.content(), b"updatednt note");
+    }
 
     #[test]
     fn test_notifier_cell_initially_empty() {
