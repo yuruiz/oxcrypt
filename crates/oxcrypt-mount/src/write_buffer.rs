@@ -126,8 +126,9 @@ impl WriteBuffer {
         // Expand buffer if needed, using geometric growth to reduce reallocations
         if end > content.len() {
             // Use 1.5x growth factor, but at least fit the required end position
-            let new_capacity = std::cmp::max(end, (content.capacity() * 3) / 2);
-            if new_capacity > content.capacity() {
+            if end > content.capacity() {
+                let new_capacity =
+                    end.max(content.capacity().saturating_add(content.capacity() / 2));
                 content.reserve(new_capacity - content.len());
             }
             content.resize(end, 0);
@@ -276,6 +277,23 @@ mod tests {
 
     fn test_dir_id() -> DirId {
         DirId::from_raw("test-dir-id")
+    }
+
+    #[test]
+    fn sequential_small_writes_keep_capacity_proportional_to_data() {
+        let mut buffer = WriteBuffer::new_for_create(test_dir_id(), "large".into());
+        let chunk = vec![7; 16 * 1024];
+        for index in 0..128 {
+            buffer.write(index * chunk.len() as u64, &chunk);
+            assert!(
+                buffer.content.capacity() <= buffer.content.len() * 3,
+                "capacity {} is excessive for {} bytes",
+                buffer.content.capacity(),
+                buffer.content.len()
+            );
+        }
+        assert_eq!(buffer.len(), 2 * 1024 * 1024);
+        assert!(buffer.content().iter().all(|byte| *byte == 7));
     }
 
     #[test]
