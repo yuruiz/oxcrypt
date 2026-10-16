@@ -6063,6 +6063,7 @@ dependencies = [
  "parking_lot",
  "plotters",
  "rfd 0.16.0",
+ "security-framework",
  "serde",
  "serde_json",
  "tempfile",
@@ -6073,6 +6074,7 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -10899,9 +10901,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.0"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
  "zeroize_derive",
 ]

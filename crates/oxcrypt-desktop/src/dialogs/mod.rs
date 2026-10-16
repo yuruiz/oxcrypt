@@ -21,4 +21,4 @@ pub use confirm_dialog::ConfirmDialog;
 pub use create_vault_dialog::CreateVaultDialog;
 pub use error_dialog::ErrorDialog;
 pub use force_lock_dialog::ForceLockDialog;
-pub use unlock_dialog::UnlockDialog;
+pub use unlock_dialog::{UnlockDialog, UnlockRequest};

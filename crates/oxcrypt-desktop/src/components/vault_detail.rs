@@ -20,7 +20,7 @@ use crate::app::open_stats_window;
 use crate::backend::{MountOptions, generate_mountpoint, mount_manager};
 use crate::dialogs::{
     BackendDialog, ChangePasswordDialog, ConfirmDialog, ErrorDialog, ForceLockDialog, UnlockDialog,
-    VaultMountSettings,
+    UnlockRequest, VaultMountSettings,
 };
 use crate::error::UserFacingError;
 use crate::state::{VaultState, use_app_state};
@@ -81,7 +81,9 @@ pub fn VaultDetail(
         let vault_id = vault_id.clone();
         let vault_path = vault_path.clone();
         let vault_name = vault_name.clone();
-        move |password: String| {
+        move |request: UnlockRequest| {
+            let password = request.password;
+            let remember = request.remember;
             tracing::info!("[UNLOCK] handle_password_submit callback invoked");
             let vault_id = vault_id.clone();
             let vault_path = vault_path.clone();
@@ -206,19 +208,34 @@ pub fn VaultDetail(
                 // Run mount in blocking task using the vault's preferred backend
                 // Use vault_id as the key for mount tracking (must match unmount calls)
                 let result = tokio::task::spawn_blocking(move || {
-                    manager.mount_with_backend_and_options(
-                        &vault_id,
-                        &vault_path,
-                        &password,
-                        &mountpoint,
-                        preferred_backend,
-                        &mount_options,
-                    )
+                    manager
+                        .mount_with_backend_and_options(
+                            &vault_id,
+                            &vault_path,
+                            &password,
+                            &mountpoint,
+                            preferred_backend,
+                            &mount_options,
+                        )
+                        .map(|mountpoint| {
+                            let keychain_error = if remember {
+                                crate::keychain::store(&vault_id, &password).err()
+                            } else {
+                                None
+                            };
+                            (mountpoint, keychain_error)
+                        })
                 })
                 .await;
 
                 match result {
-                    Ok(Ok(mp)) => {
+                    Ok(Ok((mp, keychain_error))) => {
+                        if let Some(error) = keychain_error {
+                            error_state.set(Some(UserFacingError::new(
+                                "Vault unlocked, password not saved",
+                                error,
+                            )));
+                        }
                         tracing::info!("Vault {} mounted at {}", vault_id_for_log, mp.display());
                         let mountpoint = mp.clone();
                         app_state.write().set_vault_state(
@@ -587,6 +604,7 @@ pub fn VaultDetail(
         if show_unlock_dialog() {
             UnlockDialog {
                 key: "{vault_id}-unlock-dialog",
+                vault_id: vault_id.clone(),
                 vault_name: vault_name.clone(),
                 unlock_result: unlock_result(),
                 on_unlock: handle_password_submit,
@@ -701,14 +719,21 @@ pub fn VaultDetail(
             {
                 let vault_path_for_change = vault_path.clone();
                 let vault_name_for_change = vault_name.clone();
+                let keychain_id = vault_id.clone();
                 rsx! {
                     ChangePasswordDialog {
                         vault_path: vault_path_for_change,
                         vault_name: vault_name_for_change,
                         on_complete: move |()| {
                             show_change_password.set(false);
-                            // Show success message (optional)
-                            tracing::info!("Password changed successfully");
+                            let account = keychain_id.clone();
+                            spawn(async move {
+                                match tokio::task::spawn_blocking(move || crate::keychain::forget(&account)).await {
+                                    Ok(Ok(())) => {}
+                                    _ => error_state.set(Some(UserFacingError::new("Password changed",
+                                        "The old saved password could not be removed. Use Forget saved password before unlocking again."))),
+                                }
+                            });
                         },
                         on_cancel: move |()| {
                             show_change_password.set(false);
@@ -731,17 +756,26 @@ pub fn VaultDetail(
                         confirm_label: "Remove",
                         danger: true,
                         on_confirm: move |()| {
-                            // Remove the vault from state
-                            app_state.write().remove_vault(&vault_id_for_remove);
-                            // Save to disk
-                            if let Err(e) = app_state.read().save() {
-                                tracing::error!("Failed to save config: {}", e);
-                            }
-                            show_remove_confirm.set(false);
-                            // Notify parent to clear selection
-                            if let Some(handler) = &on_removed {
-                                handler.call(());
-                            }
+                            let account = vault_id_for_remove.clone();
+                            spawn(async move {
+                                let keychain_account = account.clone();
+                                match tokio::task::spawn_blocking(move || crate::keychain::forget(&keychain_account)).await {
+                                    Ok(Ok(())) => {}
+                                    _ => {
+                                        error_state.set(Some(UserFacingError::new("Couldn't Remove Vault",
+                                            "Could not remove its saved password from Keychain. Try again after unlocking Keychain.")));
+                                        return;
+                                    }
+                                }
+                                app_state.write().remove_vault(&account);
+                                if let Err(error) = app_state.read().save() {
+                                    tracing::error!("Failed to save config: {}", error);
+                                }
+                                show_remove_confirm.set(false);
+                                if let Some(handler) = &on_removed {
+                                    handler.call(());
+                                }
+                            });
                         },
                         on_cancel: move |()| {
                             show_remove_confirm.set(false);
