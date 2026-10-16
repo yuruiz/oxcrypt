@@ -3839,9 +3839,7 @@ impl Filesystem for CryptomatorFS {
     ///
     /// # Implementation Notes
     ///
-    /// - On macOS, first cleans up AppleDouble files (`._*`) and `.DS_Store`
-    ///   that Finder creates automatically. These prevent rmdir from succeeding
-    ///   with ENOTEMPTY even though user sees directory as empty.
+    /// - Preserves all directory entries, including AppleDouble metadata, on failure
     /// - Delegates to vault's `delete_directory` which checks for empty
     /// - Invalidates path mapping and parent's directory cache
     fn rmdir(
@@ -3881,89 +3879,8 @@ impl Filesystem for CryptomatorFS {
         let parent_path = parent_entry.path.clone();
         drop(parent_entry);
 
-        // On macOS, clean up AppleDouble files before attempting directory deletion.
-        // Finder automatically creates ._* (AppleDouble resource forks) and .DS_Store
-        // files in directories. These must be deleted first or rmdir fails with ENOTEMPTY.
-        #[cfg(target_os = "macos")]
-        {
-            // First, find the target directory to get its DirId
-            let ops = self.ops_clone();
-            let parent_dir_id_clone = parent_dir_id.clone();
-            let name_owned = name_str.to_string();
-
-            let target_dir_id = match self
-                .exec(async move { ops.find_directory(&parent_dir_id_clone, &name_owned).await })
-            {
-                Ok(Ok(Some(dir_info))) => dir_info.directory_id,
-                Ok(Ok(None)) => {
-                    self.vault_stats.record_error();
-                    self.vault_stats.record_metadata_latency(start.elapsed());
-                    reply.error(fuser::Errno::from_i32(libc::ENOENT));
-                    return;
-                }
-                Ok(Err(e)) => {
-                    self.vault_stats.record_error();
-                    self.vault_stats.record_metadata_latency(start.elapsed());
-                    reply.error(fuser::Errno::from_i32(crate::error::vault_error_to_errno(
-                        &e,
-                    )));
-                    return;
-                }
-                Err(exec_err) => {
-                    self.vault_stats.record_error();
-                    self.vault_stats.record_metadata_latency(start.elapsed());
-                    reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
-                    return;
-                }
-            };
-
-            // List files in the target directory and delete AppleDouble/DS_Store files
-            let ops = self.ops_clone();
-            let target_dir_id_clone = target_dir_id.clone();
-
-            let files_to_delete: Vec<String> = match self
-                .exec(async move { ops.list_files(&target_dir_id_clone).await })
-            {
-                Ok(Ok(files)) => files
-                    .into_iter()
-                    .filter(|f| f.name.starts_with("._") || f.name == ".DS_Store")
-                    .map(|f| f.name)
-                    .collect(),
-                Ok(Err(e)) => {
-                    // If we can't list files, try delete_directory anyway - it will fail with
-                    // ENOTEMPTY if there are actually files present
-                    debug!(error = %e, "Failed to list files for AppleDouble cleanup, continuing with rmdir");
-                    Vec::new()
-                }
-                Err(exec_err) => {
-                    debug!(error = %exec_err, "Exec error listing files for AppleDouble cleanup, continuing with rmdir");
-                    Vec::new()
-                }
-            };
-
-            // Delete each AppleDouble file
-            for file_name in files_to_delete {
-                let ops = self.ops_clone();
-                let target_dir_id_clone = target_dir_id.clone();
-                let file_name_clone = file_name.clone();
-
-                match self.exec(async move {
-                    ops.delete_file(&target_dir_id_clone, &file_name_clone)
-                        .await
-                }) {
-                    Ok(Ok(())) => {
-                        trace!(file = %file_name, "Deleted AppleDouble file before rmdir");
-                    }
-                    Ok(Err(e)) => {
-                        // Log but continue - the file might have been deleted concurrently
-                        debug!(file = %file_name, error = %e, "Failed to delete AppleDouble file");
-                    }
-                    Err(exec_err) => {
-                        debug!(file = %file_name, error = %exec_err, "Exec error deleting AppleDouble file");
-                    }
-                }
-            }
-        }
+        // AppleDouble files contain user metadata. Like all directory entries,
+        // they must be removed explicitly before rmdir can succeed.
 
         let ops = self.ops_clone();
         let parent_dir_id_clone = parent_dir_id.clone();
@@ -5358,8 +5275,8 @@ impl Filesystem for CryptomatorFS {
 
     // ==================== Extended Attributes ====================
     //
-    // Cryptomator vaults do not store extended attributes.
-    // Return ENOTSUP for all xattr operations.
+    // Vault Format 8 has no native xattr records. ENOTSUP lets macFUSE store
+    // attributes in AppleDouble sidecars, encrypted as ordinary vault files.
 
     fn getxattr(
         &self,

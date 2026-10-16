@@ -234,7 +234,7 @@ This implementation follows the [Cryptomator Security Architecture](https://docs
 
 ## Limitations
 
-- **No xattr support**: Extended attributes are not supported (returns ENOTSUP)
+- **Extended attributes**: macOS uses macFUSE AppleDouble (`._`) sidecars for Finder tags and Finder Info. Sidecars are encrypted as ordinary vault files and must be included in backups. Other platforms do not expose these as native xattrs.
 - **Single vault**: Each mount handles one vault; multiple mounts needed for multiple vaults
 - **No hard links**: Cryptomator format doesn't support hard links
 
@@ -259,3 +259,10 @@ least 1 MiB stream encrypted chunks to an atomic replacement file, avoiding a se
 whole-file ciphertext allocation. This reduces flush memory overhead, but does not make
 random-access writes constant-memory or eliminate whole-file rewrite I/O. Read-only
 handles use streaming reads. Benchmark representative file sizes before deployment.
+
+The mount does not enable `noappledouble` or `noapplexattr`: blocking sidecars would
+break Finder metadata and some file-copy operations. No new vault format is introduced.
+The `auto_xattr` option directs macFUSE to handle attributes through sidecars.
+Resource-fork writes through `xattr` returned `EINVAL` on macOS 27.0.1 with macFUSE
+5.4.0 during validation; resource-fork compatibility is not guaranteed by this backend.
+See [macFUSE mount options](https://github.com/macfuse/macfuse/wiki/Mount-Options).
