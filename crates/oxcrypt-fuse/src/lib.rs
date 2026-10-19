@@ -29,6 +29,8 @@ pub mod error;
 pub mod filesystem;
 pub mod handles;
 pub mod inode;
+#[cfg(any(target_os = "macos", test))]
+mod resource_fork;
 pub mod scheduler;
 
 pub use async_bridge::{BridgeError, BridgeStats, execute};

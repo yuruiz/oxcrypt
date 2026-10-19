@@ -885,6 +885,18 @@ mod op {
         Size(NonZeroU32),
     }
     impl<'a> GetXAttr<'a> {
+        /// Offset within a macOS resource fork (zero on other platforms).
+        pub(crate) fn position(&self) -> u32 {
+            #[cfg(target_os = "macos")]
+            {
+                self.arg.position
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                0
+            }
+        }
+
         /// Name of the `XAttr`
         pub(crate) fn name(&self) -> &'a OsStr {
             self.name
