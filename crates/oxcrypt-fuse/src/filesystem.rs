@@ -45,7 +45,9 @@
 use crate::attr::{AttrCache, DEFAULT_ATTR_TTL, DirCache, DirListingEntry};
 use crate::config::MountConfig;
 use crate::error::{FuseError, FuseResult, ToErrno};
-use crate::handles::{FuseHandle, FuseHandleTable, WriteBuffer};
+#[cfg(test)]
+use crate::handles::WriteBuffer;
+use crate::handles::{FuseHandle, FuseHandleTable};
 use crate::inode::{InodeKind, InodeTable};
 use crate::scheduler::{
     DirectoryEntry, DirectoryEntryPlus, FuseScheduler, HazardousOp, HazardousOpHandler,
@@ -141,6 +143,7 @@ const DEFAULT_FILE_PERM: u16 = 0o644;
 /// Default directory permissions (rwxr-xr-x).
 const DEFAULT_DIR_PERM: u16 = 0o755;
 
+#[cfg(test)]
 fn read_result<T>(
     result: Result<
         Result<T, oxcrypt_core::error::VaultOperationError>,
@@ -264,6 +267,14 @@ impl HazardousHandler {
     }
 
     fn effective_file_size(&self, inode: u64, disk_size: u64) -> u64 {
+        if let Some(editor) = self
+            .handle_table
+            .editors
+            .get(&inode)
+            .and_then(|entry| entry.value().upgrade())
+        {
+            return editor.len();
+        }
         self.buffer_sizes
             .get(&inode)
             .map_or(disk_size, |s| (*s).max(disk_size))
@@ -375,6 +386,20 @@ impl HazardousHandler {
     }
 
     fn flush_handle_unlocked(&self, ino: u64, fh: u64) -> Result<Option<PathBuf>, c_int> {
+        let editor = self
+            .handle_table
+            .get(&fh)
+            .and_then(|handle| handle.editor())
+            .map(|(editor, _)| editor);
+        if let Some(editor) = editor {
+            let ops = Arc::clone(&self.ops);
+            let result = self
+                .exec_with_timeout(async move { editor.commit(&ops).await }, self.write_timeout)
+                .map_err(|error| error.to_errno())?
+                .map_err(|error| crate::error::write_error_to_errno(&error))?;
+            self.attr_cache.invalidate(ino);
+            return Ok(result);
+        }
         let ops = Arc::clone(&self.ops);
         let result = persist_write_buffer(&self.handle_table, fh, |dir_id, filename, content| {
             self.exec_with_timeout(
@@ -464,6 +489,49 @@ impl HazardousHandler {
         Ok(())
     }
 
+    fn recover_handle(&self, fh: u64) -> Result<PathBuf, i32> {
+        let root = self
+            .handle_table
+            .recovery_root
+            .lock()
+            .clone()
+            .ok_or(libc::EIO)?;
+        if let Some((editor, _)) = self
+            .handle_table
+            .get(&fh)
+            .and_then(|handle| handle.editor())
+        {
+            let ops = Arc::clone(&self.ops);
+            return self
+                .exec_with_timeout(
+                    async move {
+                        tokio::task::spawn_blocking(move || editor.recover(&ops, &root))
+                            .await
+                            .map_err(std::io::Error::other)?
+                    },
+                    self.write_timeout,
+                )
+                .map_err(|error| error.to_errno())?
+                .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+        }
+        let (dir, name, content) = self
+            .handle_table
+            .get_mut(&fh)
+            .and_then(|mut handle| {
+                handle.as_write_buffer_mut().map(|buffer| {
+                    (
+                        buffer.dir_id().clone(),
+                        buffer.filename().to_owned(),
+                        buffer.snapshot(),
+                    )
+                })
+            })
+            .ok_or(libc::EBADF)?;
+        let key = Arc::clone(self.ops.master_key());
+        self.exec_with_timeout(async move { oxcrypt_core::fs::recovery::save(&root, &key, &dir, &name, &content).await }, self.write_timeout)
+            .map_err(|error| error.to_errno())?.map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+    }
+
     fn op_release(&self, ino: u64, fh: u64) -> Result<(), i32> {
         self.wait_pending_writes(ino)?;
         let _namespace = self.handle_table.namespace.lock();
@@ -472,43 +540,22 @@ impl HazardousHandler {
         }
         let mut release_error = None;
         if let Err(errno) = self.flush_handle_unlocked(ino, fh) {
-            let pending = self.handle_table.get_mut(&fh).and_then(|mut handle| {
-                handle.as_write_buffer_mut().map(|buffer| {
-                    (
-                        buffer.dir_id().clone(),
-                        buffer.filename().to_owned(),
-                        buffer.snapshot(),
-                    )
-                })
-            });
-            if let Some((dir, name, content)) = pending {
-                let key = Arc::clone(self.ops.master_key());
-                let recovery_root = self.handle_table.recovery_root.lock().clone();
-                match self.exec_with_timeout(
-                    async move {
-                        let root = recovery_root.ok_or_else(|| {
-                            std::io::Error::other("recovery directory unavailable")
-                        })?;
-                        oxcrypt_core::fs::recovery::save(&root, &key, &dir, &name, &content).await
-                    },
-                    self.write_timeout,
-                ) {
-                    Ok(Ok(path)) => {
-                        let message = format!(
-                            "Write-back failed (errno {errno}); encrypted recovery copy: {}",
-                            path.display()
-                        );
-                        error!("{message}");
-                        self.handle_table.close_reports.lock().push(message);
-                    }
-                    failure => {
-                        error!(
-                            ?failure,
-                            fh, "Cannot save recovery copy; retaining pending write handle"
-                        );
-                        self.handle_table.pending_releases.lock().insert(fh, ino);
-                        return Err(errno);
-                    }
+            match self.recover_handle(fh) {
+                Ok(path) => {
+                    let message = format!(
+                        "Write-back failed (errno {errno}); encrypted recovery copy: {}",
+                        path.display()
+                    );
+                    error!("{message}");
+                    self.handle_table.close_reports.lock().push(message);
+                }
+                Err(failure) => {
+                    error!(
+                        failure,
+                        fh, "Cannot save recovery copy; retaining pending write handle"
+                    );
+                    self.handle_table.pending_releases.lock().insert(fh, ino);
+                    return Err(errno);
                 }
             }
             release_error = Some(errno);
@@ -519,6 +566,7 @@ impl HazardousHandler {
 
         let deferred = self.open_handle_tracker.remove_handle(ino);
         if !self.open_handle_tracker.has_open_handles(ino) {
+            self.handle_table.editors.remove(&ino);
             self.buffer_sizes.remove(&ino);
         }
 
@@ -861,6 +909,34 @@ pub struct CryptomatorFS {
 }
 
 impl CryptomatorFS {
+    fn editor_for_inode(
+        &self,
+        ino: u64,
+        dir: DirId,
+        name: String,
+    ) -> Result<Arc<oxcrypt_mount::EditBuffer>, i32> {
+        if let Some(editor) = self
+            .handle_table
+            .editors
+            .get(&ino)
+            .and_then(|entry| entry.value().upgrade())
+        {
+            return Ok(editor);
+        }
+        let ops = self.ops_clone();
+        let editor = self
+            .exec(
+                async move { oxcrypt_mount::EditBuffer::open(&ops, dir, name, false, false).await },
+            )
+            .map_err(|error| error.to_errno())?
+            .map_err(|error| crate::error::write_error_to_errno(&error))?;
+        let editor = Arc::new(editor);
+        self.handle_table
+            .editors
+            .insert(ino, Arc::downgrade(&editor));
+        Ok(editor)
+    }
+
     #[cfg(target_os = "macos")]
     fn resource_sidecar(
         &self,
@@ -1246,6 +1322,7 @@ impl CryptomatorFS {
 
     /// Existing-file mutations require an authenticated read of the old data.
     /// Creation is handled separately by `create`; even ENOENT is an error here.
+    #[cfg(test)]
     fn read_for_modify(&self, dir_id: &DirId, filename: &str) -> Result<Vec<u8>, c_int> {
         let ops = self.ops_clone();
         let dir_id = dir_id.clone();
@@ -1395,6 +1472,20 @@ impl CryptomatorFS {
     }
 
     fn flush_handle_unlocked(&self, ino: u64, fh: u64) -> Result<Option<PathBuf>, c_int> {
+        let editor = self
+            .handle_table
+            .get(&fh)
+            .and_then(|handle| handle.editor())
+            .map(|(editor, _)| editor);
+        if let Some(editor) = editor {
+            let ops = Arc::clone(&self.ops);
+            let result = self
+                .exec_with_timeout(async move { editor.commit(&ops).await }, self.write_timeout)
+                .map_err(|error| error.to_errno())?
+                .map_err(|error| crate::error::write_error_to_errno(&error))?;
+            self.attr_cache.invalidate(ino);
+            return Ok(result);
+        }
         let ops = self.ops_clone();
         let result = persist_write_buffer(&self.handle_table, fh, |dir_id, filename, content| {
             self.exec_with_timeout(
@@ -1532,6 +1623,14 @@ impl CryptomatorFS {
     /// to ensure the kernel sees the true current size.
     #[inline]
     fn effective_file_size(&self, inode: u64, disk_size: u64) -> u64 {
+        if let Some(editor) = self
+            .handle_table
+            .editors
+            .get(&inode)
+            .and_then(|entry| entry.value().upgrade())
+        {
+            return editor.len();
+        }
         self.buffer_sizes
             .get(&inode)
             .map_or(disk_size, |s| (*s).max(disk_size))
@@ -2427,64 +2526,56 @@ impl Filesystem for CryptomatorFS {
         #[cfg(target_os = "macos")]
         let _resource_guard = name.starts_with("._").then(|| self.resource_lock.lock());
 
+        let open_flags = fuser::FopenFlags::empty();
         // Check if opening for write
         let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
         let is_trunc = (flags & libc::O_TRUNC) != 0;
 
-        if is_write {
-            // Open for writing using WriteBuffer for random-access support
-            let existing_content = if is_trunc {
-                // O_TRUNC: start with empty buffer
-                Vec::new()
-            } else {
-                match self.read_for_modify(&dir_id, &name) {
-                    Ok(content) => content,
-                    Err(errno) => {
-                        reply.error(fuser::Errno::from_i32(errno));
-                        return;
-                    }
-                }
-            };
-
-            let initial_size = existing_content.len() as u64;
-            let buffer = WriteBuffer::new(dir_id, name, existing_content);
-            let fh = self
-                .handle_table
-                .insert_auto(FuseHandle::WriteBuffer(buffer));
-            self.open_handle_tracker.add_handle(ino);
-            // Track initial buffer size for mmap consistency
-            self.update_buffer_size(ino, initial_size);
-            self.vault_stats.record_file_open();
-            reply.opened(fuser::FileHandle(fh), fuser::FopenFlags::empty());
+        let existing = self
+            .handle_table
+            .editors
+            .get(&ino)
+            .and_then(|entry| entry.value().upgrade());
+        let editor = if let Some(editor) = existing {
+            editor
         } else {
-            // Open for reading - use streaming reader without holding vault locks.
-            // We use the synchronous reader to avoid Tokio runtime dependencies in the executor.
-            // Opening involves reading the header, which is fast enough to do synchronously.
-            let sync_ops = match self.get_or_create_sync_ops() {
-                Ok(ops) => ops,
-                Err(e) => {
-                    reply.error(fuser::Errno::from_i32(e.to_errno()));
+            let ops = self.ops_clone();
+            match self.exec(async move {
+                oxcrypt_mount::EditBuffer::open(&ops, dir_id, name, false, false).await
+            }) {
+                Ok(Ok(editor)) => Arc::new(editor),
+                Ok(Err(error)) => {
+                    reply.error(fuser::Errno::from_i32(crate::error::write_error_to_errno(
+                        &error,
+                    )));
                     return;
                 }
-            };
-
-            match sync_ops.open_file_reader_sync(&dir_id, &name) {
-                Ok(reader) => {
-                    // Store streaming reader in handle table
-                    let fh = self
-                        .handle_table
-                        .insert_auto(FuseHandle::Reader(Box::new(reader)));
-                    self.open_handle_tracker.add_handle(ino);
-                    self.vault_stats.record_file_open();
-                    reply.opened(fuser::FileHandle(fh), fuser::FopenFlags::empty());
-                }
-                Err(e) => {
-                    reply.error(fuser::Errno::from_i32(crate::error::vault_error_to_errno(
-                        &e,
-                    )));
+                Err(error) => {
+                    reply.error(fuser::Errno::from_i32(error.to_errno()));
+                    return;
                 }
             }
+        };
+        if is_trunc
+            && is_write
+            && let Err(error) = editor.truncate(0)
+        {
+            reply.error(fuser::Errno::from_i32(
+                error.raw_os_error().unwrap_or(libc::EIO),
+            ));
+            return;
         }
+        self.handle_table
+            .editors
+            .insert(ino, Arc::downgrade(&editor));
+        self.set_buffer_size(ino, editor.len());
+        let fh = self.handle_table.insert_auto(FuseHandle::Editor {
+            buffer: editor,
+            writable: is_write,
+        });
+        self.open_handle_tracker.add_handle(ino);
+        self.vault_stats.record_file_open();
+        reply.opened(fuser::FileHandle(fh), open_flags);
     }
 
     fn read(
@@ -2510,6 +2601,34 @@ impl Filesystem for CryptomatorFS {
         };
 
         match &mut *handle {
+            FuseHandle::Editor { buffer, .. } => {
+                let buffer = Arc::clone(buffer);
+                drop(handle);
+                let Some(permit) = self.handle_table.reader_wait_slot() else {
+                    reply.error(fuser::Errno::from_i32(libc::EAGAIN));
+                    return;
+                };
+                let stats = Arc::clone(&self.vault_stats);
+                let task = self.handle.spawn_blocking(move || {
+                    let _permit = permit;
+                    buffer.read(u64::try_from(offset).unwrap_or(0), size as usize)
+                });
+                let timeout = self.default_timeout;
+                self.handle.spawn(async move {
+                    match tokio::time::timeout(timeout, task).await {
+                        Ok(Ok(Ok(data))) => {
+                            stats.record_read(data.len() as u64);
+                            reply.data(&data);
+                        }
+                        Ok(Ok(Err(error))) => reply.error(fuser::Errno::from_i32(
+                            error.raw_os_error().unwrap_or(libc::EIO),
+                        )),
+                        Ok(Err(_)) => reply.error(fuser::Errno::from_i32(libc::EIO)),
+                        Err(_) => reply.error(fuser::Errno::from_i32(libc::ETIMEDOUT)),
+                    }
+                });
+            }
+
             FuseHandle::Reader(_) => {
                 // Async read path: loan reader to scheduler, return immediately
                 // Take the reader by replacing with ReaderLoaned placeholder
@@ -3084,7 +3203,7 @@ impl Filesystem for CryptomatorFS {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<fuser::FileHandle>,
+        _fh: Option<fuser::FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -3092,7 +3211,6 @@ impl Filesystem for CryptomatorFS {
         reply: ReplyAttr,
     ) {
         let ino = ino.0;
-        let fh = fh.map(|f| f.0);
         let start = Instant::now();
         self.vault_stats.record_metadata_op();
         trace!(
@@ -3123,141 +3241,30 @@ impl Filesystem for CryptomatorFS {
                 InodeKind::File { dir_id, name } => {
                     let dir_id = dir_id.clone();
                     let name = name.clone();
-                    let file_name = name.clone();
                     drop(entry);
-
-                    debug!(inode = ino, new_size = new_size, fh = ?fh, file = %file_name, "setattr: truncate request");
-
-                    // If we have an open file handle, truncate the buffer
-                    if let Some(fh) = fh
-                        && let Some(mut handle) = self.handle_table.get_mut(&fh)
-                        && let Some(buffer) = handle.as_write_buffer_mut()
-                    {
-                        debug!(
-                            inode = ino,
-                            old_size = buffer.len(),
-                            new_size = new_size,
-                            "setattr: found open write buffer"
-                        );
-                        let old_size = buffer.len();
-                        buffer.truncate(new_size);
-                        if new_size < old_size
-                            && let Some(ref scheduler) = self.scheduler
-                        {
-                            let shrink = old_size - new_size;
-                            let current = scheduler.file_write_bytes(ino);
-                            let release = shrink.min(current);
-                            if release > 0 {
-                                scheduler.release_write_bytes(ino, release);
-                            }
-                        }
-
-                        // CRITICAL: For mmap compatibility, if we're extending the file,
-                        // we MUST flush to disk immediately. Otherwise the kernel will
-                        // report the new size but the file on disk is still the old size,
-                        // causing SIGBUS when applications (like SQLite WAL) mmap the
-                        // extended region.
-                        if new_size > old_size {
-                            drop(handle);
-                            match self.flush_handle(ino, fh) {
-                                Ok(_) => {
-                                    self.update_buffer_size(ino, new_size);
-                                    let attr = self.make_file_attr(ino, new_size, None);
-                                    self.attr_cache.insert(ino, attr);
-                                    self.vault_stats.record_metadata_latency(start.elapsed());
-                                    reply.attr(&Duration::ZERO, &attr);
-                                }
-                                Err(errno) => {
-                                    self.vault_stats.record_error();
-                                    self.vault_stats.record_metadata_latency(start.elapsed());
-                                    reply.error(fuser::Errno::from_i32(errno));
-                                }
-                            }
-                            return;
-                        }
-
-                        // Truncating to smaller size: just update buffer (no flush needed)
-                        drop(handle);
-
-                        // Set exact buffer size for mmap consistency (use set, not update, since we're shrinking)
-                        self.set_buffer_size(ino, new_size);
-                        // Just modified file, so mtime = now is correct
-                        let attr = self.make_file_attr(ino, new_size, None);
-                        self.attr_cache.insert(ino, attr);
-                        if let Some(ref scheduler) = self.scheduler {
-                            scheduler.invalidate_read_cache_inode(ino);
-                        }
-                        self.vault_stats.record_metadata_latency(start.elapsed());
-                        // Use zero TTL - file has active buffer, kernel must not cache size
-                        reply.attr(&Duration::ZERO, &attr);
-                        return;
-                    }
-
-                    // No open handle - read file, truncate, write back
-                    debug!(inode = ino, new_size = new_size, file = %file_name, "setattr: no open write buffer, using read-modify-write");
-                    let mut content = match self.read_for_modify(&dir_id, &name) {
-                        Ok(content) => content,
-                        Err(errno) => {
-                            self.vault_stats.record_error();
-                            self.vault_stats.record_metadata_latency(start.elapsed());
-                            reply.error(fuser::Errno::from_i32(errno));
-                            return;
-                        }
-                    };
-                    let old_size = content.len() as u64;
-
-                    // Track if we're extending (for TTL decision)
-                    let is_extending = new_size > old_size;
-
-                    // Truncate or extend
-                    // On 32-bit: file sizes beyond 4GB would fail earlier in allocation
-                    #[allow(clippy::cast_possible_truncation)]
-                    content.resize(new_size as usize, 0);
-
-                    // Write back
-                    let ops = self.ops_clone();
-                    let dir_id_write = dir_id.clone();
-                    let name_write = name.clone();
-
-                    match self.exec(async move {
-                        ops.write_file(&dir_id_write, &name_write, &content).await
-                    }) {
-                        Ok(Ok(_)) => {
-                            // Just modified file, so mtime = now is correct
+                    let _namespace = self.handle_table.namespace.lock();
+                    let result = (|| {
+                        let editor = self.editor_for_inode(ino, dir_id, name)?;
+                        editor
+                            .truncate(new_size)
+                            .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
+                        let ops = self.ops_clone();
+                        self.exec_with_timeout(
+                            async move { editor.commit(&ops).await },
+                            self.write_timeout,
+                        )
+                        .map_err(|error| error.to_errno())?
+                        .map_err(|error| crate::error::write_error_to_errno(&error))?;
+                        Ok::<(), i32>(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            self.set_buffer_size(ino, new_size);
                             let attr = self.make_file_attr(ino, new_size, None);
-                            self.vault_stats.record_metadata_latency(start.elapsed());
-                            // CRITICAL for mmap: When extending via fallback path (no open WriteBuffer),
-                            // we must:
-                            // 1. Return zero TTL to prevent kernel from caching size
-                            // 2. NOT insert into attr_cache - otherwise next getattr returns
-                            //    cached entry with time_remaining() (up to 60s), causing kernel
-                            //    to cache stale size → SIGBUS on mmap if file extended again
-                            if is_extending {
-                                self.attr_cache.invalidate(ino);
-                                if let Some(ref scheduler) = self.scheduler {
-                                    scheduler.invalidate_read_cache_inode(ino);
-                                }
-                                reply.attr(&Duration::ZERO, &attr);
-                            } else {
-                                self.attr_cache.insert(ino, attr);
-                                if let Some(ref scheduler) = self.scheduler {
-                                    scheduler.invalidate_read_cache_inode(ino);
-                                }
-                                reply.attr(&DEFAULT_ATTR_TTL, &attr);
-                            }
+                            self.attr_cache.insert(ino, attr);
+                            reply.attr(&Duration::ZERO, &attr);
                         }
-                        Ok(Err(e)) => {
-                            self.vault_stats.record_error();
-                            self.vault_stats.record_metadata_latency(start.elapsed());
-                            reply.error(fuser::Errno::from_i32(
-                                crate::error::write_error_to_errno(&e),
-                            ));
-                        }
-                        Err(exec_err) => {
-                            self.vault_stats.record_error();
-                            self.vault_stats.record_metadata_latency(start.elapsed());
-                            reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
-                        }
+                        Err(errno) => reply.error(fuser::Errno::from_i32(errno)),
                     }
                     return;
                 }
@@ -3304,6 +3311,28 @@ impl Filesystem for CryptomatorFS {
                     let name = name.clone();
                     drop(entry);
 
+                    if let Some(editor) = self
+                        .handle_table
+                        .editors
+                        .get(&ino)
+                        .and_then(|entry| entry.value().upgrade())
+                    {
+                        match editor.set_times(atime_ft.map(Into::into), mtime_ft.map(Into::into)) {
+                            Ok(()) => {
+                                let attr = self.make_file_attr(
+                                    ino,
+                                    editor.len(),
+                                    mtime_ft.map(Into::into),
+                                );
+                                self.attr_cache.insert(ino, attr);
+                                reply.attr(&Duration::ZERO, &attr);
+                            }
+                            Err(error) => reply.error(fuser::Errno::from_i32(
+                                error.raw_os_error().unwrap_or(libc::EIO),
+                            )),
+                        }
+                        return;
+                    }
                     let ops = self.ops_clone();
                     match self.exec(async move { ops.find_file(&dir_id, &name).await }) {
                         Ok(Ok(Some(file_info))) => {
@@ -3592,10 +3621,31 @@ impl Filesystem for CryptomatorFS {
 
         // Create the file with a new WriteBuffer marked dirty
         // (File will be written to vault on release, even if empty)
-        let buffer = WriteBuffer::new_for_create(dir_id.clone(), name_str.to_string());
-        let fh = self
-            .handle_table
-            .insert_auto(FuseHandle::WriteBuffer(buffer));
+        let ops = self.ops_clone();
+        let directory = dir_id.clone();
+        let filename = name_str.to_owned();
+        let editor = match self.exec(async move {
+            let editor =
+                oxcrypt_mount::EditBuffer::open(&ops, directory, filename, true, true).await?;
+            editor.commit(&ops).await?;
+            Ok::<_, oxcrypt_core::error::VaultWriteError>(editor)
+        }) {
+            Ok(Ok(editor)) => Arc::new(editor),
+            Ok(Err(error)) => {
+                reply.error(fuser::Errno::from_i32(crate::error::write_error_to_errno(
+                    &error,
+                )));
+                return;
+            }
+            Err(error) => {
+                reply.error(fuser::Errno::from_i32(error.to_errno()));
+                return;
+            }
+        };
+        let fh = self.handle_table.insert_auto(FuseHandle::Editor {
+            buffer: Arc::clone(&editor),
+            writable: true,
+        });
 
         // Allocate inode
         let inode = self.inodes.get_or_insert(
@@ -3606,6 +3656,9 @@ impl Filesystem for CryptomatorFS {
             },
         );
 
+        self.handle_table
+            .editors
+            .insert(inode, Arc::downgrade(&editor));
         self.open_handle_tracker.add_handle(inode);
 
         // Just created, so mtime = now is correct
@@ -3654,6 +3707,26 @@ impl Filesystem for CryptomatorFS {
             reply.error(fuser::Errno::from_i32(libc::EBADF));
             return;
         };
+
+        if let Some((editor, writable)) = handle.editor() {
+            drop(handle);
+            if !writable {
+                reply.error(fuser::Errno::from_i32(libc::EBADF));
+                return;
+            }
+            match editor.write(u64::try_from(offset).unwrap_or(u64::MAX), data) {
+                Ok(written) => {
+                    self.set_buffer_size(ino, editor.len());
+                    self.attr_cache.invalidate(ino);
+                    self.vault_stats.record_write(written as u64);
+                    reply.written(u32::try_from(written).unwrap_or(u32::MAX));
+                }
+                Err(error) => reply.error(fuser::Errno::from_i32(
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                )),
+            }
+            return;
+        }
 
         let Some(_buffer) = handle.as_write_buffer_mut() else {
             // Trying to write to a read-only handle
@@ -3912,6 +3985,7 @@ impl Filesystem for CryptomatorFS {
         name: &OsStr,
         reply: ReplyEmpty,
     ) {
+        let _namespace = self.handle_table.namespace.lock();
         let parent = parent.0;
         let start = Instant::now();
         self.vault_stats.record_metadata_op();
@@ -3949,6 +4023,12 @@ impl Filesystem for CryptomatorFS {
         // Check if file has open handles - if so, defer deletion
         if let Some(ino) = child_inode
             && self.open_handle_tracker.has_open_handles(ino)
+            && self
+                .handle_table
+                .editors
+                .get(&ino)
+                .and_then(|entry| entry.value().upgrade())
+                .is_none()
         {
             // POSIX: unlink removes directory entry immediately but defers file deletion
             self.open_handle_tracker
@@ -3979,6 +4059,7 @@ impl Filesystem for CryptomatorFS {
         // Try to delete as file first
         match self.exec(async move { ops.delete_file(&dir_id_file, &name_file).await }) {
             Ok(Ok(())) => {
+                self.handle_table.detach_writers(&dir_id, name_str);
                 // Invalidate caches
                 self.inodes.invalidate_path(&child_path);
                 self.dir_cache.invalidate(parent);
@@ -4965,73 +5046,36 @@ impl Filesystem for CryptomatorFS {
         };
         drop(entry);
 
-        // FUSE guarantees offset and length are non-negative (they're from kernel fallocate requests)
-        #[allow(clippy::cast_sign_loss)]
-        let new_size = (offset + length) as u64;
-
-        // If we have an open file handle, extend the buffer
-        if let Some(mut handle) = self.handle_table.get_mut(&fh)
-            && let Some(buffer) = handle.as_write_buffer_mut()
-        {
-            // Only extend, don't shrink
-            if new_size > buffer.len() {
-                buffer.truncate(new_size);
-                // Track buffer size for mmap consistency
-                self.update_buffer_size(ino, new_size);
-            }
-            drop(handle);
-
-            self.attr_cache.invalidate(ino);
-            if let Some(ref scheduler) = self.scheduler {
-                scheduler.invalidate_read_cache_inode(ino);
-            }
-            reply.ok();
+        let Some(new_size) = u64::try_from(offset).ok().and_then(|offset| {
+            u64::try_from(length)
+                .ok()
+                .and_then(|length| offset.checked_add(length))
+        }) else {
+            reply.error(fuser::Errno::from_i32(libc::EFBIG));
             return;
-        }
-
-        // A failed read must never turn an existing file into zero-filled data.
-        let mut content = match self.read_for_modify(&dir_id, &name) {
-            Ok(content) => content,
-            Err(errno) => {
-                reply.error(fuser::Errno::from_i32(errno));
-                return;
-            }
         };
-
-        // Extend if needed (don't shrink)
-        // On 32-bit: file sizes beyond 4GB would fail earlier in allocation
-        #[allow(clippy::cast_possible_truncation)]
-        if new_size as usize > content.len() {
-            #[allow(clippy::cast_possible_truncation)]
-            content.resize(new_size as usize, 0);
-
-            // Write back
-            let ops = self.ops_clone();
-            let dir_id_write = dir_id.clone();
-            let name_write = name.clone();
-
-            match self
-                .exec(async move { ops.write_file(&dir_id_write, &name_write, &content).await })
-            {
-                Ok(Ok(_)) => {
-                    self.attr_cache.invalidate(ino);
-                    if let Some(ref scheduler) = self.scheduler {
-                        scheduler.invalidate_read_cache_inode(ino);
-                    }
-                    reply.ok();
-                }
-                Ok(Err(e)) => {
-                    reply.error(fuser::Errno::from_i32(crate::error::write_error_to_errno(
-                        &e,
-                    )));
-                }
-                Err(exec_err) => {
-                    reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
-                }
+        let _namespace = self.handle_table.namespace.lock();
+        let result = (|| {
+            let editor = self.editor_for_inode(ino, dir_id, name)?;
+            if new_size > editor.len() {
+                editor
+                    .truncate(new_size)
+                    .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
             }
-        } else {
-            // File is already large enough
-            reply.ok();
+            let size = editor.len();
+            let ops = self.ops_clone();
+            self.exec_with_timeout(async move { editor.commit(&ops).await }, self.write_timeout)
+                .map_err(|error| error.to_errno())?
+                .map_err(|error| crate::error::write_error_to_errno(&error))?;
+            Ok::<u64, i32>(size)
+        })();
+        match result {
+            Ok(size) => {
+                self.set_buffer_size(ino, size);
+                self.attr_cache.invalidate(ino);
+                reply.ok();
+            }
+            Err(errno) => reply.error(fuser::Errno::from_i32(errno)),
         }
     }
 
@@ -5070,6 +5114,51 @@ impl Filesystem for CryptomatorFS {
         };
 
         match &mut *handle_in {
+            FuseHandle::Editor { buffer, .. } => {
+                let source = Arc::clone(buffer);
+                drop(handle_in);
+                let target = self
+                    .handle_table
+                    .get(&fh_out)
+                    .and_then(|handle| handle.editor());
+                let Some((target, true)) = target else {
+                    reply.error(fuser::Errno::from_i32(libc::EBADF));
+                    return;
+                };
+                let result = (|| {
+                    let mut copied = 0u64;
+                    let length = len.min(u64::from(u32::MAX));
+                    while copied < length {
+                        let data = source.read(
+                            u64::try_from(offset_in)
+                                .unwrap_or(u64::MAX)
+                                .saturating_add(copied),
+                            (length - copied).min(32768) as usize,
+                        )?;
+                        if data.is_empty() {
+                            break;
+                        }
+                        target.write(
+                            u64::try_from(offset_out)
+                                .unwrap_or(u64::MAX)
+                                .saturating_add(copied),
+                            &data,
+                        )?;
+                        copied += data.len() as u64;
+                    }
+                    Ok::<_, std::io::Error>(copied)
+                })();
+                match result {
+                    Ok(copied) => {
+                        self.set_buffer_size(ino_out, target.len());
+                        self.attr_cache.invalidate(ino_out);
+                        reply.written(u32::try_from(copied).unwrap_or(u32::MAX));
+                    }
+                    Err(error) => reply.error(fuser::Errno::from_i32(
+                        error.raw_os_error().unwrap_or(libc::EIO),
+                    )),
+                }
+            }
             FuseHandle::Reader(_) => {
                 // Async copy path: loan reader to scheduler, return immediately
                 // Take the reader by replacing with ReaderLoaned placeholder
@@ -5193,7 +5282,9 @@ impl Filesystem for CryptomatorFS {
 
                     // Check if we have an open buffer with the size
                     if let Some(mut handle) = self.handle_table.get_mut(&fh) {
-                        if let Some(buffer) = handle.as_write_buffer_mut() {
+                        if let Some((editor, _)) = handle.editor() {
+                            editor.len()
+                        } else if let Some(buffer) = handle.as_write_buffer_mut() {
                             buffer.len()
                         } else if let Some(reader) = handle.as_reader_mut() {
                             // Get size from reader
@@ -5316,6 +5407,7 @@ impl Filesystem for CryptomatorFS {
                     }
                     Ok(resource.to_vec())
                 });
+            trace!(inode = _ino.0, position = _position, size = _size, result = ?result.as_ref().map(Vec::len), "native resource read");
             match result {
                 Ok(data) if _size == 0 => reply.size(u32::try_from(data.len()).unwrap_or(u32::MAX)),
                 Ok(data) => {

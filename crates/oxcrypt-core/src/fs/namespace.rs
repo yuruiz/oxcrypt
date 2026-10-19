@@ -131,3 +131,37 @@ pub(crate) fn replace(
     crate::fs::durability::sync_directory_chain(source_parent, root)?;
     Ok(())
 }
+
+/// Exchange existing payloads atomically, preserving open-file identity.
+pub(crate) fn exchange(first: &Path, second: &Path, root: &Path) -> io::Result<()> {
+    fs::File::open(first)?.sync_all()?;
+    fs::File::open(second)?.sync_all()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        first,
+        rustix::fs::CWD,
+        second,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic exchange unavailable",
+    ));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        crate::fs::durability::sync_directory_chain(
+            first
+                .parent()
+                .ok_or_else(|| io::Error::other("missing parent"))?,
+            root,
+        )?;
+        crate::fs::durability::sync_directory_chain(
+            second
+                .parent()
+                .ok_or_else(|| io::Error::other("missing parent"))?,
+            root,
+        )
+    }
+}

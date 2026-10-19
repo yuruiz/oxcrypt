@@ -88,6 +88,14 @@ fn edits_atomic_save_and_long_names_survive_remount() {
 
 #[test]
 fn concurrent_reads_on_one_handle_complete_without_eagain() {
+    if std::env::var_os("OXCRYPT_TEST_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                "oxcrypt_fuse::filesystem=trace,oxcrypt_core::vault::operations_async=debug",
+            )
+            .with_test_writer()
+            .try_init();
+    }
     use std::os::unix::fs::FileExt;
     use std::sync::{Arc, Barrier};
     let vault = TempVault::new();
@@ -107,6 +115,7 @@ fn concurrent_reads_on_one_handle_complete_without_eagain() {
     );
     let path = mount.mountpoint().join("large");
     fs::write(&path, data.as_slice()).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), data.len() as u64);
     let file = Arc::new(fs::File::open(path).unwrap());
     let barrier = Arc::new(Barrier::new(8));
     let threads: Vec<_> = (0..8)
@@ -256,4 +265,37 @@ fn replaced_open_writer_cannot_overwrite_replacement() {
     let result = fs::read(mount.mountpoint().join("target"));
     mount.unmount().unwrap();
     assert_eq!(result.unwrap(), b"saved version");
+}
+
+#[test]
+fn unlinked_open_file_is_independent_of_recreated_name() {
+    use std::os::unix::fs::FileExt;
+    let vault = TempVault::new();
+    let mount_dir = tempfile::tempdir().unwrap();
+    let mount = FuseBackend::new()
+        .mount(
+            "oxcrypt-unlink-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    let path = mount.mountpoint().join("note");
+    fs::write(&path, b"old data").unwrap();
+    let old = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, b"new data").unwrap();
+    old.write_all_at(b"orphan!!", 0).unwrap();
+    old.sync_all().unwrap();
+    let mut actual = [0; 8];
+    old.read_exact_at(&mut actual, 0).unwrap();
+    drop(old);
+    let visible = fs::read(&path).unwrap();
+    mount.unmount().unwrap();
+    assert_eq!(&actual, b"orphan!!");
+    assert_eq!(visible, b"new data");
 }

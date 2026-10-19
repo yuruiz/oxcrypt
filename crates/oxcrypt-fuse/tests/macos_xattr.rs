@@ -5,6 +5,17 @@ use oxcrypt_fuse::FuseBackend;
 use oxcrypt_mount::{MountBackend, testing::TempVault};
 use std::{fs, path::Path, process::Command};
 
+fn trace_if_requested() {
+    if std::env::var_os("OXCRYPT_TEST_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                "oxcrypt_fuse::filesystem=trace,oxcrypt_core::vault::operations_async=debug",
+            )
+            .with_test_writer()
+            .try_init();
+    }
+}
+
 fn xattr(args: &[&str], path: &Path) -> Vec<u8> {
     let output = Command::new("/usr/bin/xattr")
         .args(args)
@@ -21,6 +32,7 @@ fn xattr(args: &[&str], path: &Path) -> Vec<u8> {
 
 #[test]
 fn finder_attributes_survive_remount() {
+    trace_if_requested();
     let vault = TempVault::new();
     let mount_dir = tempfile::tempdir().unwrap();
     let backend = FuseBackend::new();
@@ -135,6 +147,7 @@ fn resource_read(path: &Path, position: u32, count: usize) -> std::io::Result<Ve
 
 #[test]
 fn positioned_resource_io_and_rename_preserve_metadata() {
+    trace_if_requested();
     let vault = TempVault::new();
     let mount_dir = tempfile::tempdir().unwrap();
     let backend = FuseBackend::new();

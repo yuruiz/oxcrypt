@@ -15,6 +15,11 @@ pub use oxcrypt_mount::{HandleTable, WriteBuffer};
 /// This wraps the underlying vault handles with additional buffering for writes.
 #[derive(Debug)]
 pub enum FuseHandle {
+    /// Shared chunk editor, also used by readers to observe uncommitted writes.
+    Editor {
+        buffer: std::sync::Arc<oxcrypt_mount::EditBuffer>,
+        writable: bool,
+    },
     /// Read-only handle using streaming reader (preferred).
     ///
     /// Opened via `open_file_unlocked()` which releases vault locks after
@@ -52,6 +57,13 @@ pub enum FuseHandle {
 }
 
 impl FuseHandle {
+    pub(crate) fn editor(&self) -> Option<(std::sync::Arc<oxcrypt_mount::EditBuffer>, bool)> {
+        match self {
+            Self::Editor { buffer, writable } => Some((std::sync::Arc::clone(buffer), *writable)),
+            _ => None,
+        }
+    }
+
     /// Check if this is a streaming reader handle.
     pub fn is_reader(&self) -> bool {
         matches!(self, FuseHandle::Reader(_))
@@ -109,6 +121,7 @@ impl FuseHandle {
 #[derive(Debug)]
 pub struct FuseHandleTable {
     inner: HandleTable<u64, FuseHandle>,
+    pub(crate) editors: DashMap<u64, std::sync::Weak<oxcrypt_mount::EditBuffer>>,
     /// Serializes namespace mutations with opening and committing write handles.
     pub(crate) namespace: parking_lot::Mutex<()>,
     pub(crate) recovery_root: parking_lot::Mutex<Option<std::path::PathBuf>>,
@@ -122,6 +135,7 @@ impl FuseHandleTable {
     pub fn new_auto_id() -> Self {
         Self {
             inner: HandleTable::new_auto_id(),
+            editors: DashMap::new(),
             namespace: parking_lot::Mutex::new(()),
             recovery_root: parking_lot::Mutex::new(
                 oxcrypt_core::fs::recovery::default_directory().ok(),
@@ -145,6 +159,13 @@ impl FuseHandleTable {
     pub(crate) fn writer_handles(&self, dir: &DirId, name: &str) -> Vec<u64> {
         let mut ids = Vec::new();
         self.inner.retain(|id, handle| {
+            if let Some((editor, writable)) = handle.editor()
+                && writable
+                && !editor.is_detached()
+                && editor.location() == (dir.clone(), name.to_owned())
+            {
+                ids.push(*id);
+            }
             if let Some(buffer) = handle.as_write_buffer_mut()
                 && !buffer.is_detached()
                 && buffer.dir_id() == dir
@@ -158,6 +179,13 @@ impl FuseHandleTable {
     }
 
     pub(crate) fn detach_writers(&self, dir: &DirId, name: &str) {
+        for entry in &self.editors {
+            if let Some(editor) = entry.value().upgrade()
+                && editor.location() == (dir.clone(), name.to_owned())
+            {
+                editor.detach();
+            }
+        }
         self.inner.retain(|_, handle| {
             if let Some(buffer) = handle.as_write_buffer_mut()
                 && !buffer.is_detached()
@@ -177,6 +205,14 @@ impl FuseHandleTable {
         to_dir: &DirId,
         to_name: &str,
     ) {
+        for entry in &self.editors {
+            if let Some(editor) = entry.value().upgrade()
+                && !editor.is_detached()
+                && editor.location() == (from_dir.clone(), from_name.to_owned())
+            {
+                editor.relocate(to_dir.clone(), to_name.to_owned());
+            }
+        }
         self.inner.retain(|_, handle| {
             if let Some(buffer) = handle.as_write_buffer_mut()
                 && !buffer.is_detached()
@@ -197,6 +233,18 @@ impl FuseHandleTable {
         b_dir: &DirId,
         b_name: &str,
     ) {
+        for entry in &self.editors {
+            if let Some(editor) = entry.value().upgrade()
+                && !editor.is_detached()
+            {
+                let location = editor.location();
+                if location == (a_dir.clone(), a_name.to_owned()) {
+                    editor.relocate(b_dir.clone(), b_name.to_owned());
+                } else if location == (b_dir.clone(), b_name.to_owned()) {
+                    editor.relocate(a_dir.clone(), a_name.to_owned());
+                }
+            }
+        }
         self.inner.retain(|_, handle| {
             if let Some(buffer) = handle.as_write_buffer_mut() {
                 if buffer.dir_id() == a_dir && buffer.filename() == a_name {

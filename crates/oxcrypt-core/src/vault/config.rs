@@ -38,17 +38,19 @@ pub const DEFAULT_SHORTENING_THRESHOLD: usize = 220;
 ///
 /// # Reference Implementation
 /// - Java: [`CryptorProvider.Scheme`](https://github.com/cryptomator/cryptolib/blob/develop/src/main/java/org/cryptomator/cryptolib/api/CryptorProvider.java)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CipherCombo {
     /// AES-SIV for filenames, AES-GCM for content (v2)
     ///
     /// File header: 68 bytes (12-byte nonce + 40-byte payload + 16-byte tag)
     /// Chunk overhead: 28 bytes (12-byte nonce + 16-byte tag)
+    #[serde(rename = "SIV_GCM")]
     SivGcm,
     /// AES-SIV for filenames, AES-CTR + HMAC-SHA256 for content (v1)
     ///
     /// File header: 88 bytes (16-byte nonce + 40-byte payload + 32-byte HMAC)
     /// Chunk overhead: 48 bytes (16-byte nonce + 32-byte HMAC)
+    #[serde(rename = "SIV_CTRMAC")]
     SivCtrMac,
 }
 

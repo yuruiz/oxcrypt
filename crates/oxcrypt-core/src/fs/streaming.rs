@@ -16,6 +16,8 @@
 //! Each chunk is independently encrypted, using the chunk number and
 //! header nonce as additional authenticated data.
 
+pub mod editor;
+
 use std::io::{self, SeekFrom};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
