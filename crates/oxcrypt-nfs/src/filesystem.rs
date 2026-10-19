@@ -523,6 +523,31 @@ impl CryptomatorNFS {
         Ok((id, attr))
     }
 
+    async fn ensure_create_name_available(&self, dir: &DirId, name: &str) -> Result<(), nfsstat3> {
+        if self
+            .ops
+            .find_file(dir, name)
+            .await
+            .map_err(|error| vault_error_to_nfsstat(&error))?
+            .is_some()
+            || self
+                .ops
+                .find_directory(dir, name)
+                .await
+                .map_err(|error| vault_error_to_nfsstat(&error))?
+                .is_some()
+            || self
+                .ops
+                .find_symlink(dir, name)
+                .await
+                .map_err(|error| vault_error_to_nfsstat(&error))?
+                .is_some()
+        {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
+        Ok(())
+    }
+
     /// Gets an inode entry or returns NFS3ERR_STALE.
     fn get_entry(
         &self,
@@ -791,88 +816,100 @@ impl NFSFileSystem for CryptomatorNFS {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
+        self.create_guarded(dirid, filename, sattr3::default())
+            .await
+            .map(|(id, _)| id)
+    }
+
+    async fn create_guarded(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
+        attr: sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
         let _namespace = self.namespace.write().await;
         let _mutation = self.flush_lock.lock().await;
-        let start = Instant::now();
-        self.stats.record_metadata_op();
+        Self::requested_times(&attr)?;
+        let dir = self.get_dir_entry(dirid)?;
+        let name = Self::filename_to_str(filename)?;
+        self.ensure_create_name_available(&dir, name).await?;
+        self.create_unlocked(dirid, filename, attr).await
+    }
 
-        let name = match Self::filename_to_str(filename) {
-            Ok(n) => n,
-            Err(e) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(e);
-            }
-        };
-        debug!(dirid, name, "create_exclusive");
-
-        let dir_id = match self.get_dir_entry(dirid) {
-            Ok(d) => d,
-            Err(e) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(e);
-            }
-        };
-
-        // Check if any entry already exists
-        match self.ops.find_file(&dir_id, name).await {
-            Ok(Some(_)) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(nfsstat3::NFS3ERR_EXIST);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(vault_error_to_nfsstat(&e));
-            }
-        }
-
-        match self.ops.find_directory(&dir_id, name).await {
-            Ok(Some(_)) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(nfsstat3::NFS3ERR_EXIST);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(vault_error_to_nfsstat(&e));
-            }
-        }
-
-        match self.ops.find_symlink(&dir_id, name).await {
-            Ok(Some(_)) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(nfsstat3::NFS3ERR_EXIST);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(vault_error_to_nfsstat(&e));
-            }
-        }
-
-        // Create using regular create (which has its own stats recording)
-        match self
-            .create_unlocked(dirid, filename, sattr3::default())
+    async fn create_exclusive_with_verifier(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
+        verifier: [u8; 8],
+    ) -> Result<fileid3, nfsstat3> {
+        let _namespace = self.namespace.write().await;
+        let _mutation = self.flush_lock.lock().await;
+        let dir = self.get_dir_entry(dirid)?;
+        let parent = self.get_parent_path(dirid)?;
+        let name = Self::filename_to_str(filename)?;
+        let mut first = [0; 4];
+        let mut second = [0; 4];
+        first.copy_from_slice(&verifier[..4]);
+        second.copy_from_slice(&verifier[4..]);
+        // RFC 1813 permits stable timestamp storage until the client's SETATTR.
+        let accessed =
+            UNIX_EPOCH + Duration::new(u64::from(u32::from_be_bytes(first)), 100_000_000);
+        let modified =
+            UNIX_EPOCH + Duration::new(u64::from(u32::from_be_bytes(second)), 200_000_000);
+        let existing = self
+            .ops
+            .find_file(&dir, name)
             .await
-        {
-            Ok((id, _)) => {
-                self.stats.record_metadata_latency(start.elapsed());
-                Ok(id)
+            .map_err(|error| vault_error_to_nfsstat(&error))?;
+        let created = existing.is_none();
+        if let Some(info) = existing {
+            // Reading metadata does not access content and cannot advance atime.
+            let metadata = tokio::fs::metadata(info.encrypted_path)
+                .await
+                .map_err(|error| vault_error_to_nfsstat(&error))?;
+            if metadata
+                .accessed()
+                .map_err(|error| vault_error_to_nfsstat(&error))?
+                != accessed
+                || metadata
+                    .modified()
+                    .map_err(|error| vault_error_to_nfsstat(&error))?
+                    != modified
+            {
+                return Err(nfsstat3::NFS3ERR_EXIST);
             }
-            Err(e) => {
-                // Error already recorded in create()
-                self.stats.record_metadata_latency(start.elapsed());
-                Err(e)
+        } else {
+            self.ensure_create_name_available(&dir, name).await?;
+            let editor = self
+                .ops
+                .edit_file(&dir, name, true, false)
+                .await
+                .map_err(|error| vault_error_to_nfsstat(&error))?;
+            let staged = Arc::clone(&editor);
+            tokio::task::spawn_blocking(move || {
+                staged.lock().set_initial_times_exact(accessed, modified)
+            })
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|error| vault_error_to_nfsstat(&error))?;
+            self.ops
+                .commit_editor(&dir, name, editor)
+                .await
+                .map_err(|error| vault_error_to_nfsstat(&error))?;
+        }
+        let child = parent.join(name);
+        if created {
+            for stale in self.inodes.remove_subtree(&child) {
+                self.editors.remove(&stale);
             }
         }
+        Ok(self.inodes.get_or_insert(
+            &child,
+            InodeKind::File {
+                dir_id: dir,
+                name: name.to_owned(),
+            },
+        ))
     }
 
     async fn mkdir(
@@ -1440,6 +1477,26 @@ impl NFSFileSystem for ArcNfs {
         self.0.create_exclusive(dirid, filename).await
     }
 
+    async fn create_guarded(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
+        attr: sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        self.0.create_guarded(dirid, filename, attr).await
+    }
+
+    async fn create_exclusive_with_verifier(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
+        verifier: [u8; 8],
+    ) -> Result<fileid3, nfsstat3> {
+        self.0
+            .create_exclusive_with_verifier(dirid, filename, verifier)
+            .await
+    }
+
     async fn mkdir(
         &self,
         dirid: fileid3,
@@ -1507,6 +1564,36 @@ mod writeback_tests {
             other.fh_to_id(&handle),
             Err(nfsstat3::NFS3ERR_STALE)
         ));
+    }
+
+    #[tokio::test]
+    async fn shared_rpc_wrapper_delegates_atomic_create_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = Arc::new(oxcrypt_core::crypto::keys::MasterKey::random().unwrap());
+        let ops = Arc::new(VaultOperationsAsync::new(temp.path(), key));
+        let shared = ArcNfs::new(CryptomatorNFS::new(ops));
+        let root = shared.root_dir();
+        let guarded = filename3::from(b"guarded".to_vec());
+        shared
+            .create_guarded(root, &guarded, sattr3::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            shared
+                .create_guarded(root, &guarded, sattr3::default())
+                .await,
+            Err(nfsstat3::NFS3ERR_EXIST)
+        ));
+        let exclusive = filename3::from(b"exclusive".to_vec());
+        let first = shared
+            .create_exclusive_with_verifier(root, &exclusive, [7; 8])
+            .await
+            .unwrap();
+        let replay = shared
+            .create_exclusive_with_verifier(root, &exclusive, [7; 8])
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
     }
 
     #[tokio::test]
