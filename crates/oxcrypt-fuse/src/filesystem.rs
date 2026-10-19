@@ -777,6 +777,8 @@ impl HazardousOpHandler for HazardousHandler {
 /// Implements the fuser `Filesystem` trait to provide a mountable filesystem
 /// backed by an encrypted Cryptomator vault.
 pub struct CryptomatorFS {
+    #[cfg(target_os = "macos")]
+    resource_lock: parking_lot::Mutex<()>,
     /// Handle to tokio runtime for async operations.
     /// Points to either our owned runtime or an external one.
     handle: Handle,
@@ -849,6 +851,114 @@ pub struct CryptomatorFS {
 }
 
 impl CryptomatorFS {
+    #[cfg(target_os = "macos")]
+    fn resource_sidecar(
+        &self,
+        ino: u64,
+        create: bool,
+    ) -> Result<(DirId, String, VaultPath, Vec<u8>), i32> {
+        let entry = self.inodes.get(ino).ok_or(libc::ENOENT)?;
+        let InodeKind::File { dir_id, name } = &entry.kind else {
+            return Err(libc::EISDIR);
+        };
+        if name.starts_with("._") {
+            return Err(libc::ENOTSUP);
+        }
+        let dir_id = dir_id.clone();
+        let name = format!("._{name}");
+        let path = entry.path.parent().ok_or(libc::EINVAL)?.join(&name);
+        drop(entry);
+        if let Some(inode) = self.inodes.get_inode(&path)
+            && self.open_handle_tracker.has_open_handles(inode)
+        {
+            return Err(libc::EBUSY);
+        }
+        let ops = self.ops_clone();
+        let directory = dir_id.clone();
+        let filename = name.clone();
+        let data = self
+            .exec(async move {
+                let info = ops
+                    .find_file(&directory, &filename)
+                    .await
+                    .map_err(|error| crate::error::vault_error_to_errno(&error))?;
+                let Some(info) = info else {
+                    return if create {
+                        Ok(crate::resource_fork::empty())
+                    } else {
+                        Err(libc::ENOATTR)
+                    };
+                };
+                if info.encrypted_size
+                    > (crate::resource_fork::MAX_SIDECAR_SIZE + 128 * 1024) as u64
+                {
+                    return Err(libc::E2BIG);
+                }
+                ops.read_file(&directory, &filename)
+                    .await
+                    .map(|file| file.content)
+                    .map_err(|error| crate::error::vault_error_to_errno(&error))
+            })
+            .map_err(|error| error.to_errno())??;
+        Ok((dir_id, name, path, data))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_resource(
+        &self,
+        ino: u64,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        remove: bool,
+    ) -> Result<(), i32> {
+        let _guard = self.resource_lock.lock();
+        let (directory, filename, path, data) = self.resource_sidecar(ino, !remove)?;
+        let exists = !crate::resource_fork::resource(&data)?.is_empty();
+        trace!(
+            flags,
+            position,
+            value_len = value.len(),
+            exists,
+            "resource fork update"
+        );
+        if flags & 6 == 6 {
+            return Err(libc::EINVAL);
+        }
+        if flags & 2 != 0 && exists {
+            return Err(libc::EEXIST);
+        }
+        if (flags & 4 != 0 || remove) && !exists {
+            return Err(libc::ENOATTR);
+        }
+        let data = crate::resource_fork::replace(&data, value, position)?;
+        let ops = self.ops_clone();
+        let name_for_write = filename.clone();
+        self.exec_with_timeout(
+            async move { ops.write_file(&directory, &name_for_write, &data).await },
+            self.write_timeout,
+        )
+        .map_err(|error| error.to_errno())?
+        .map_err(|error| crate::error::write_error_to_errno(&error))?;
+        if let Some(inode) = self.inodes.get_inode(&path) {
+            self.attr_cache.invalidate(inode);
+            if let Some(scheduler) = &self.scheduler {
+                scheduler.invalidate_read_cache_inode(inode);
+            }
+            self.notify_detached(move |notifier| {
+                let _ = notifier.inval_inode(fuser::INodeNo(inode), 0, 0);
+            });
+        }
+        if let Some(parent) = path.parent().and_then(|path| self.inodes.get_inode(&path)) {
+            self.attr_cache.remove_negative(parent, &filename);
+            self.dir_cache.invalidate(parent);
+            self.notify_detached(move |notifier| {
+                let _ = notifier.inval_entry(fuser::INodeNo(parent), OsStr::new(&filename));
+            });
+        }
+        Ok(())
+    }
+
     /// Creates a new CryptomatorFS from a vault path and password.
     ///
     /// Uses the default configuration optimized for network filesystems
@@ -1028,6 +1138,8 @@ impl CryptomatorFS {
             )));
 
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            resource_lock: parking_lot::Mutex::new(()),
             ops,
             inodes,
             attr_cache,
@@ -2257,6 +2369,9 @@ impl Filesystem for CryptomatorFS {
         };
         drop(entry);
 
+        #[cfg(target_os = "macos")]
+        let _resource_guard = name.starts_with("._").then(|| self.resource_lock.lock());
+
         // Check if opening for write
         let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
         let is_trunc = (flags & libc::O_TRUNC) != 0;
@@ -3347,6 +3462,11 @@ impl Filesystem for CryptomatorFS {
         let parent_path = parent_entry.path.clone();
         drop(parent_entry);
 
+        #[cfg(target_os = "macos")]
+        let _resource_guard = name_str
+            .starts_with("._")
+            .then(|| self.resource_lock.lock());
+
         // Check if entry already exists (file, directory, or symlink)
         // This is needed because macOS FUSE doesn't always call lookup before create
         let child_path = parent_path.join(name_str);
@@ -3399,9 +3519,7 @@ impl Filesystem for CryptomatorFS {
             },
         );
 
-        // TODO: Re-enable when open_handle_tracker is added back
-        // Track open handle for POSIX-compliant deferred deletion
-        // self.open_handle_tracker.add_handle(inode);
+        self.open_handle_tracker.add_handle(inode);
 
         // Just created, so mtime = now is correct
         let attr = self.make_file_attr(inode, 0, None);
@@ -5289,23 +5407,57 @@ impl Filesystem for CryptomatorFS {
 
     // ==================== Extended Attributes ====================
     //
-    // Vault Format 8 has no native xattr records. ENOTSUP lets macFUSE store
-    // attributes in AppleDouble sidecars, encrypted as ordinary vault files.
+    // Resource forks are handled natively using standard encrypted AppleDouble
+    // entries. Other attributes use macFUSE sidecar fallback through ENOTSUP.
 
     fn getxattr(
+        &self,
+        req: &fuser::Request,
+        ino: fuser::INodeNo,
+        name: &OsStr,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        self.getxattr_with_position(req, ino, name, size, 0, reply);
+    }
+
+    #[allow(clippy::used_underscore_binding)]
+    fn getxattr_with_position(
         &self,
         _req: &fuser::Request,
         _ino: fuser::INodeNo,
         _name: &OsStr,
         _size: u32,
+        _position: u32,
         reply: fuser::ReplyXattr,
     ) {
-        // Extended attributes are not supported for Cryptomator vaults
-        // Note: ENOTSUP (not ENODATA) indicates xattrs aren't supported at all,
-        // rather than the specific attribute not existing.
+        #[cfg(target_os = "macos")]
+        if _name == OsStr::new("com.apple.ResourceFork") {
+            let _guard = self.resource_lock.lock();
+            let result = self
+                .resource_sidecar(_ino.0, false)
+                .and_then(|(_, _, _, data)| {
+                    let resource = crate::resource_fork::resource(&data)?;
+                    if resource.is_empty() {
+                        return Err(libc::ENOATTR);
+                    }
+                    Ok(resource.to_vec())
+                });
+            match result {
+                Ok(data) if _size == 0 => reply.size(u32::try_from(data.len()).unwrap_or(u32::MAX)),
+                Ok(data) => {
+                    let start = (_position as usize).min(data.len());
+                    let end = start.saturating_add(_size as usize).min(data.len());
+                    reply.data(&data[start..end]);
+                }
+                Err(error) => reply.error(fuser::Errno::from_i32(error)),
+            }
+            return;
+        }
         reply.error(fuser::Errno::from_i32(libc::ENOTSUP));
     }
 
+    #[allow(clippy::used_underscore_binding)]
     fn setxattr(
         &self,
         _req: &fuser::Request,
@@ -5316,6 +5468,14 @@ impl Filesystem for CryptomatorFS {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        #[cfg(target_os = "macos")]
+        if _name == OsStr::new("com.apple.ResourceFork") {
+            match self.write_resource(_ino.0, _value, _flags, _position, false) {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(fuser::Errno::from_i32(error)),
+            }
+            return;
+        }
         reply.error(fuser::Errno::from_i32(libc::ENOTSUP));
     }
 
@@ -5329,6 +5489,7 @@ impl Filesystem for CryptomatorFS {
         reply.error(fuser::Errno::from_i32(libc::ENOTSUP));
     }
 
+    #[allow(clippy::used_underscore_binding)]
     fn removexattr(
         &self,
         _req: &fuser::Request,
@@ -5336,6 +5497,14 @@ impl Filesystem for CryptomatorFS {
         _name: &OsStr,
         reply: ReplyEmpty,
     ) {
+        #[cfg(target_os = "macos")]
+        if _name == OsStr::new("com.apple.ResourceFork") {
+            match self.write_resource(_ino.0, &[], 0, 0, true) {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(fuser::Errno::from_i32(error)),
+            }
+            return;
+        }
         reply.error(fuser::Errno::from_i32(libc::ENOTSUP));
     }
 }

@@ -40,7 +40,6 @@ fn macfuse_backend_option() -> Option<MountOption> {
 fn platform_mount_options(vault_id: &str) -> Vec<MountOption> {
     let mut options = vec![
         MountOption::CUSTOM(format!("volname={vault_id}")),
-        MountOption::CUSTOM("auto_xattr".to_string()),
         MountOption::CUSTOM("daemon_timeout=30".to_string()),
     ];
     options.extend(macfuse_backend_option());
@@ -621,8 +620,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn finder_metadata_is_not_blocked() {
         let options = platform_mount_options("test");
-        assert!(options.iter().any(|option| matches!(option,
-            MountOption::CUSTOM(value) if value == "auto_xattr")));
+
         assert!(!options.iter().any(|option| matches!(option,
             MountOption::CUSTOM(value) if value == "noappledouble" || value == "noapplexattr")));
     }

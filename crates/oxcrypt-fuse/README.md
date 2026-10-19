@@ -234,7 +234,7 @@ This implementation follows the [Cryptomator Security Architecture](https://docs
 
 ## Limitations
 
-- **Extended attributes**: macOS uses macFUSE AppleDouble (`._`) sidecars for Finder tags and Finder Info. Sidecars are encrypted as ordinary vault files and must be included in backups. Other platforms do not expose these as native xattrs.
+- **Extended attributes**: macOS uses macFUSE AppleDouble (`._`) sidecars for Finder tags, Finder Info and resource forks. Sidecars are encrypted as ordinary vault files and must be included in backups. Other platforms do not expose these as native xattrs.
 - **Single vault**: Each mount handles one vault; multiple mounts needed for multiple vaults
 - **No hard links**: Cryptomator format doesn't support hard links
 
@@ -262,7 +262,15 @@ handles use streaming reads. Benchmark representative file sizes before deployme
 
 The mount does not enable `noappledouble` or `noapplexattr`: blocking sidecars would
 break Finder metadata and some file-copy operations. No new vault format is introduced.
-The `auto_xattr` option directs macFUSE to handle attributes through sidecars.
-Resource-fork writes through `xattr` returned `EINVAL` on macOS 27.0.1 with macFUSE
-5.4.0 during validation; resource-fork compatibility is not guaranteed by this backend.
+Resource forks use native FUSE callbacks backed by the standard AppleDouble
+resource entry; other attributes use macFUSE's normal sidecar fallback. Do not
+force `auto_xattr`, which bypasses the native resource-fork handlers. The vendored
+fuser forwards macOS resource-fork offsets without changing existing filesystem
+implementations' zero-offset behavior.
+
+Resource sidecars are limited to 64 MiB and malformed containers are rejected.
+Updates return `EBUSY` while the sidecar has open handles, to avoid overwriting a
+concurrent metadata writer. Finder Info and opaque attribute payload offsets are
+preserved. Tests cover positional reads/writes, attribute coexistence, rename,
+`cp -p`, deletion and remount on macOS 27.0.1 / macFUSE 5.4.0.
 See [macFUSE mount options](https://github.com/macfuse/macfuse/wiki/Mount-Options).

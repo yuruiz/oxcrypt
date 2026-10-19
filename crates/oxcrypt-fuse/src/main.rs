@@ -278,7 +278,6 @@ fn mount_and_wait(cli: &Cli, fs: CryptomatorFS) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         options.push(fuser::MountOption::CUSTOM(format!("volname={vault_name}")));
-        options.push(fuser::MountOption::CUSTOM("auto_xattr".to_string()));
         options.push(fuser::MountOption::CUSTOM(format!(
             "daemon_timeout={}",
             cli.daemon_timeout

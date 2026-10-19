@@ -804,6 +804,24 @@ pub trait Filesystem: Send + Sync + 'static {
         reply.error(Errno::ENOSYS);
     }
 
+    /// Get an extended attribute with a macOS resource-fork offset.
+    /// Implementations without positioned reads reject nonzero offsets.
+    fn getxattr_with_position(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        size: u32,
+        position: u32,
+        reply: ReplyXattr,
+    ) {
+        if position == 0 {
+            self.getxattr(req, ino, name, size, reply);
+        } else {
+            reply.error(Errno::EINVAL);
+        }
+    }
+
     /// List extended attribute names.
     /// If `size` is 0, the size of the value should be sent with `reply.size()`.
     /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
