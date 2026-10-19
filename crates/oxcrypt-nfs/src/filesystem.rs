@@ -21,16 +21,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, trace};
 
-/// Flush buffer when it reaches this size to prevent unbounded memory growth.
-/// 4MB threshold allows batching ~128 typical 32KB writes while limiting memory.
-/// Configurable via OXCRYPT_NFS_FLUSH_THRESHOLD environment variable.
-static FLUSH_THRESHOLD: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("OXCRYPT_NFS_FLUSH_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4 * 1024 * 1024)
-});
-
 /// NFS filesystem implementation for Cryptomator vaults.
 ///
 /// This implements the `NFSFileSystem` trait to provide NFS access to vault contents.
@@ -61,7 +51,8 @@ pub struct CryptomatorNFS {
     inodes: NfsInodeTable,
     /// Write buffers for files with pending writes.
     /// Key: file ID, Value: WriteBuffer containing pending data.
-    write_buffers: DashMap<fileid3, WriteBuffer>,
+    write_buffers: Arc<DashMap<fileid3, WriteBuffer>>,
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
     /// Read cache for decrypted file contents.
     /// Key: file ID, Value: decrypted content.
     /// This prevents re-decrypting the entire file on each NFS READ RPC.
@@ -76,6 +67,69 @@ pub struct CryptomatorNFS {
     stats: Arc<VaultStats>,
 }
 
+/// Shared by RPC requests and the mount lifecycle.
+#[derive(Clone)]
+pub(crate) struct NfsWriteback {
+    ops: Arc<VaultOperationsAsync>,
+    buffers: Arc<DashMap<fileid3, WriteBuffer>>,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    stats: Arc<VaultStats>,
+}
+
+struct WriteActivity(Arc<VaultStats>);
+
+impl Drop for WriteActivity {
+    fn drop(&mut self) {
+        self.0.finish_write();
+    }
+}
+
+impl NfsWriteback {
+    pub(crate) async fn flush_all(&self) -> Result<(), nfsstat3> {
+        let ids: Vec<_> = self.buffers.iter().map(|entry| *entry.key()).collect();
+        let mut failure = None;
+        for id in ids {
+            if let Err(error) = self.flush(id).await {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    async fn flush(&self, id: fileid3) -> Result<u64, nfsstat3> {
+        // Prevent an older snapshot from overwriting a newer one on disk.
+        let _guard = self.lock.lock().await;
+        let Some(buffer) = self.buffers.get(&id) else {
+            return Ok(0);
+        };
+        let len = buffer.len();
+        if !buffer.is_dirty() {
+            return Ok(len);
+        }
+        let revision = buffer.revision();
+        let content = buffer.snapshot();
+        let dir_id = buffer.dir_id().clone();
+        let name = buffer.filename().to_owned();
+        drop(buffer);
+        self.stats.start_write();
+        let _activity = WriteActivity(Arc::clone(&self.stats));
+        let path = self
+            .ops
+            .write_file(&dir_id, &name, &content)
+            .await
+            .map_err(|error| vault_error_to_nfsstat(&error))?;
+        self.ops
+            .sync_encrypted_file(&path, false)
+            .await
+            .map_err(|error| vault_error_to_nfsstat(&error))?;
+        self.stats.record_encrypted(len);
+        self.buffers.remove_if(&id, |_, buffer| {
+            buffer.revision() == revision && Arc::ptr_eq(&buffer.snapshot(), &content)
+        });
+        Ok(len)
+    }
+}
+
 impl CryptomatorNFS {
     /// Creates a new NFS filesystem for the given vault.
     pub fn new(ops: Arc<VaultOperationsAsync>) -> Self {
@@ -87,7 +141,8 @@ impl CryptomatorNFS {
         Self {
             ops,
             inodes: NfsInodeTable::new(),
-            write_buffers: DashMap::new(),
+            write_buffers: Arc::new(DashMap::new()),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             read_cache: SyncTtlCache::new(READ_CACHE_TTL),
             generation,
             uid: unsafe { libc::getuid() },
@@ -101,64 +156,22 @@ impl CryptomatorNFS {
         Arc::clone(&self.stats)
     }
 
-    /// Flush all dirty buffers to vault. Called during unmount.
-    pub async fn flush_all_buffers(&self) -> Result<(), nfsstat3> {
-        let buffer_ids: Vec<fileid3> = self
-            .write_buffers
-            .iter()
-            .map(|entry| *entry.key())
-            .collect();
-
-        debug!(count = buffer_ids.len(), "Flushing all buffers on shutdown");
-
-        for id in buffer_ids {
-            if let Err(e) = self.flush_buffer(id).await {
-                error!(id, nfs_error = ?e, "Failed to flush buffer during shutdown");
-                // Continue flushing other buffers even if one fails
-            }
+    pub(crate) fn writeback(&self) -> NfsWriteback {
+        NfsWriteback {
+            ops: Arc::clone(&self.ops),
+            buffers: Arc::clone(&self.write_buffers),
+            lock: Arc::clone(&self.flush_lock),
+            stats: Arc::clone(&self.stats),
         }
-        Ok(())
     }
 
-    /// Flush a write buffer to the vault.
-    ///
-    /// This writes the buffered content to the vault and removes the buffer.
-    /// Returns the final content length on success.
+    /// Persist every pending buffer and report failures to the caller.
+    pub async fn flush_all_buffers(&self) -> Result<(), nfsstat3> {
+        self.writeback().flush_all().await
+    }
+
     async fn flush_buffer(&self, id: fileid3) -> Result<u64, nfsstat3> {
-        if let Some((_, buffer)) = self.write_buffers.remove(&id) {
-            let len = buffer.len();
-            if buffer.is_dirty() {
-                debug!(id, len, "Flushing write buffer to vault");
-                self.stats.start_write();
-
-                // Capture values before write_file consumes the buffer
-                let dir_id = buffer.dir_id().clone();
-                let filename = buffer.filename().to_string();
-
-                let result = self
-                    .ops
-                    .write_file(buffer.dir_id(), buffer.filename(), buffer.content())
-                    .await
-                    .map_err(|e| {
-                        // Log the underlying vault error before converting to NFS status
-                        error!(
-                            id,
-                            dir_id = %dir_id,
-                            filename = %filename,
-                            error = %e,
-                            "Failed to write file to vault"
-                        );
-                        vault_error_to_nfsstat(&e)
-                    });
-                self.stats.finish_write();
-                result?;
-                // Record encrypted bytes written to vault
-                self.stats.record_encrypted(len);
-            }
-            Ok(len)
-        } else {
-            Ok(0)
-        }
+        self.writeback().flush(id).await
     }
 
     /// Get or create a write buffer for a file.
@@ -201,16 +214,7 @@ impl CryptomatorNFS {
                 }
                 decrypted.content
             }
-            Err(e) => {
-                error!(
-                    id,
-                    dir_id = %dir_id,
-                    name = %name,
-                    error = %e,
-                    "Failed to read existing file for buffer (treating as new file)"
-                );
-                Vec::new()
-            }
+            Err(e) => return Err(vault_error_to_nfsstat(&e)),
         };
 
         // Use entry API to atomically insert only if key doesn't exist.
@@ -752,28 +756,14 @@ impl NFSFileSystem for CryptomatorNFS {
         // Write to buffer
         buffer.write(offset, data);
         let new_size = buffer.len();
-        let buffer_size = new_size; // Capture size before dropping buffer
         drop(buffer); // Release buffer before flushing
 
         // Record bytes written
         self.stats.record_write(data.len() as u64);
 
-        // Conditionally flush based on buffer size
-        let should_flush = buffer_size >= (*FLUSH_THRESHOLD) as u64; // Large buffer
-
-        if should_flush {
-            debug!(id, buffer_size, "Flushing buffer (threshold reached)");
-            if let Err(e) = self.flush_buffer(id).await {
-                error!(id, nfs_error = ?e, "Flush buffer failed in write()");
-                self.stats.record_write_latency(op_start.elapsed());
-                self.stats.record_error();
-                return Err(e);
-            }
-            self.stats.record_write_latency(op_start.elapsed());
-        } else {
-            debug!(id, buffer_size, "Deferred flush (below threshold)");
-            self.stats.record_write_latency(op_start.elapsed());
-        }
+        // nfsserve acknowledges every successful WRITE as FILE_SYNC.
+        self.flush_buffer(id).await?;
+        self.stats.record_write_latency(op_start.elapsed());
 
         // Return attributes with updated size (just modified, use current time)
         Ok(self.file_attr(id, new_size, None))
@@ -1556,5 +1546,111 @@ impl NFSFileSystem for ArcNfs {
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
         self.0.readlink(id).await
+    }
+}
+
+#[cfg(test)]
+mod writeback_tests {
+    use crate::filesystem::*;
+    use oxcrypt_mount::testing::TempVault;
+
+    #[tokio::test]
+    async fn cancelled_flush_keeps_the_buffer() {
+        let vault = TempVault::new();
+        let ops =
+            Arc::new(VaultOperationsAsync::open(vault.path(), TempVault::password()).unwrap());
+        let filesystem = CryptomatorNFS::new(Arc::clone(&ops));
+        let mut buffer = WriteBuffer::new_for_create(DirId::root(), "note".into());
+        buffer.write(0, b"pending");
+        filesystem.write_buffers.insert(42, buffer);
+        let writer = ops
+            .create_file(&DirId::root(), "lock-holder")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), filesystem.flush_buffer(42))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            filesystem.write_buffers.get(&42).unwrap().content(),
+            b"pending"
+        );
+        drop(writer);
+        filesystem.flush_all_buffers().await.unwrap();
+        assert_eq!(
+            ops.read_file(&DirId::root(), "note").await.unwrap().content,
+            b"pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_does_not_replace_unreadable_existing_content() {
+        let vault = TempVault::new();
+        let ops =
+            Arc::new(VaultOperationsAsync::open(vault.path(), TempVault::password()).unwrap());
+        let filesystem = CryptomatorNFS::new(Arc::clone(&ops));
+        let (id, _) = filesystem
+            .create(ROOT_FILEID, &b"note"[..].into(), sattr3::default())
+            .await
+            .unwrap();
+        let path = ops
+            .write_file(&DirId::root(), "note", b"original")
+            .await
+            .unwrap();
+        let mut corrupt = std::fs::read(&path).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &corrupt).unwrap();
+        assert!(filesystem.write(id, 0, b"edit").await.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), corrupt);
+    }
+
+    #[tokio::test]
+    async fn failed_flush_is_retained_and_shutdown_reports_it() {
+        let vault = TempVault::new();
+        let ops =
+            Arc::new(VaultOperationsAsync::open(vault.path(), TempVault::password()).unwrap());
+        let filesystem = CryptomatorNFS::new(Arc::clone(&ops));
+        let path = ops
+            .write_file(&DirId::root(), "note", b"old")
+            .await
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut buffer = WriteBuffer::new_for_create(DirId::root(), "note".into());
+        buffer.write(0, b"pending note");
+        filesystem.write_buffers.insert(42, buffer);
+        assert!(filesystem.flush_all_buffers().await.is_err());
+        assert_eq!(
+            filesystem.write_buffers.get(&42).unwrap().content(),
+            b"pending note"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        filesystem.flush_all_buffers().await.unwrap();
+        assert!(filesystem.write_buffers.is_empty());
+        assert_eq!(
+            ops.read_file(&DirId::root(), "note").await.unwrap().content,
+            b"pending note"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_write_is_persisted_before_file_sync_acknowledgement() {
+        let vault = TempVault::new();
+        let ops =
+            Arc::new(VaultOperationsAsync::open(vault.path(), TempVault::password()).unwrap());
+        let filesystem = CryptomatorNFS::new(Arc::clone(&ops));
+        let (id, _) = filesystem
+            .create(ROOT_FILEID, &b"note"[..].into(), sattr3::default())
+            .await
+            .unwrap();
+        filesystem
+            .write(id, 0, b"small durable write")
+            .await
+            .unwrap();
+        assert_eq!(
+            ops.read_file(&DirId::root(), "note").await.unwrap().content,
+            b"small durable write"
+        );
     }
 }

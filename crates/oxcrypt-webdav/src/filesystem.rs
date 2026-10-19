@@ -52,6 +52,7 @@ pub struct CryptomatorWebDav {
     ops: Arc<VaultOperationsAsync>,
     /// Write buffer table for pending PUT operations.
     write_buffers: Arc<WriteBufferTable>,
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
     /// Metadata cache to reduce vault operations.
     metadata_cache: Arc<MetadataCache>,
     /// Path resolution cache (vault_path -> DirId).
@@ -77,6 +78,7 @@ impl CryptomatorWebDav {
         Self {
             ops,
             write_buffers: Arc::new(HandleTable::new()),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             metadata_cache: Arc::new(metadata_cache),
             path_cache: Arc::new(path_cache),
             stats,
@@ -253,24 +255,34 @@ impl CryptomatorWebDav {
 
     /// Flush a write buffer to the vault.
     async fn flush_write_buffer(&self, path: &str) -> Result<(), FsError> {
+        let _guard = self.flush_lock.lock().await;
         let path_key = path.to_string();
-        if let Some(buffer) = self.write_buffers.remove(&path_key)
-            && buffer.is_dirty()
-        {
-            let dir_id = buffer.dir_id().clone();
-            let filename = buffer.filename().to_string();
-            let content = buffer.into_content();
-
-            debug!(path = %path, size = content.len(), "Flushing write buffer to vault");
-
-            self.ops
-                .write_file(&dir_id, &filename, &content)
-                .await
-                .map_err(write_error_to_fs_error)?;
-
-            // Invalidate cache since file size has changed
-            self.metadata_cache.invalidate(&path_key);
+        let Some(buffer) = self.write_buffers.get(&path_key) else {
+            return Ok(());
+        };
+        if !buffer.is_dirty() {
+            return Ok(());
         }
+        let revision = buffer.revision();
+        let content = buffer.snapshot();
+        let dir_id = buffer.dir_id().clone();
+        let filename = buffer.filename().to_owned();
+        drop(buffer);
+        let encrypted_path = self
+            .ops
+            .write_file(&dir_id, &filename, &content)
+            .await
+            .map_err(write_error_to_fs_error)?;
+        self.ops
+            .sync_encrypted_file(&encrypted_path, false)
+            .await
+            .map_err(write_error_to_fs_error)?;
+        if let Some(mut buffer) = self.write_buffers.get_mut(&path_key)
+            && Arc::ptr_eq(&buffer.snapshot(), &content)
+        {
+            buffer.mark_clean_if_revision(revision);
+        }
+        self.metadata_cache.invalidate(&path_key);
         Ok(())
     }
 
@@ -297,7 +309,7 @@ impl CryptomatorWebDav {
 
         for file in files {
             let file_path = Self::join_path(dir_path, &file.name);
-            self.flush_write_buffer(&file_path).await.ok();
+            self.flush_write_buffer(&file_path).await?;
             self.ops
                 .delete_file(dir_id, &file.name)
                 .await
@@ -354,7 +366,7 @@ impl CryptomatorWebDav {
 
             for file in files {
                 let file_path = Self::join_path(&current_path, &file.name);
-                self.flush_write_buffer(&file_path).await.ok();
+                self.flush_write_buffer(&file_path).await?;
                 self.ops
                     .delete_file(&current_dir_id, &file.name)
                     .await
@@ -437,7 +449,7 @@ impl CryptomatorWebDav {
 
             for file in files {
                 let source_path = Self::join_path(&current_from_path, &file.name);
-                self.flush_write_buffer(&source_path).await.ok();
+                self.flush_write_buffer(&source_path).await?;
                 let content = self
                     .ops
                     .read_file(&current_from_id, &file.name)
@@ -553,19 +565,17 @@ impl DavFileSystem for CryptomatorWebDav {
                     // Open existing file for append/modify
                     match self.ops.read_file(&dir_id, &filename).await {
                         Ok(content) => WriteBuffer::new(dir_id, filename.clone(), content.content),
-                        Err(_) if options.create => {
-                            // File doesn't exist, create new
-                            WriteBuffer::new_for_create(dir_id, filename.clone())
+                        Err(error) => {
+                            let error = vault_error_to_fs_error(error);
+                            if options.create && matches!(error, FsError::NotFound) {
+                                WriteBuffer::new_for_create(dir_id, filename.clone())
+                            } else {
+                                return Err(error);
+                            }
                         }
-                        Err(e) => return Err(vault_error_to_fs_error(e)),
                     }
                 };
 
-                self.write_buffers.insert(vault_path.clone(), buffer);
-                let buffer = self.write_buffers.remove(&vault_path).ok_or_else(|| {
-                    tracing::error!(path = %vault_path, "Write buffer disappeared immediately after insert");
-                    FsError::GeneralFailure
-                })?;
                 let file = CryptomatorFile::writer(
                     buffer,
                     filename,
@@ -757,7 +767,7 @@ impl DavFileSystem for CryptomatorWebDav {
             debug!(vault_path = %vault_path, "Removing file");
 
             // First flush any pending writes
-            self.flush_write_buffer(&vault_path).await.ok();
+            self.flush_write_buffer(&vault_path).await?;
 
             let (parent_dir_id, name) = match self.resolve_path(&vault_path).await {
                 Ok(result) => result,
@@ -810,7 +820,7 @@ impl DavFileSystem for CryptomatorWebDav {
             debug!(from = %from_path, to = %to_path, "Renaming/moving");
 
             // Flush any pending writes on source
-            self.flush_write_buffer(&from_path).await.ok();
+            self.flush_write_buffer(&from_path).await?;
 
             let (from_dir_id, from_name) = match self.resolve_path(&from_path).await {
                 Ok(result) => result,
@@ -1044,7 +1054,7 @@ impl DavFileSystem for CryptomatorWebDav {
                     .map_err(write_error_to_fs_error)?;
                 self.metadata_cache.invalidate(&to_path);
             } else {
-                self.flush_write_buffer(&from_path).await.ok();
+                self.flush_write_buffer(&from_path).await?;
                 // Read source file
                 let content = match self.ops.read_file(&from_dir_id, &from_name).await {
                     Ok(content) => content,
@@ -1086,7 +1096,103 @@ impl DavFileSystem for CryptomatorWebDav {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::filesystem::*;
+
+    #[tokio::test]
+    async fn put_handle_can_retry_a_failed_flush() {
+        let vault = oxcrypt_mount::testing::TempVault::new();
+        let ops = Arc::new(
+            VaultOperationsAsync::open(vault.path(), oxcrypt_mount::testing::TempVault::password())
+                .unwrap(),
+        );
+        let fs = CryptomatorWebDav::new(Arc::clone(&ops));
+        let path = ops
+            .write_file(&DirId::root(), "note", b"old")
+            .await
+            .unwrap();
+        let dav_path = DavPath::new("/note").unwrap();
+        let mut file = fs
+            .open(
+                &dav_path,
+                OpenOptions {
+                    write: true,
+                    truncate: true,
+                    ..OpenOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        file.write_bytes(bytes::Bytes::from_static(b"pending"))
+            .await
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(file.flush().await.is_err());
+        std::fs::remove_dir(&path).unwrap();
+        file.flush().await.unwrap();
+        assert_eq!(
+            ops.read_file(&DirId::root(), "note").await.unwrap().content,
+            b"pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_error_preserves_pending_bytes_for_retry() {
+        let vault = oxcrypt_mount::testing::TempVault::new();
+        let ops = Arc::new(
+            VaultOperationsAsync::open(vault.path(), oxcrypt_mount::testing::TempVault::password())
+                .unwrap(),
+        );
+        let fs = CryptomatorWebDav::new(Arc::clone(&ops));
+        let path = ops
+            .write_file(&DirId::root(), "note", b"old")
+            .await
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut buffer = WriteBuffer::new_for_create(DirId::root(), "note".into());
+        buffer.write(0, b"pending");
+        fs.write_buffers.insert("/note".into(), buffer);
+        assert!(fs.flush_write_buffer("/note").await.is_err());
+        assert_eq!(
+            fs.write_buffers.get(&"/note".into()).unwrap().content(),
+            b"pending"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        fs.flush_write_buffer("/note").await.unwrap();
+        assert_eq!(
+            ops.read_file(&DirId::root(), "note").await.unwrap().content,
+            b"pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_permission_does_not_hide_authentication_failure() {
+        let vault = oxcrypt_mount::testing::TempVault::new();
+        let ops = Arc::new(
+            VaultOperationsAsync::open(vault.path(), oxcrypt_mount::testing::TempVault::password())
+                .unwrap(),
+        );
+        let fs = CryptomatorWebDav::new(Arc::clone(&ops));
+        let path = ops
+            .write_file(&DirId::root(), "note", b"original")
+            .await
+            .unwrap();
+        let mut corrupt = std::fs::read(&path).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &corrupt).unwrap();
+        let options = OpenOptions {
+            write: true,
+            create: true,
+            ..OpenOptions::default()
+        };
+        assert!(
+            fs.open(&DavPath::new("/note").unwrap(), options)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+    }
 
     #[test]
     fn test_parse_path() {
