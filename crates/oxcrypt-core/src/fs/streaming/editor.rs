@@ -61,6 +61,8 @@ pub struct VaultFileEditor {
     dirty: bool,
     dirty_chunk: Option<(u64, Zeroizing<Vec<u8>>)>,
     expected: Option<Identity>,
+    pending_accessed: Option<std::time::SystemTime>,
+    pending_modified: Option<std::time::SystemTime>,
     stats: EditStats,
 }
 
@@ -94,6 +96,8 @@ impl VaultFileEditor {
             dirty: false,
             dirty_chunk: None,
             expected,
+            pending_accessed: None,
+            pending_modified: None,
             stats: EditStats::default(),
         })
     }
@@ -124,9 +128,9 @@ impl VaultFileEditor {
     pub fn is_empty(&self) -> bool {
         self.size == 0
     }
-    /// Whether the stage differs from the committed file.
+    /// Whether content or metadata still need a durable commit.
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.dirty || self.pending_accessed.is_some() || self.pending_modified.is_some()
     }
     /// Crypto and fallback copy counters.
     pub fn stats(&self) -> EditStats {
@@ -282,6 +286,7 @@ impl VaultFileEditor {
                 self.reader.chunk_cache.pop(&chunk);
                 self.dirty_chunk = Some((chunk, bytes));
                 self.size = self.size.max(position + count as u64);
+                self.pending_modified = Some(std::time::SystemTime::now());
                 self.dirty = true;
                 Ok(())
             })();
@@ -376,6 +381,7 @@ impl VaultFileEditor {
             self.reader.chunk_cache.pop(&number);
         }
         self.size = size;
+        self.pending_modified = Some(std::time::SystemTime::now());
         self.dirty = true;
         self.flush_chunk()?;
         let end = self.offset(tail)
@@ -453,6 +459,12 @@ impl VaultFileEditor {
             times = times.set_modified(time);
         }
         self.reader.file.set_times(times)?;
+        if let Some(time) = accessed {
+            self.pending_accessed = Some(time);
+        }
+        if let Some(time) = modified {
+            self.pending_modified = Some(time);
+        }
         if self.expected.is_some() {
             self.expected = Some(Identity::of(&self.reader.file.metadata()?)?);
         }
@@ -501,7 +513,7 @@ impl VaultFileEditor {
 
     /// Commit with conflict detection; failed commits retain the complete stage.
     pub fn commit(&mut self, destination: &Path, vault_root: &Path) -> io::Result<()> {
-        if !self.dirty {
+        if !self.is_dirty() {
             return Ok(());
         }
         let actual = match fs::metadata(destination) {
@@ -514,6 +526,13 @@ impl VaultFileEditor {
                 io::ErrorKind::WouldBlock,
                 "file changed since editor opened",
             ));
+        }
+        if !self.dirty {
+            // Metadata-only edits still require fsync, without rewriting content.
+            self.reader.file.sync_all()?;
+            self.pending_accessed = None;
+            self.pending_modified = None;
+            return Ok(());
         }
         self.flush_chunk()?;
         let cipher = self.cipher();
@@ -530,6 +549,16 @@ impl VaultFileEditor {
         let candidate_path = candidate.path().join("content");
         let (published, copied) = clone_ciphertext(&mut stage.file, &candidate_path)?;
         self.stats.copied_ciphertext_bytes += copied;
+        // Apply times after all ciphertext writes and copies: both operations
+        // can update mtime, and a copy fallback need not preserve source times.
+        let mut times = fs::FileTimes::new();
+        if let Some(time) = self.pending_accessed {
+            times = times.set_accessed(time);
+        }
+        if let Some(time) = self.pending_modified {
+            times = times.set_modified(time);
+        }
+        published.set_times(times)?;
         published.sync_all()?;
         fs::rename(&candidate_path, destination)?;
         self.expected = Some(Identity::of(&published.metadata()?)?);
@@ -538,6 +567,8 @@ impl VaultFileEditor {
         self.reader.plaintext_size = self.size;
         destination.clone_into(&mut self.reader.decryptor.path);
         self.stage = None;
+        self.pending_accessed = None;
+        self.pending_modified = None;
         self.dirty = false;
         Ok(())
     }
