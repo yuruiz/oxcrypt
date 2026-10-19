@@ -5116,6 +5116,18 @@ impl Filesystem for CryptomatorFS {
         _flags: fuser::CopyFileRangeFlags,
         reply: ReplyWrite,
     ) {
+        let Some(input_end) = offset_in.checked_add(len) else {
+            reply.error(fuser::Errno::from_i32(libc::EINVAL));
+            return;
+        };
+        let Some(output_end) = offset_out.checked_add(len) else {
+            reply.error(fuser::Errno::from_i32(libc::EINVAL));
+            return;
+        };
+        if ino_in == ino_out && offset_in < output_end && offset_out < input_end {
+            reply.error(fuser::Errno::from_i32(libc::EINVAL));
+            return;
+        }
         let ino_in = ino_in.0;
         let fh_in = fh_in.0;
         let offset_in = offset_in.cast_signed();

@@ -3434,8 +3434,8 @@ impl VaultOperationsAsync {
     ///
     /// Returns an error if:
     /// - Either file doesn't exist
-    /// - A file with the temp name already exists (extremely unlikely with UUID)
-    /// - IO error during any phase
+    /// - Atomic exchange is unavailable on the backing filesystem
+    /// - An I/O or synchronization operation fails
     #[instrument(level = "info", skip(self), fields(dir_a = %dir_id_a.as_str(), name_a = %name_a, dir_b = %dir_id_b.as_str(), name_b = %name_b))]
     pub async fn atomic_swap_files(
         &self,
