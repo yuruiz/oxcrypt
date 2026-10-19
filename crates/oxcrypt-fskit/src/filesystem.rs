@@ -17,7 +17,7 @@ use tokio::runtime::{self, Runtime};
 use tracing::{debug, error, trace, warn};
 
 use oxcrypt_core::error::{VaultOperationError, VaultWriteError};
-use oxcrypt_core::fs::encrypted_to_plaintext_size_or_zero;
+use oxcrypt_core::fs::streaming::encrypted_to_plaintext_size_or_zero_for_cipher;
 use oxcrypt_core::vault::VaultOperationsAsync;
 use oxcrypt_core::vault::config::VaultError;
 use oxcrypt_core::vault::path::{DirId, VaultPath};
@@ -1767,7 +1767,8 @@ impl CryptoFilesystem {
             })?;
 
         let encrypted_size = file_info.map_or(0, |info| info.encrypted_size);
-        let size = encrypted_to_plaintext_size_or_zero(encrypted_size);
+        let size =
+            encrypted_to_plaintext_size_or_zero_for_cipher(encrypted_size, self.ops.cipher_combo());
 
         // Cache the result
         self.attr_cache.insert(
@@ -1784,7 +1785,44 @@ impl CryptoFilesystem {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::filesystem::*;
+
+    #[test]
+    fn configured_cipher_sizes_match_lookup_attributes_and_enumeration() {
+        use oxcrypt_core::vault::config::CipherCombo;
+        use oxcrypt_mount::testing::TempVault;
+        let vault = TempVault::new();
+        let mut fs =
+            CryptoFilesystem::new_internal(vault.path().to_str().unwrap(), TempVault::password())
+                .unwrap();
+        fs.ops = Arc::new(VaultOperationsAsync::with_options(
+            vault.path(),
+            Arc::clone(fs.ops.master_key()),
+            220,
+            CipherCombo::SivCtrMac,
+        ));
+        for size in [0, 1, 32768, 32769] {
+            let name = format!("file-{size}");
+            fs.runtime
+                .block_on(fs.ops.write_file(&DirId::root(), &name, &vec![42; size]))
+                .unwrap();
+            let attr = fs.lookup(ROOT_ITEM_ID, name).0.unwrap();
+            assert_eq!(attr.attr_size(), size as u64);
+            assert_eq!(
+                fs.get_attributes(attr.attr_item_id())
+                    .0
+                    .unwrap()
+                    .attr_size(),
+                size as u64
+            );
+        }
+        for entry in fs.enumerate_directory(ROOT_ITEM_ID, 0).0.unwrap() {
+            let name = String::from_utf8(entry.entry_name()).unwrap();
+            if let Some(size) = name.strip_prefix("file-") {
+                assert_eq!(entry.entry_size(), size.parse::<u64>().unwrap());
+            }
+        }
+    }
 
     #[test]
     fn test_root_item_id() {

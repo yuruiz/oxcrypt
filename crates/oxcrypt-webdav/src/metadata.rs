@@ -7,6 +7,9 @@
 
 use dav_server::fs::{DavMetaData, FsError};
 use oxcrypt_core::vault::operations::{VaultDirectoryInfo, VaultFileInfo, VaultSymlinkInfo};
+use oxcrypt_core::{
+    fs::streaming::encrypted_to_plaintext_size_or_zero_for_cipher, vault::config::CipherCombo,
+};
 use std::time::SystemTime;
 
 /// Metadata for a vault entry (file, directory, or symlink).
@@ -60,11 +63,9 @@ impl CryptomatorMetaData {
     }
 
     /// Create metadata from a VaultFileInfo.
-    pub fn from_file(info: &VaultFileInfo) -> Self {
-        // Compute plaintext size from encrypted size
-        // Encrypted file structure: 68-byte header + ceil(plaintext_size / 32768) * (32768 + 48) bytes
-        // For simplicity, we estimate: plaintext ≈ encrypted_size * 0.998 (header + tag overhead)
-        let plaintext_size = Self::estimate_plaintext_size(info.encrypted_size);
+    pub fn from_file(info: &VaultFileInfo, cipher: CipherCombo) -> Self {
+        let plaintext_size =
+            encrypted_to_plaintext_size_or_zero_for_cipher(info.encrypted_size, cipher);
 
         // Try to get the modification time from the encrypted file
         let modified = std::fs::metadata(&info.encrypted_path)
@@ -110,49 +111,6 @@ impl CryptomatorMetaData {
             size,
             modified: SystemTime::now(),
         })
-    }
-
-    /// Estimate plaintext size from encrypted size.
-    ///
-    /// Cryptomator file structure:
-    /// - 68-byte header (12B nonce + 40B encrypted header + 16B tag)
-    /// - Chunks: each chunk is nonce (12B) + plaintext (up to 32KB) + tag (16B)
-    ///   Overhead per chunk = 28 bytes (12 + 16)
-    ///
-    /// Reverse calculation:
-    /// encrypted_content = encrypted_size - 68
-    /// For last chunk: encrypted_chunk_size = plaintext_size + 28
-    fn estimate_plaintext_size(encrypted_size: u64) -> u64 {
-        const HEADER_SIZE: u64 = 68;
-        const CHUNK_OVERHEAD: u64 = 28; // 12B nonce + 16B tag
-        const MAX_PLAINTEXT_CHUNK: u64 = 32768;
-        const MAX_ENCRYPTED_CHUNK: u64 = MAX_PLAINTEXT_CHUNK + CHUNK_OVERHEAD; // 32796
-
-        if encrypted_size <= HEADER_SIZE {
-            return 0;
-        }
-
-        let content_size = encrypted_size - HEADER_SIZE;
-
-        // Calculate number of full chunks and remainder
-        let num_full_chunks = content_size / MAX_ENCRYPTED_CHUNK;
-        let remainder = content_size % MAX_ENCRYPTED_CHUNK;
-
-        // Full chunks contribute MAX_PLAINTEXT_CHUNK each
-        let full_chunk_plaintext = num_full_chunks * MAX_PLAINTEXT_CHUNK;
-
-        // Remainder is the last (possibly partial) chunk
-        let last_chunk_plaintext = if remainder > CHUNK_OVERHEAD {
-            remainder - CHUNK_OVERHEAD
-        } else if remainder > 0 {
-            // Edge case: remainder exists but is smaller than overhead
-            // This shouldn't happen with valid Cryptomator files
-            0
-        } else {
-            0
-        };
-
-        full_chunk_plaintext + last_chunk_plaintext
     }
 }
 
@@ -217,7 +175,7 @@ impl DavMetaData for CryptomatorMetaData {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::metadata::*;
 
     #[test]
     fn test_root_metadata() {
@@ -236,27 +194,31 @@ mod tests {
     }
 
     #[test]
-    fn test_plaintext_size_estimation() {
-        // Header only (empty file): 68 bytes encrypted
-        assert_eq!(CryptomatorMetaData::estimate_plaintext_size(68), 0);
-
-        // Very small encrypted file (smaller than header)
-        assert_eq!(CryptomatorMetaData::estimate_plaintext_size(50), 0);
-
-        // Small file: 7 bytes plaintext
-        // encrypted = 68 (header) + 12 (nonce) + 7 (plaintext) + 16 (tag) = 103
-        assert_eq!(CryptomatorMetaData::estimate_plaintext_size(103), 7);
-
-        // 100 bytes plaintext
-        // encrypted = 68 + 12 + 100 + 16 = 196
-        assert_eq!(CryptomatorMetaData::estimate_plaintext_size(196), 100);
-
-        // Exactly one full chunk: 32768 bytes plaintext
-        // encrypted = 68 + 12 + 32768 + 16 = 32864
-        assert_eq!(CryptomatorMetaData::estimate_plaintext_size(32864), 32768);
-
-        // One full chunk + 100 bytes: 32868 bytes plaintext
-        // encrypted = 68 + 32796 (full chunk) + 12 + 100 + 16 = 68 + 32796 + 128 = 32992
-        assert_eq!(CryptomatorMetaData::estimate_plaintext_size(32992), 32868);
+    fn file_metadata_uses_the_configured_cipher_overhead() {
+        for (cipher, encrypted, expected) in [
+            (CipherCombo::SivGcm, 68, 0),
+            (CipherCombo::SivGcm, 50, 0),
+            (CipherCombo::SivGcm, 103, 7),
+            (CipherCombo::SivGcm, 196, 100),
+            (CipherCombo::SivGcm, 32864, 32768),
+            (CipherCombo::SivGcm, 32992, 32868),
+            (CipherCombo::SivCtrMac, 88, 0),
+            (CipherCombo::SivCtrMac, 136, 0),
+            (CipherCombo::SivCtrMac, 137, 1),
+            (CipherCombo::SivCtrMac, 32904, 32768),
+            (CipherCombo::SivCtrMac, 33052, 32868),
+        ] {
+            let info = VaultFileInfo {
+                name: "test".into(),
+                encrypted_name: "encrypted.c9r".into(),
+                encrypted_path: "/nonexistent/oxcrypt-metadata-test".into(),
+                encrypted_size: encrypted,
+                is_shortened: false,
+            };
+            assert_eq!(
+                CryptomatorMetaData::from_file(&info, cipher).len(),
+                expected
+            );
+        }
     }
 }

@@ -5,13 +5,14 @@
 
 use crate::metadata::CryptomatorMetaData;
 use dav_server::fs::{DavDirEntry, DavMetaData, FsFuture};
+use oxcrypt_core::vault::config::CipherCombo;
 use oxcrypt_core::vault::operations::{VaultDirectoryInfo, VaultFileInfo, VaultSymlinkInfo};
 
 /// A directory entry in the vault.
 #[derive(Debug, Clone)]
 pub enum CryptomatorDirEntry {
     /// A file entry.
-    File(VaultFileInfo),
+    File(VaultFileInfo, CipherCombo),
     /// A directory entry.
     Directory(VaultDirectoryInfo),
     /// A symlink entry (exposed as regular file).
@@ -20,8 +21,8 @@ pub enum CryptomatorDirEntry {
 
 impl CryptomatorDirEntry {
     /// Create a file entry.
-    pub fn file(info: VaultFileInfo) -> Self {
-        CryptomatorDirEntry::File(info)
+    pub fn file(info: VaultFileInfo, cipher: CipherCombo) -> Self {
+        CryptomatorDirEntry::File(info, cipher)
     }
 
     /// Create a directory entry.
@@ -38,7 +39,7 @@ impl CryptomatorDirEntry {
 impl DavDirEntry for CryptomatorDirEntry {
     fn name(&self) -> Vec<u8> {
         match self {
-            CryptomatorDirEntry::File(f) => f.name.as_bytes().to_vec(),
+            CryptomatorDirEntry::File(f, _) => f.name.as_bytes().to_vec(),
             CryptomatorDirEntry::Directory(d) => d.name.as_bytes().to_vec(),
             CryptomatorDirEntry::Symlink(s) => s.name.as_bytes().to_vec(),
         }
@@ -46,7 +47,7 @@ impl DavDirEntry for CryptomatorDirEntry {
 
     fn metadata(&self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         let meta: CryptomatorMetaData = match self {
-            CryptomatorDirEntry::File(f) => CryptomatorMetaData::from_file(f),
+            CryptomatorDirEntry::File(f, cipher) => CryptomatorMetaData::from_file(f, *cipher),
             CryptomatorDirEntry::Directory(d) => CryptomatorMetaData::from_directory(d),
             CryptomatorDirEntry::Symlink(s) => CryptomatorMetaData::from_symlink(s),
         };
@@ -61,7 +62,7 @@ impl DavDirEntry for CryptomatorDirEntry {
     fn is_file(&self) -> FsFuture<'_, bool> {
         let is_file = matches!(
             self,
-            CryptomatorDirEntry::File(_) | CryptomatorDirEntry::Symlink(_)
+            CryptomatorDirEntry::File(..) | CryptomatorDirEntry::Symlink(_)
         );
         Box::pin(async move { Ok(is_file) })
     }
@@ -74,7 +75,7 @@ impl DavDirEntry for CryptomatorDirEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dir_entry::*;
     use oxcrypt_core::vault::DirId;
     use std::path::PathBuf;
 
@@ -99,7 +100,7 @@ mod tests {
 
     #[test]
     fn test_file_entry_name() {
-        let entry = CryptomatorDirEntry::file(test_file_info());
+        let entry = CryptomatorDirEntry::file(test_file_info(), CipherCombo::SivGcm);
         assert_eq!(entry.name(), b"test.txt");
     }
 
@@ -111,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_entry_is_file() {
-        let entry = CryptomatorDirEntry::file(test_file_info());
+        let entry = CryptomatorDirEntry::file(test_file_info(), CipherCombo::SivGcm);
         assert!(entry.is_file().await.unwrap());
         assert!(!entry.is_dir().await.unwrap());
     }

@@ -298,7 +298,7 @@ impl CryptomatorWebDav {
         // Try O(1) lookup for files
         match self.ops.find_file(&parent_dir_id, &name).await {
             Ok(Some(file_info)) => {
-                let meta = CryptomatorMetaData::from_file(&file_info);
+                let meta = CryptomatorMetaData::from_file(&file_info, self.ops.cipher_combo());
                 self.metadata_cache.insert(path.to_string(), meta.clone());
                 trace!(path = %path, "found file via O(1) lookup");
                 return Ok(meta);
@@ -706,7 +706,10 @@ impl DavFileSystem for CryptomatorWebDav {
 
             // Add files
             for file_info in files {
-                entries.push(Box::new(CryptomatorDirEntry::file(file_info)));
+                entries.push(Box::new(CryptomatorDirEntry::file(
+                    file_info,
+                    self.ops.cipher_combo(),
+                )));
             }
 
             // Add symlinks (as files - WebDAV doesn't support symlinks)
