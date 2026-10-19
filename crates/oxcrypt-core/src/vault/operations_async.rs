@@ -1794,6 +1794,7 @@ impl VaultOperationsAsync {
             let short_dir = storage_path.join(format!("{hash}.c9s"));
 
             // Create the .c9s directory and write name.c9s
+            Self::check_file_container(&short_dir).await?;
             fs::create_dir_all(&short_dir)
                 .await
                 .map_err(|e| VaultWriteError::Io {
@@ -1960,6 +1961,14 @@ impl VaultOperationsAsync {
         Ok(file_path)
     }
 
+    async fn check_file_container(path: &Path) -> Result<(), VaultWriteError> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || crate::fs::namespace::check_file_container(&path))
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(())
+    }
+
     /// Write a file with a shortened name (.c9s format)
     async fn write_shortened_file(
         &self,
@@ -1969,6 +1978,7 @@ impl VaultOperationsAsync {
     ) -> Result<PathBuf, VaultWriteError> {
         let hash = create_c9s_filename(encrypted_name);
         let short_dir = storage_path.join(format!("{hash}.c9s"));
+        Self::check_file_container(&short_dir).await?;
         fs::create_dir_all(&short_dir)
             .await
             .map_err(|e| VaultWriteError::Io {
@@ -3074,7 +3084,7 @@ impl VaultOperationsAsync {
                 .await?;
         } else {
             let new_path = parent_storage_path.join(format!("{new_encrypted_name}.c9r"));
-            fs::create_dir_all(&new_path)
+            fs::create_dir(&new_path)
                 .await
                 .map_err(|e| VaultWriteError::Io {
                     source: e,
@@ -3204,7 +3214,7 @@ impl VaultOperationsAsync {
                 .await?;
         } else {
             let new_path = dest_storage_path.join(format!("{new_encrypted_name}.c9r"));
-            fs::create_dir_all(&new_path)
+            fs::create_dir(&new_path)
                 .await
                 .map_err(|e| VaultWriteError::Io {
                     source: e,
@@ -4060,7 +4070,7 @@ impl VaultOperationsAsync {
         }
 
         // Create the symlink directory
-        fs::create_dir_all(&symlink_dir).await?;
+        fs::create_dir(&symlink_dir).await?;
 
         // If shortened, write the name.c9s file
         if is_shortened {
@@ -4241,12 +4251,12 @@ impl VaultOperationsAsync {
         let new_symlink_dir = if new_is_long {
             let shortened_hash = create_c9s_filename(&new_encrypted_name);
             let new_dir = dir_path.join(format!("{shortened_hash}.c9s"));
-            fs::create_dir_all(&new_dir).await?;
+            fs::create_dir(&new_dir).await?;
             fs::write(new_dir.join("name.c9s"), &new_encrypted_name).await?;
             new_dir
         } else {
             let new_dir = dir_path.join(format!("{new_encrypted_name}.c9r"));
-            fs::create_dir_all(&new_dir).await?;
+            fs::create_dir(&new_dir).await?;
             new_dir
         };
 
@@ -4380,12 +4390,12 @@ impl VaultOperationsAsync {
         let new_symlink_dir = if dest_is_long {
             let shortened_hash = create_c9s_filename(&new_encrypted_name);
             let new_dir = dest_storage_path.join(format!("{shortened_hash}.c9s"));
-            fs::create_dir_all(&new_dir).await?;
+            fs::create_dir(&new_dir).await?;
             fs::write(new_dir.join("name.c9s"), &new_encrypted_name).await?;
             new_dir
         } else {
             let new_dir = dest_storage_path.join(format!("{new_encrypted_name}.c9r"));
-            fs::create_dir_all(&new_dir).await?;
+            fs::create_dir(&new_dir).await?;
             new_dir
         };
 

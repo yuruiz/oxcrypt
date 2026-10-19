@@ -2643,7 +2643,7 @@ impl VaultOperations {
             self.create_shortened_directory(&parent_storage_path, &new_encrypted_name, dir_id)?;
         } else {
             let new_path = parent_storage_path.join(format!("{new_encrypted_name}.c9r"));
-            fs::create_dir_all(&new_path)?;
+            fs::create_dir(&new_path)?;
             self.atomic_write(&new_path.join("dir.c9r"), dir_id.as_str().as_bytes())?;
 
             // Note: dirid.c9r is in the content directory, not the .c9r folder.
@@ -2937,6 +2937,7 @@ impl VaultOperations {
     ) -> Result<PathBuf, VaultWriteError> {
         let hash = create_c9s_filename(encrypted_name);
         let short_dir = storage_path.join(format!("{hash}.c9s"));
+        crate::fs::namespace::check_file_container(&short_dir)?;
         fs::create_dir_all(&short_dir)?;
 
         // Write name.c9s (contains the original encrypted name)
@@ -3134,7 +3135,7 @@ impl VaultOperations {
         }
 
         // Create the symlink directory
-        fs::create_dir_all(&symlink_dir)?;
+        fs::create_dir(&symlink_dir)?;
 
         // If shortened, write the name.c9s file
         if is_shortened {

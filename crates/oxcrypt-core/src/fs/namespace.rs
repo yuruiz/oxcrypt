@@ -8,6 +8,35 @@ pub(crate) enum Kind {
     Symlink,
 }
 
+/// A shortened file may have a reserved container before its contents are
+/// published, but it must never reuse directory or symlink markers.
+pub(crate) fn check_file_container(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file container has an incompatible type",
+            ));
+        }
+        Ok(_) => {}
+    }
+    for marker in ["dir.c9r", "symlink.c9r"] {
+        match fs::symlink_metadata(path.join(marker)) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination is a directory or symlink",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn inspect(path: &Path) -> io::Result<Kind> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_file() {
