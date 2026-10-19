@@ -18,11 +18,12 @@ use clap::Args as ClapArgs;
 use serde::Serialize;
 use tracing::instrument;
 
-use oxcrypt_core::fs::encrypted_to_plaintext_size_or_zero;
+use oxcrypt_core::fs::streaming::encrypted_to_plaintext_size_or_zero_for_cipher;
+use oxcrypt_core::vault::config::CipherCombo;
 use oxcrypt_core::vault::operations::VaultOperations;
 use oxcrypt_core::vault::path::DirId;
 
-use super::normalize_path;
+use crate::commands::normalize_path;
 use crate::output::{create_table, format_entry_type, format_size};
 
 #[allow(clippy::struct_excessive_bools)] // Command-line args naturally have multiple boolean flags
@@ -89,9 +90,16 @@ pub fn execute(vault_ops: &VaultOperations, args: &Args) -> Result<()> {
     let symlinks = vault_ops.list_symlinks(&dir_id)?;
 
     if args.json {
-        print_json(&normalized, &files, &dirs, &symlinks, args.all)?;
+        print_json(
+            &normalized,
+            &files,
+            &dirs,
+            &symlinks,
+            args.all,
+            vault_ops.cipher_combo(),
+        )?;
     } else if args.long {
-        print_long_format(&files, &dirs, &symlinks, args.all);
+        print_long_format(&files, &dirs, &symlinks, args.all, vault_ops.cipher_combo());
     } else {
         print_short_format(&files, &dirs, &symlinks, args.all, args.one_per_line);
     }
@@ -105,6 +113,7 @@ fn print_json(
     dirs: &[oxcrypt_core::vault::operations::VaultDirectoryInfo],
     symlinks: &[oxcrypt_core::vault::operations::VaultSymlinkInfo],
     show_hidden: bool,
+    cipher: CipherCombo,
 ) -> Result<()> {
     let mut entries = Vec::new();
 
@@ -129,7 +138,10 @@ fn print_json(
         entries.push(EntryInfo {
             name: file.name.clone(),
             entry_type: "file".to_string(),
-            size: Some(encrypted_to_plaintext_size_or_zero(file.encrypted_size)),
+            size: Some(encrypted_to_plaintext_size_or_zero_for_cipher(
+                file.encrypted_size,
+                cipher,
+            )),
             target: None,
         });
     }
@@ -161,6 +173,7 @@ fn print_long_format(
     dirs: &[oxcrypt_core::vault::operations::VaultDirectoryInfo],
     symlinks: &[oxcrypt_core::vault::operations::VaultSymlinkInfo],
     show_hidden: bool,
+    cipher: CipherCombo,
 ) {
     let mut table = create_table();
     table.set_header(vec!["Type", "Size", "Name"]);
@@ -184,7 +197,10 @@ fn print_long_format(
         }
         table.add_row(vec![
             format_entry_type(false, false).to_string(),
-            format_size(encrypted_to_plaintext_size_or_zero(file.encrypted_size)),
+            format_size(encrypted_to_plaintext_size_or_zero_for_cipher(
+                file.encrypted_size,
+                cipher,
+            )),
             file.name.clone(),
         ]);
     }

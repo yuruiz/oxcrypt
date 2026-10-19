@@ -8,7 +8,7 @@ use crate::item::{
     encode_identifier, filename_from_path, parent_identifier,
 };
 use oxcrypt_core::error::{VaultOperationError, VaultWriteError};
-use oxcrypt_core::fs::encrypted_to_plaintext_size_or_zero;
+use oxcrypt_core::fs::streaming::encrypted_to_plaintext_size_or_zero_for_cipher;
 use oxcrypt_core::vault::VaultOperationsAsync;
 use oxcrypt_core::vault::config::VaultError;
 use oxcrypt_core::vault::operations::DirEntry;
@@ -734,7 +734,10 @@ impl FileProviderFilesystem {
         // Convert DirEntry to FileProviderItem
         let (item_type, size) = match &entry {
             DirEntry::File(info) => {
-                let plaintext_size = encrypted_to_plaintext_size_or_zero(info.encrypted_size);
+                let plaintext_size = encrypted_to_plaintext_size_or_zero_for_cipher(
+                    info.encrypted_size,
+                    self.ops.cipher_combo(),
+                );
                 (ItemType::File, plaintext_size)
             }
             DirEntry::Directory(_) => (ItemType::Directory, 0),
@@ -1079,7 +1082,10 @@ impl FileProviderFilesystem {
                 .runtime
                 .block_on(async move { ops.get_entry(&final_path_str).await })
             {
-                encrypted_to_plaintext_size_or_zero(info.encrypted_size)
+                encrypted_to_plaintext_size_or_zero_for_cipher(
+                    info.encrypted_size,
+                    self.ops.cipher_combo(),
+                )
             } else {
                 0
             }
@@ -1221,8 +1227,10 @@ impl FileProviderFilesystem {
                 .map(|entry| {
                     let (name, item_type, size) = match entry {
                         DirEntry::File(info) => {
-                            let plaintext_size =
-                                encrypted_to_plaintext_size_or_zero(info.encrypted_size);
+                            let plaintext_size = encrypted_to_plaintext_size_or_zero_for_cipher(
+                                info.encrypted_size,
+                                self.ops.cipher_combo(),
+                            );
                             (info.name.clone(), ItemType::File, plaintext_size)
                         }
                         DirEntry::Directory(info) => (info.name.clone(), ItemType::Directory, 0),
@@ -1287,7 +1295,10 @@ impl FileProviderFilesystem {
                     DirEntry::File(info) => (
                         info.name,
                         ItemType::File,
-                        encrypted_to_plaintext_size_or_zero(info.encrypted_size),
+                        encrypted_to_plaintext_size_or_zero_for_cipher(
+                            info.encrypted_size,
+                            self.ops.cipher_combo(),
+                        ),
                         info.encrypted_path,
                     ),
                     DirEntry::Directory(info) => {
@@ -1507,6 +1518,60 @@ mod tests {
         .result
         .unwrap();
         (vault, fs)
+    }
+
+    #[test]
+    fn configured_cipher_sizes_match_items_enumeration_changes_and_modification() {
+        use oxcrypt_core::vault::DirId;
+        use oxcrypt_core::vault::config::CipherCombo;
+        let (vault, mut fs) = fixture();
+        fs.ops = Arc::new(VaultOperationsAsync::with_options(
+            vault.path(),
+            Arc::clone(fs.ops.master_key()),
+            220,
+            CipherCombo::SivCtrMac,
+        ));
+        let anchor = fs.current_anchor();
+        for size in [0, 1, 32768, 32769] {
+            let name = format!("file-{size}");
+            fs.runtime
+                .block_on(fs.ops.write_file(&DirId::root(), &name, &vec![42; size]))
+                .unwrap();
+            assert_eq!(
+                fs.item(encode_identifier(&format!("/{name}")))
+                    .result
+                    .unwrap()
+                    .size(),
+                size as u64
+            );
+        }
+        for item in fs
+            .enumerate(ROOT_ITEM_IDENTIFIER.into(), 0)
+            .result
+            .unwrap()
+            .items
+        {
+            let name = String::from_utf8(item.filename()).unwrap();
+            let size: u64 = name.strip_prefix("file-").unwrap().parse().unwrap();
+            assert_eq!(item.size(), size);
+        }
+        for item in fs.changes_since(&anchor).result.unwrap().updated {
+            let name = String::from_utf8(item.filename()).unwrap();
+            let size: u64 = name.strip_prefix("file-").unwrap().parse().unwrap();
+            assert_eq!(item.size(), size);
+        }
+        let contents = vault.path().join("test-upload");
+        std::fs::write(&contents, b"changed").unwrap();
+        let item = fs
+            .modify_item(
+                encode_identifier("/file-1"),
+                None,
+                None,
+                Some(contents.to_str().unwrap().into()),
+            )
+            .result
+            .unwrap();
+        assert_eq!(item.size(), 7);
     }
 
     #[test]

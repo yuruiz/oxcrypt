@@ -61,7 +61,7 @@ use fuser::{
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyWrite, TimeOrNow,
 };
 use libc::c_int;
-use oxcrypt_core::fs::encrypted_to_plaintext_size_or_zero;
+use oxcrypt_core::fs::streaming::encrypted_to_plaintext_size_or_zero_for_cipher;
 use oxcrypt_core::vault::{DirId, SyncFirstResult, VaultOperationsAsync, VaultPath};
 use oxcrypt_mount::VaultStats;
 use std::ffi::OsStr;
@@ -736,7 +736,10 @@ impl HazardousHandler {
                 .map(|d| (d.name, FileType::Directory, 0, Some(d.directory_id))),
         )
         .chain(files.into_iter().map(|f| {
-            let plaintext_size = encrypted_to_plaintext_size_or_zero(f.encrypted_size);
+            let plaintext_size = encrypted_to_plaintext_size_or_zero_for_cipher(
+                f.encrypted_size,
+                self.ops.cipher_combo(),
+            );
             (f.name, FileType::RegularFile, plaintext_size, None)
         }))
         .chain(symlinks.into_iter().map(|s| {
@@ -1764,7 +1767,10 @@ impl CryptomatorFS {
                     name: name.to_string(),
                 },
             );
-            let disk_size = encrypted_to_plaintext_size_or_zero(file_info.encrypted_size);
+            let disk_size = encrypted_to_plaintext_size_or_zero_for_cipher(
+                file_info.encrypted_size,
+                self.ops.cipher_combo(),
+            );
             let effective_size = self.effective_file_size(inode, disk_size);
             let mtime = Self::get_mtime(&file_info.encrypted_path);
             let attr = self.make_file_attr(inode, effective_size, mtime);
@@ -1915,7 +1921,10 @@ impl CryptomatorFS {
                     name: name.to_string(),
                 },
             );
-            let disk_size = encrypted_to_plaintext_size_or_zero(file_info.encrypted_size);
+            let disk_size = encrypted_to_plaintext_size_or_zero_for_cipher(
+                file_info.encrypted_size,
+                self.ops.cipher_combo(),
+            );
             // Use effective size to account for in-memory buffer (mmap consistency)
             let effective_size = self.effective_file_size(inode, disk_size);
             let mtime = Self::get_mtime(&file_info.encrypted_path);
@@ -2350,7 +2359,10 @@ impl Filesystem for CryptomatorFS {
 
                 match result {
                     Ok(Some(info)) => {
-                        let disk_size = encrypted_to_plaintext_size_or_zero(info.encrypted_size);
+                        let disk_size = encrypted_to_plaintext_size_or_zero_for_cipher(
+                            info.encrypted_size,
+                            self.ops.cipher_combo(),
+                        );
                         // Use effective size to account for in-memory buffer (mmap consistency)
                         let effective_size = self.effective_file_size(ino, disk_size);
                         if effective_size != disk_size {
@@ -3368,8 +3380,10 @@ impl Filesystem for CryptomatorFS {
                             ) {
                                 warn!("Failed to set file times: {:?}", e);
                             }
-                            let file_size =
-                                encrypted_to_plaintext_size_or_zero(file_info.encrypted_size);
+                            let file_size = encrypted_to_plaintext_size_or_zero_for_cipher(
+                                file_info.encrypted_size,
+                                self.ops.cipher_combo(),
+                            );
                             let new_mtime = Self::get_mtime(&file_info.encrypted_path);
                             self.make_file_attr(ino, file_size, new_mtime)
                         }
@@ -5364,7 +5378,10 @@ impl Filesystem for CryptomatorFS {
 
                         match self.exec(async move { ops.find_file(&dir_id, &name).await }) {
                             Ok(Ok(Some(file_info))) => {
-                                encrypted_to_plaintext_size_or_zero(file_info.encrypted_size)
+                                encrypted_to_plaintext_size_or_zero_for_cipher(
+                                    file_info.encrypted_size,
+                                    self.ops.cipher_combo(),
+                                )
                             }
                             Ok(Ok(None)) => 0,
                             Ok(Err(e)) => {
@@ -5578,6 +5595,33 @@ impl Filesystem for CryptomatorFS {
 #[cfg(test)]
 mod tests {
     use crate::filesystem::*;
+
+    #[test]
+    fn configured_cipher_sizes_match_fuse_lookup_attributes() {
+        use oxcrypt_core::vault::config::CipherCombo;
+        use oxcrypt_mount::testing::TempVault;
+        let vault = TempVault::new();
+        let mut fs = CryptomatorFS::new(vault.path(), TempVault::password()).unwrap();
+        fs.ops = Arc::new(VaultOperationsAsync::with_options(
+            vault.path(),
+            Arc::clone(fs.ops.master_key()),
+            220,
+            CipherCombo::SivCtrMac,
+        ));
+        for size in [0, 1, 32768, 32769] {
+            let name = format!("file-{size}");
+            let filename = name.clone();
+            let ops = fs.ops_clone();
+            fs.exec(async move {
+                ops.write_file(&DirId::root(), &filename, &vec![42; size])
+                    .await
+            })
+            .unwrap()
+            .unwrap();
+            let (_, attr, _) = fs.lookup_child(1, &name).unwrap();
+            assert_eq!(attr.size, size as u64);
+        }
+    }
 
     #[test]
     fn modification_read_preserves_io_and_bridge_errors() {
