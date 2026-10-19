@@ -834,7 +834,7 @@ impl VaultOperationsAsync {
     /// This is a synchronous helper method since it only involves CPU-bound
     /// cryptographic hashing. Delegates to VaultCore.
     #[instrument(level = "trace", skip(self), fields(dir_id = %dir_id.as_str()))]
-    fn calculate_directory_storage_path(
+    pub fn calculate_directory_storage_path(
         &self,
         dir_id: &DirId,
     ) -> Result<PathBuf, VaultOperationError> {
