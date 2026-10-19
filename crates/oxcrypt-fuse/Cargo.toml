@@ -86,7 +86,7 @@ oxcrypt-mount = { path = "../oxcrypt-mount" }
 tokio = { version = "1", features = ["time"] }
 git2 = { version = "0.21", features = ["vendored-libgit2"], default-features = false }
 reqwest = { version = "0.13.1", features = ["blocking"] }
-zip = "7.0.0"
+zip = "9"
 
 [[bench]]
 name = "fuse_operations"

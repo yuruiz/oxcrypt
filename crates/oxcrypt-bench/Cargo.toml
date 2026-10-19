@@ -33,7 +33,7 @@ oxcrypt-mount = { path = "../oxcrypt-mount" }
 
 # FUSE filesystem
 oxcrypt-fuse = { path = "../oxcrypt-fuse" }
-zip = "2"
+zip = "9"
 
 # WebDAV backend
 oxcrypt-webdav = { path = "../oxcrypt-webdav" }
