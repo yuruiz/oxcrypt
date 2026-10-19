@@ -2497,22 +2497,41 @@ impl VaultOperationsAsync {
 
         // Physical entries include symlinks and names that cannot be decrypted.
         let storage_path = self.calculate_directory_storage_path(&dir_info.directory_id)?;
-        let mut entries = fs::read_dir(&storage_path).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_name() != "dirid.c9r" {
-                return Err(VaultWriteError::DirectoryNotEmpty {
-                    context: Box::new(ctx.clone().with_encrypted_path(&dir_info.encrypted_path)),
-                });
+        if !crate::fs::durability::directory_exists_checked_async(
+            &dir_info.encrypted_path,
+            self.vault_path(),
+        )
+        .await?
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "directory entry disappeared",
+            )
+            .into());
+        }
+        let storage_exists =
+            crate::fs::durability::directory_exists_checked_async(&storage_path, self.vault_path())
+                .await?;
+        if storage_exists {
+            let mut entries = fs::read_dir(&storage_path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.file_name() != "dirid.c9r" {
+                    return Err(VaultWriteError::DirectoryNotEmpty {
+                        context: Box::new(
+                            ctx.clone().with_encrypted_path(&dir_info.encrypted_path),
+                        ),
+                    });
+                }
             }
+            drop(entries);
+            match fs::remove_file(storage_path.join("dirid.c9r")).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            // Never recursively remove user entries after a potentially stale check.
+            fs::remove_dir(&storage_path).await?;
         }
-        drop(entries);
-        match fs::remove_file(storage_path.join("dirid.c9r")).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        // Never recursively remove user entries after a potentially stale check.
-        fs::remove_dir(&storage_path).await?;
 
         // Remove the directory entry from parent
         if fs::metadata(&dir_info.encrypted_path).await.is_ok() {
@@ -2526,7 +2545,7 @@ impl VaultOperationsAsync {
                 })?;
         }
 
-        if let Some(parent) = storage_path.parent() {
+        if storage_exists && let Some(parent) = storage_path.parent() {
             crate::fs::durability::sync_directory_chain_async(parent, self.vault_path()).await?;
         }
         if let Some(parent) = dir_info.encrypted_path.parent() {
