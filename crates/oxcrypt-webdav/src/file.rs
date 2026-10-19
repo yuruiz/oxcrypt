@@ -33,6 +33,7 @@ pub struct WriterHandle {
     stats: Arc<VaultStats>,
     pending: Arc<WriteBufferTable>,
     flush_lock: Arc<tokio::sync::Mutex<()>>,
+    _path_guards: crate::path_locks::PathGuards,
 }
 impl std::fmt::Debug for WriterHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -63,6 +64,7 @@ impl CryptomatorFile {
         stats: Arc<VaultStats>,
         pending: Arc<WriteBufferTable>,
         flush_lock: Arc<tokio::sync::Mutex<()>>,
+        path_guards: crate::path_locks::PathGuards,
     ) -> Self {
         stats.record_file_open();
         Self::Writer(WriterHandle {
@@ -75,6 +77,7 @@ impl CryptomatorFile {
             stats,
             pending,
             flush_lock,
+            _path_guards: path_guards,
         })
     }
     fn size(&self) -> u64 {
@@ -193,9 +196,6 @@ impl DavFile for CryptomatorFile {
                     .await
                     .map_err(write_error_to_fs_error)?;
                 handle.cache.invalidate(&handle.vault_path);
-                handle.pending.retain(|path, editor| {
-                    path != &handle.vault_path || !Arc::ptr_eq(editor, &handle.buffer)
-                });
             }
             Ok(())
         })
@@ -206,7 +206,16 @@ impl Drop for CryptomatorFile {
     fn drop(&mut self) {
         match self {
             Self::Reader { stats, .. } => stats.record_file_close(),
-            Self::Writer(handle) => handle.stats.record_file_close(),
+            Self::Writer(handle) => {
+                // A flush does not end the writer's lifetime: it may write again.
+                // Keep failed/unfinished writes reachable after the handle drops.
+                if !handle.buffer.is_dirty() {
+                    handle.pending.retain(|path, editor| {
+                        path != &handle.vault_path || !Arc::ptr_eq(editor, &handle.buffer)
+                    });
+                }
+                handle.stats.record_file_close();
+            }
         }
     }
 }
