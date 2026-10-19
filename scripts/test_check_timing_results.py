@@ -13,6 +13,11 @@ class TimingResultsTests(unittest.TestCase):
     def test_valid_results(self):
         self.assertEqual(timing.check(self.report()), [])
 
+    def test_seed_announcements_are_not_measurements(self):
+        seeds = "bench timing_hmac_verify seeded with 0x1234\nbench timing_key_unwrap seeded with 0xabcd\n"
+        self.assertEqual(timing.check(seeds + self.report()), [])
+        self.assertTrue(timing.check(seeds))
+
     def test_missing_result(self):
         self.assertTrue(timing.check(self.report().splitlines()[0]))
 

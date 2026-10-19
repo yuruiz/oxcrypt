@@ -11,7 +11,9 @@ def check(text):
     text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
     errors = []
     for name in REQUIRED:
-        lines = [line for line in text.splitlines() if re.search(rf"\bbench {name}\b", line)]
+        lines = [line for line in text.splitlines()
+                 if re.search(rf"\bbench {name}\b", line)
+                 and not re.fullmatch(rf"bench {name}\s+seeded with 0x[0-9a-fA-F]+", line.strip())]
         measurements = [re.search(r"max t\s*=\s*([^,\s]+)", line) for line in lines]
         if not measurements or any(match is None for match in measurements):
             errors.append(f"Missing or malformed result: {name}")
