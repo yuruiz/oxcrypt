@@ -52,6 +52,8 @@ jobs:
             --exclude DELETED \
             --exclude oxcrypt-desktop \
             -- -D warnings
+      - name: Check synchronous core without default features
+        run: cargo clippy --locked -p oxcrypt-core --no-default-features --lib -- -D warnings
 
   # =============================================================================
   # Security Audit

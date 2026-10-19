@@ -263,7 +263,7 @@ impl VaultOperationsAsync {
     /// let validated = validator.validate("password", Duration::from_secs(5))?;
     ///
     /// // Phase 2: Create operations (uses already-validated key, no re-validation)
-    /// let ops = VaultOperationsAsync::from_validated(validated);
+    /// let ops = VaultOperationsAsync::from_validated(&validated);
     /// ```
     #[instrument(level = "info", skip(validated), fields(vault_path = %validated.vault_path().display()))]
     pub fn from_validated(validated: &super::password::ValidatedPassword) -> Self {
