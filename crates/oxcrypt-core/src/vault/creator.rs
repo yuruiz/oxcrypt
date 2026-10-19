@@ -112,9 +112,9 @@ impl VaultCreator {
     /// Create the vault and return a VaultOperations handle
     ///
     /// This will:
-    /// 1. Create the vault directory structure (`/d/`, `/masterkey/`)
+    /// 1. Create the vault directory structure (`/d/`)
     /// 2. Generate a new random master key
-    /// 3. Create `masterkey/masterkey.cryptomator` with the encrypted keys
+    /// 3. Create `masterkey.cryptomator` with the encrypted keys
     /// 4. Create `vault.cryptomator` JWT configuration
     /// 5. Create the root directory storage path
     ///
@@ -189,7 +189,6 @@ impl VaultCreator {
 
         // Create directory structure
         fs::create_dir_all(self.vault_path.join("d"))?;
-        fs::create_dir_all(self.vault_path.join("masterkey"))?;
 
         // Generate master key
         let master_key = MasterKey::random()?;
@@ -210,7 +209,7 @@ impl VaultCreator {
         let masterkey_content = create_masterkey_file(&master_key, &self.passphrase)
             .map_err(|e| VaultCreationError::MasterkeyCreation(e.to_string()))?;
         crate::fs::durability::write_atomic(
-            &self.vault_path.join("masterkey/masterkey.cryptomator"),
+            &self.vault_path.join("masterkey.cryptomator"),
             masterkey_content.as_bytes(),
             &self.vault_path,
             crate::fs::durability::AtomicWriteMode::CreateNew,
@@ -256,7 +255,7 @@ mod tests {
 
         // Verify structure exists
         assert!(vault_path.join("vault.cryptomator").exists());
-        assert!(vault_path.join("masterkey/masterkey.cryptomator").exists());
+        assert!(vault_path.join("masterkey.cryptomator").exists());
         assert!(vault_path.join("d").exists());
 
         // Write a file

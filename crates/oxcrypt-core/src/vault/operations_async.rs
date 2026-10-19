@@ -212,8 +212,8 @@ impl VaultOperationsAsync {
         let master_key = extract_master_key(vault_path, password)?;
 
         // Read and validate vault config to get cipher combo and shortening threshold
-        let vault_config_path = vault_path.join("vault.cryptomator");
-        let vault_config_jwt = std::fs::read_to_string(&vault_config_path)?;
+        let vault_config_jwt =
+            crate::vault::metadata::read_vault_file(vault_path, Path::new("vault.cryptomator"))?;
         let claims = validate_vault_claims(&vault_config_jwt, &master_key)?;
 
         let cipher_combo = claims.cipher_combo().ok_or_else(|| {
@@ -4701,14 +4701,33 @@ pub async fn change_password_async(
     old_passphrase: &str,
     new_passphrase: &str,
 ) -> Result<(), ChangePasswordAsyncError> {
-    use crate::vault::master_key::change_password;
+    use crate::vault::master_key::{ChangePasswordError, MasterKeyFile, create_masterkey_file};
 
-    let root = std::path::absolute(vault_path)?;
-    let masterkey_path = root.join("masterkey/masterkey.cryptomator");
+    let root = vault_path.to_owned();
     let old_pw = zeroize::Zeroizing::new(old_passphrase.to_owned());
     let new_pw = zeroize::Zeroizing::new(new_passphrase.to_owned());
     tokio::task::spawn_blocking(move || {
-        let new_content = change_password(&masterkey_path, &old_pw, &new_pw)?;
+        let root = std::fs::canonicalize(root)?;
+        let config =
+            crate::vault::metadata::read_vault_file(&root, Path::new("vault.cryptomator"))?;
+        let masterkey_path = crate::vault::config::masterkey_path(&root, &config)?;
+        let original = std::fs::read_to_string(&masterkey_path)?;
+        let file: MasterKeyFile =
+            serde_json::from_str(&original).map_err(ChangePasswordError::from)?;
+        let key = file.unlock(&old_pw).map_err(ChangePasswordError::from)?;
+        validate_vault_claims(&config, &key)?;
+        let new_content =
+            create_masterkey_file(&key, &new_pw).map_err(ChangePasswordError::from)?;
+        if crate::vault::metadata::read_vault_file(&root, Path::new("vault.cryptomator"))? != config
+            || crate::vault::config::masterkey_path(&root, &config)? != masterkey_path
+            || std::fs::read_to_string(&masterkey_path)? != original
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "vault metadata changed during password update",
+            )
+            .into());
+        }
         crate::fs::durability::write_atomic(
             &masterkey_path,
             new_content.as_bytes(),
@@ -4727,10 +4746,16 @@ pub async fn change_password_async(
 /// Errors that can occur when changing the vault password asynchronously.
 #[derive(Error, Debug)]
 pub enum ChangePasswordAsyncError {
+    #[error("Masterkey location validation failed: {0}")]
+    MasterkeyLocation(#[from] crate::vault::config::MasterKeyExtractionError),
+
+    #[error("Vault configuration validation failed: {0}")]
+    Configuration(#[from] ClaimValidationError),
+
     #[error("Password change failed: {0}")]
     ChangePassword(#[from] crate::vault::master_key::ChangePasswordError),
 
-    #[error("Failed to write new masterkey file: {0}")]
+    #[error("Vault metadata I/O failed: {0}")]
     Io(#[from] std::io::Error),
 
     #[error("Task join error: {0}")]

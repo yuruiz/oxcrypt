@@ -4,6 +4,7 @@ pub mod cache;
 pub mod config;
 pub mod creator;
 pub mod master_key;
+pub(crate) mod metadata;
 pub mod operations;
 pub mod ops;
 pub mod password;

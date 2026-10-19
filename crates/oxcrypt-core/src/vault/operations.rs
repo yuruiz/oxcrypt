@@ -628,8 +628,8 @@ impl VaultOperations {
         let master_key = extract_master_key(vault_path, password)?;
 
         // Read and validate vault config to get cipher combo and shortening threshold
-        let vault_config_path = vault_path.join("vault.cryptomator");
-        let vault_config_jwt = fs::read_to_string(&vault_config_path)?;
+        let vault_config_jwt =
+            crate::vault::metadata::read_vault_file(vault_path, Path::new("vault.cryptomator"))?;
         let claims = validate_vault_claims(&vault_config_jwt, &master_key)?;
 
         let cipher_combo = claims

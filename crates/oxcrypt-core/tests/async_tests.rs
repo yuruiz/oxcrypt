@@ -2939,7 +2939,7 @@ async fn test_change_password_sync_function() {
         .add_file("sync_test.txt", b"sync content")
         .build();
 
-    let masterkey_path = vault_path.join("masterkey").join("masterkey.cryptomator");
+    let masterkey_path = vault_path.join("masterkey.cryptomator");
     let old_password = common::TEST_PASSPHRASE;
     let new_password = "sync-new-password";
 

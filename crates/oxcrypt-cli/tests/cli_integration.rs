@@ -161,7 +161,7 @@ fn test_init_creates_vault() {
 
     // Verify vault structure
     assert!(vault_path.join("vault.cryptomator").exists());
-    assert!(vault_path.join("masterkey").exists());
+    assert!(vault_path.join("masterkey.cryptomator").exists());
     assert!(vault_path.join("d").exists());
 }
 

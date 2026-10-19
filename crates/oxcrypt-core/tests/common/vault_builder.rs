@@ -77,7 +77,6 @@ impl VaultBuilder {
 
         // Create vault structure
         fs::create_dir_all(vault_path.join("d")).unwrap();
-        fs::create_dir_all(vault_path.join("masterkey")).unwrap();
 
         // Create vault.cryptomator
         let config = VaultConfig {
@@ -93,11 +92,7 @@ impl VaultBuilder {
 
         // Create masterkey file
         let masterkey_content = create_masterkey_file(&self.master_key, &self.passphrase).unwrap();
-        fs::write(
-            vault_path.join("masterkey").join("masterkey.cryptomator"),
-            masterkey_content,
-        )
-        .unwrap();
+        fs::write(vault_path.join("masterkey.cryptomator"), masterkey_content).unwrap();
 
         // Track directory structure
         let mut dir_map: HashMap<String, String> = HashMap::new();

@@ -58,6 +58,7 @@ moka = { version = "0.12.12", features = ["sync"] }
 bumpalo = "3.19.1"
 rayon = "1.11.0"
 parking_lot = "0.12.5"
+percent-encoding = "2.3.2"
 
 [dev-dependencies]
 assert_fs = "1"
