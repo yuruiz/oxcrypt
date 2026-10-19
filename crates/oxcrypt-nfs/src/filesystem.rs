@@ -15,11 +15,12 @@ use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use oxcrypt_core::fs::streaming::encrypted_to_plaintext_size_or_zero_for_cipher;
 use oxcrypt_core::vault::operations_async::VaultOperationsAsync;
 use oxcrypt_core::vault::path::{DirId, VaultPath};
-use oxcrypt_mount::moka_cache::SyncTtlCache;
-use oxcrypt_mount::{VaultStats, WriteBuffer};
+use oxcrypt_mount::{EditBuffer, VaultStats};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, trace};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tracing::{debug, trace};
 
 /// NFS filesystem implementation for Cryptomator vaults.
 ///
@@ -38,12 +39,7 @@ use tracing::{debug, error, trace};
 /// - The file is removed
 /// - A rename operation occurs
 ///
-/// TTL for read cache entries:
-/// Short TTL (5 seconds) allows consecutive reads to reuse decrypted content
-/// while ensuring freshness for external modifications.
-const READ_CACHE_TTL: Duration = Duration::from_secs(5);
-
-/// NFS filesystem implementation for Cryptomator vaults.
+/// NFS filesystem with streaming reads and serialized chunk commits.
 pub struct CryptomatorNFS {
     /// Vault operations for reading/writing encrypted files.
     ops: Arc<VaultOperationsAsync>,
@@ -51,12 +47,9 @@ pub struct CryptomatorNFS {
     inodes: NfsInodeTable,
     /// Write buffers for files with pending writes.
     /// Key: file ID, Value: WriteBuffer containing pending data.
-    write_buffers: Arc<DashMap<fileid3, WriteBuffer>>,
     flush_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Read cache for decrypted file contents.
-    /// Key: file ID, Value: decrypted content.
-    /// This prevents re-decrypting the entire file on each NFS READ RPC.
-    read_cache: SyncTtlCache<fileid3, Vec<u8>>,
+    /// Pending encrypted edits, retained after write-back failures.
+    editors: Arc<DashMap<fileid3, Arc<EditBuffer>>>,
     /// Server generation number (for cookieverf3).
     generation: u64,
     /// UID for all files (from process).
@@ -71,22 +64,13 @@ pub struct CryptomatorNFS {
 #[derive(Clone)]
 pub(crate) struct NfsWriteback {
     ops: Arc<VaultOperationsAsync>,
-    buffers: Arc<DashMap<fileid3, WriteBuffer>>,
+    editors: Arc<DashMap<fileid3, Arc<EditBuffer>>>,
     lock: Arc<tokio::sync::Mutex<()>>,
-    stats: Arc<VaultStats>,
-}
-
-struct WriteActivity(Arc<VaultStats>);
-
-impl Drop for WriteActivity {
-    fn drop(&mut self) {
-        self.0.finish_write();
-    }
 }
 
 impl NfsWriteback {
     pub(crate) async fn flush_all(&self) -> Result<(), nfsstat3> {
-        let ids: Vec<_> = self.buffers.iter().map(|entry| *entry.key()).collect();
+        let ids: Vec<_> = self.editors.iter().map(|entry| *entry.key()).collect();
         let mut failure = None;
         for id in ids {
             if let Err(error) = self.flush(id).await {
@@ -99,34 +83,20 @@ impl NfsWriteback {
     async fn flush(&self, id: fileid3) -> Result<u64, nfsstat3> {
         // Prevent an older snapshot from overwriting a newer one on disk.
         let _guard = self.lock.lock().await;
-        let Some(buffer) = self.buffers.get(&id) else {
-            return Ok(0);
-        };
-        let len = buffer.len();
-        if !buffer.is_dirty() {
-            return Ok(len);
+        self.flush_unlocked(id).await
+    }
+
+    async fn flush_unlocked(&self, id: fileid3) -> Result<u64, nfsstat3> {
+        let editor = self.editors.get(&id).map(|entry| Arc::clone(entry.value()));
+        if let Some(editor) = editor {
+            editor
+                .commit(&self.ops)
+                .await
+                .map_err(|error| vault_error_to_nfsstat(&error))?;
+            self.editors.remove(&id);
+            return Ok(editor.len());
         }
-        let revision = buffer.revision();
-        let content = buffer.snapshot();
-        let dir_id = buffer.dir_id().clone();
-        let name = buffer.filename().to_owned();
-        drop(buffer);
-        self.stats.start_write();
-        let _activity = WriteActivity(Arc::clone(&self.stats));
-        let path = self
-            .ops
-            .write_file(&dir_id, &name, &content)
-            .await
-            .map_err(|error| vault_error_to_nfsstat(&error))?;
-        self.ops
-            .sync_encrypted_file(&path, false)
-            .await
-            .map_err(|error| vault_error_to_nfsstat(&error))?;
-        self.stats.record_encrypted(len);
-        self.buffers.remove_if(&id, |_, buffer| {
-            buffer.revision() == revision && Arc::ptr_eq(&buffer.snapshot(), &content)
-        });
-        Ok(len)
+        Ok(0)
     }
 }
 
@@ -141,9 +111,8 @@ impl CryptomatorNFS {
         Self {
             ops,
             inodes: NfsInodeTable::new(),
-            write_buffers: Arc::new(DashMap::new()),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
-            read_cache: SyncTtlCache::new(READ_CACHE_TTL),
+            editors: Arc::new(DashMap::new()),
             generation,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -159,9 +128,8 @@ impl CryptomatorNFS {
     pub(crate) fn writeback(&self) -> NfsWriteback {
         NfsWriteback {
             ops: Arc::clone(&self.ops),
-            buffers: Arc::clone(&self.write_buffers),
+            editors: Arc::clone(&self.editors),
             lock: Arc::clone(&self.flush_lock),
-            stats: Arc::clone(&self.stats),
         }
     }
 
@@ -174,61 +142,22 @@ impl CryptomatorNFS {
         self.writeback().flush(id).await
     }
 
-    /// Get or create a write buffer for a file.
-    ///
-    /// If the file doesn't have a buffer yet, reads existing content from vault
-    /// and creates a new buffer. Uses atomic entry API to prevent race conditions
-    /// when multiple WRITE RPCs arrive concurrently.
-    async fn get_or_create_buffer(
+    async fn editor(
         &self,
         id: fileid3,
-        dir_id: &DirId,
+        dir: &DirId,
         name: &str,
-    ) -> Result<dashmap::mapref::one::RefMut<'_, fileid3, WriteBuffer>, nfsstat3> {
-        // Fast path: buffer already exists
-        if let Some(buffer) = self.write_buffers.get_mut(&id) {
-            debug!(id, buffer_size = buffer.len(), "Using existing buffer");
-            return Ok(buffer);
+    ) -> Result<Arc<EditBuffer>, nfsstat3> {
+        if let Some(editor) = self.editors.get(&id) {
+            return Ok(Arc::clone(editor.value()));
         }
-
-        // Slow path: need to read existing content from vault
-        debug!(id, dir_id = %dir_id, name = %name, "Creating new buffer, reading existing content");
-        let read_start = Instant::now();
-        let existing = match self.ops.read_file(dir_id, name).await {
-            Ok(decrypted) => {
-                let read_duration = read_start.elapsed();
-                debug!(
-                    id,
-                    existing_len = decrypted.content.len(),
-                    read_duration_ms = read_duration.as_millis(),
-                    "Read existing content for buffer"
-                );
-                // Log slow reads for large files
-                if read_duration.as_millis() > 100 || decrypted.content.len() > 100_000 {
-                    debug!(
-                        id,
-                        existing_len = decrypted.content.len(),
-                        read_duration_ms = read_duration.as_millis(),
-                        "Slow or large file read for buffer creation"
-                    );
-                }
-                decrypted.content
-            }
-            Err(e) => return Err(vault_error_to_nfsstat(&e)),
-        };
-
-        // Use entry API to atomically insert only if key doesn't exist.
-        // This prevents race conditions where two concurrent WRITEs both read
-        // existing content and then both try to insert, with the second overwriting
-        // the first's buffer (losing data).
-        //
-        // IMPORTANT: We must use the RefMut returned by or_insert() directly,
-        // not drop it and call get_mut() again. Dropping the RefMut and calling
-        // get_mut() creates a race condition where another thread could remove
-        // the buffer between insertion and retrieval.
-        debug!(id, "Creating new buffer for file");
-        let buffer = WriteBuffer::new(dir_id.clone(), name.to_string(), existing);
-        Ok(self.write_buffers.entry(id).or_insert(buffer))
+        let editor = Arc::new(
+            EditBuffer::open(&self.ops, dir.clone(), name.to_owned(), false, false)
+                .await
+                .map_err(|error| vault_error_to_nfsstat(&error))?,
+        );
+        self.editors.insert(id, Arc::clone(&editor));
+        Ok(editor)
     }
 
     /// Creates file attributes for a directory.
@@ -475,7 +404,7 @@ impl NFSFileSystem for CryptomatorNFS {
             InodeKind::Root | InodeKind::Directory { .. } => Ok(self.dir_attr(id, None)),
             InodeKind::File { dir_id, name } => {
                 // Check if we have a buffer with pending writes - use that size
-                if let Some(buffer) = self.write_buffers.get(&id) {
+                if let Some(buffer) = self.editors.get(&id) {
                     return {
                         self.stats.record_metadata_latency(start.elapsed());
                         // Buffer has pending changes, use current time
@@ -554,42 +483,12 @@ impl NFSFileSystem for CryptomatorNFS {
                 let name = name.to_string();
                 drop(entry); // Release the borrow before async operations
 
-                // Discard any pending buffer - we're replacing content
-                self.write_buffers.remove(&id);
-                // Invalidate read cache since content is being truncated
-                self.read_cache.invalidate(&id);
-
-                if size == 0 {
-                    // Truncate to empty - create empty file
-                    debug!(id, "Truncating file to empty");
-                    if let Err(e) = self.ops.write_file(&dir_id, &name, &[]).await {
-                        self.stats.record_metadata_latency(start.elapsed());
-                        self.stats.record_error();
-                        return Err(vault_error_to_nfsstat(&e));
-                    }
-                } else {
-                    // Partial truncate - read, truncate, write
-                    debug!(id, size, "Truncating file to size");
-                    let decrypted = match self.ops.read_file(&dir_id, &name).await {
-                        Ok(d) => d,
-                        Err(e) => {
-                            self.stats.record_metadata_latency(start.elapsed());
-                            self.stats.record_error();
-                            return Err(vault_error_to_nfsstat(&e));
-                        }
-                    };
-                    let size = usize::try_from(size).map_err(|_| nfsstat3::NFS3ERR_FBIG)?;
-                    let mut truncated = decrypted.content;
-                    truncated
-                        .try_reserve(size.saturating_sub(truncated.len()))
-                        .map_err(|_| nfsstat3::NFS3ERR_FBIG)?;
-                    truncated.resize(size, 0);
-                    if let Err(e) = self.ops.write_file(&dir_id, &name, &truncated).await {
-                        self.stats.record_metadata_latency(start.elapsed());
-                        self.stats.record_error();
-                        return Err(vault_error_to_nfsstat(&e));
-                    }
-                }
+                let _mutation = self.flush_lock.lock().await;
+                let editor = self.editor(id, &dir_id, &name).await?;
+                editor
+                    .truncate(size)
+                    .map_err(|error| vault_error_to_nfsstat(&error))?;
+                self.writeback().flush_unlocked(id).await?;
 
                 // Re-get entry for timestamp handling
                 let entry = match self.get_entry(id) {
@@ -641,65 +540,23 @@ impl NFSFileSystem for CryptomatorNFS {
         };
         drop(entry); // Release the borrow before async operations
 
-        // Check if we have buffered writes - if so, flush first for read-after-write consistency
-        if self.write_buffers.contains_key(&id) {
-            debug!(id, "Flushing buffer before read for consistency");
-            // Invalidate read cache since we're about to write new content
-            self.read_cache.invalidate(&id);
-            if let Err(e) = self.flush_buffer(id).await {
-                self.stats.record_read_latency(op_start.elapsed());
-                self.stats.record_error();
-                return Err(e);
-            }
+        if self.editors.contains_key(&id) {
+            self.flush_buffer(id).await?;
         }
-
-        // Try to get content from cache first
-        let content = if let Some(cached) = self.read_cache.get(&id) {
-            trace!(id, "Read cache hit");
-            cached.value
-        } else {
-            // Cache miss - decrypt the file and cache it
-            trace!(id, "Read cache miss, decrypting file");
-            self.stats.start_read();
-            let result = self.ops.read_file(&dir_id, &name).await;
-            self.stats.finish_read();
-
-            let decrypted = match result {
-                Ok(d) => d,
-                Err(e) => {
-                    self.stats.record_read_latency(op_start.elapsed());
-                    self.stats.record_error();
-                    return Err(vault_error_to_nfsstat(&e));
-                }
-            };
-
-            // Cache the decrypted content for subsequent reads
-            let content = decrypted.content;
-            self.read_cache.insert(id, content.clone());
-            // Safe cast: content.len() is the file size, fits in u64
-            #[allow(clippy::cast_possible_truncation)]
-            self.stats.record_decrypted(content.len() as u64);
-            content
-        };
-
-        // Safe cast: offset from NFS protocol is u64, converted to usize for slicing
-        #[allow(clippy::cast_possible_truncation)]
-        let start = offset as usize;
-        #[allow(clippy::cast_possible_truncation)]
-        let end = (offset as usize + count as usize).min(content.len());
-
-        if start >= content.len() {
-            self.stats.record_read_latency(op_start.elapsed());
-            return Ok((vec![], true)); // EOF
-        }
-
-        let data = content[start..end].to_vec();
-        let eof = end >= content.len();
-
-        // Record bytes read
+        let mut reader = self
+            .ops
+            .open_file_unlocked(&dir_id, &name)
+            .await
+            .map_err(|error| vault_error_to_nfsstat(&error))?;
+        let size = reader.plaintext_size();
+        let data = reader
+            .read_range(offset, count as usize)
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let eof = offset.saturating_add(data.len() as u64) >= size;
         self.stats.record_read(data.len() as u64);
+        self.stats.record_decrypted(data.len() as u64);
         self.stats.record_read_latency(op_start.elapsed());
-
         Ok((data, eof))
     }
 
@@ -735,39 +592,22 @@ impl NFSFileSystem for CryptomatorNFS {
         };
         drop(entry); // Release the borrow before async operations
 
-        // Invalidate read cache since file content is changing
-        self.read_cache.invalidate(&id);
-
-        // Get or create write buffer for this file
-        let mut buffer = match self.get_or_create_buffer(id, &dir_id, &name).await {
-            Ok(b) => b,
-            Err(e) => {
-                error!(
-                    id,
-                    dir_id = %dir_id,
-                    name = %name,
-                    nfs_error = ?e,
-                    "Failed to get or create write buffer"
-                );
-                self.stats.record_write_latency(op_start.elapsed());
-                self.stats.record_error();
-                return Err(e);
+        let _mutation = self.flush_lock.lock().await;
+        let editor = self.editor(id, &dir_id, &name).await?;
+        let mut written = 0;
+        while written < data.len() {
+            let count = editor
+                .write(offset + written as u64, &data[written..])
+                .map_err(|error| vault_error_to_nfsstat(&error))?;
+            if count == 0 {
+                return Err(nfsstat3::NFS3ERR_IO);
             }
-        };
-
-        // Write to buffer
-        buffer.write(offset, data);
-        let new_size = buffer.len();
-        drop(buffer); // Release buffer before flushing
-
-        // Record bytes written
+            written += count;
+        }
+        let new_size = editor.len();
+        self.writeback().flush_unlocked(id).await?;
         self.stats.record_write(data.len() as u64);
-
-        // nfsserve acknowledges every successful WRITE as FILE_SYNC.
-        self.flush_buffer(id).await?;
         self.stats.record_write_latency(op_start.elapsed());
-
-        // Return attributes with updated size (just modified, use current time)
         Ok(self.file_attr(id, new_size, None))
     }
 
@@ -1003,9 +843,8 @@ impl NFSFileSystem for CryptomatorNFS {
         let child_path = parent_path.join(name);
         if let Some(file_id) = self.inodes.get_id(&child_path) {
             // Discard pending writes - file is being deleted
-            self.write_buffers.remove(&file_id);
+            self.editors.remove(&file_id);
             // Invalidate read cache for the deleted file
-            self.read_cache.invalidate(&file_id);
         }
 
         // Try to remove as file first
@@ -1056,6 +895,7 @@ impl NFSFileSystem for CryptomatorNFS {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        let _mutation = self.flush_lock.lock().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
 
@@ -1105,12 +945,12 @@ impl NFSFileSystem for CryptomatorNFS {
         // Flush any pending writes for the source file before rename
         let from_path = from_parent_path.join(from_name);
         if let Some(file_id) = self.inodes.get_id(&from_path)
-            && self.write_buffers.contains_key(&file_id)
+            && (self.editors.contains_key(&file_id))
         {
             debug!(file_id, "Flushing buffer before rename");
             // Invalidate read cache since we're writing new content
-            self.read_cache.invalidate(&file_id);
-            if let Err(e) = self.flush_buffer(file_id).await {
+
+            if let Err(e) = self.writeback().flush_unlocked(file_id).await {
                 self.stats.record_error();
                 self.stats.record_metadata_latency(start.elapsed());
                 return Err(e);
@@ -1551,9 +1391,13 @@ mod writeback_tests {
         let ops =
             Arc::new(VaultOperationsAsync::open(vault.path(), TempVault::password()).unwrap());
         let filesystem = CryptomatorNFS::new(Arc::clone(&ops));
-        let mut buffer = WriteBuffer::new_for_create(DirId::root(), "note".into());
-        buffer.write(0, b"pending");
-        filesystem.write_buffers.insert(42, buffer);
+        let buffer = Arc::new(
+            EditBuffer::open(&ops, DirId::root(), "note".into(), true, false)
+                .await
+                .unwrap(),
+        );
+        buffer.write(0, b"pending").unwrap();
+        filesystem.editors.insert(42, buffer);
         let writer = ops
             .create_file(&DirId::root(), "lock-holder")
             .await
@@ -1564,7 +1408,7 @@ mod writeback_tests {
                 .is_err()
         );
         assert_eq!(
-            filesystem.write_buffers.get(&42).unwrap().content(),
+            filesystem.editors.get(&42).unwrap().read(0, 100).unwrap(),
             b"pending"
         );
         drop(writer);
@@ -1606,19 +1450,25 @@ mod writeback_tests {
             .write_file(&DirId::root(), "note", b"old")
             .await
             .unwrap();
-        std::fs::remove_file(&path).unwrap();
+        let buffer = Arc::new(
+            EditBuffer::open(&ops, DirId::root(), "note".into(), false, true)
+                .await
+                .unwrap(),
+        );
+        buffer.write(0, b"pending note").unwrap();
+        let backup = path.with_extension("fault-backup");
+        std::fs::rename(&path, &backup).unwrap();
         std::fs::create_dir(&path).unwrap();
-        let mut buffer = WriteBuffer::new_for_create(DirId::root(), "note".into());
-        buffer.write(0, b"pending note");
-        filesystem.write_buffers.insert(42, buffer);
+        filesystem.editors.insert(42, buffer);
         assert!(filesystem.flush_all_buffers().await.is_err());
         assert_eq!(
-            filesystem.write_buffers.get(&42).unwrap().content(),
+            filesystem.editors.get(&42).unwrap().read(0, 100).unwrap(),
             b"pending note"
         );
         std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
         filesystem.flush_all_buffers().await.unwrap();
-        assert!(filesystem.write_buffers.is_empty());
+        assert!(filesystem.editors.is_empty());
         assert_eq!(
             ops.read_file(&DirId::root(), "note").await.unwrap().content,
             b"pending note"

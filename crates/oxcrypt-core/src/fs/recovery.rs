@@ -16,6 +16,51 @@ pub struct RecoveryMetadata {
     pub directory_id: String,
     /// Intended cleartext filename (encrypted on disk).
     pub filename: String,
+    /// Cipher used for the data file; metadata itself always uses GCM.
+    #[serde(default = "default_cipher")]
+    pub cipher_combo: CipherCombo,
+}
+
+fn default_cipher() -> CipherCombo {
+    CipherCombo::SivGcm
+}
+
+/// Preserve already encrypted staged data without whole-file crypto work.
+pub fn save_editor(
+    root: &Path,
+    key: &MasterKey,
+    dir: &DirId,
+    name: &str,
+    editor: &mut crate::fs::streaming::editor::VaultFileEditor,
+) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Err(io::Error::other("recovery root is a symlink"));
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("oxcrypt-recovery-")
+        .tempdir_in(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    let metadata = RecoveryMetadata {
+        directory_id: dir.as_str().to_owned(),
+        filename: name.to_owned(),
+        cipher_combo: editor.cipher(),
+    };
+    let bytes = serde_json::to_vec(&metadata).map_err(io::Error::other)?;
+    let encrypted = CipherCombo::SivGcm
+        .encrypt_file(&bytes, key)
+        .map_err(io::Error::other)?;
+    let path = directory.path().join("metadata.c9r");
+    std::fs::write(&path, encrypted)?;
+    std::fs::File::open(path)?.sync_all()?;
+    editor.copy_ciphertext(&directory.path().join("data.c9r"))?;
+    crate::fs::durability::sync_directory_chain(directory.path(), root)?;
+    Ok(directory.keep())
 }
 
 /// Persistent per-user storage, separate from the potentially unavailable vault.
@@ -71,6 +116,7 @@ pub async fn save(
     let metadata = RecoveryMetadata {
         directory_id: dir.as_str().to_owned(),
         filename: name.to_owned(),
+        cipher_combo: CipherCombo::SivGcm,
     };
     let encoded = serde_json::to_vec(&metadata).map_err(io::Error::other)?;
     let encrypted = CipherCombo::SivGcm
@@ -115,9 +161,12 @@ pub fn export(
 ) -> io::Result<RecoveryMetadata> {
     use std::io::Write;
     let metadata = metadata(path, master_key)?;
-    let mut reader =
-        crate::fs::streaming::VaultFileReaderSync::open(path.join("data.c9r"), master_key)
-            .map_err(io::Error::other)?;
+    let mut reader = crate::fs::streaming::VaultFileReaderSync::open_with_cipher(
+        path.join("data.c9r"),
+        master_key,
+        metadata.cipher_combo,
+    )
+    .map_err(io::Error::other)?;
     let parent = destination
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

@@ -86,6 +86,7 @@ mod backend;
 pub mod bounded_pool;
 mod cleanup;
 pub mod daemon;
+mod edit_buffer;
 mod error_category;
 mod force_unmount;
 mod handle_table;
@@ -141,6 +142,7 @@ pub use stale_detection::{
 pub use stale_detection::canonicalize_with_timeout;
 
 // Implementation utility exports
+pub use edit_buffer::EditBuffer;
 pub use error_category::{VaultErrorCategory, io_error_to_errno};
 pub use handle_table::HandleTable;
 pub use moka_cache::{

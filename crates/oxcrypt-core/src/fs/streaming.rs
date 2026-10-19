@@ -16,6 +16,8 @@
 //! Each chunk is independently encrypted, using the chunk number and
 //! header nonce as additional authenticated data.
 
+pub mod editor;
+
 use std::io::{self, SeekFrom};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -163,8 +165,8 @@ pub fn encrypted_to_plaintext_size_for_cipher(
 
     let content_size = encrypted_size - header_size as u64;
     if content_size == 0 {
-        // File with header but no content chunks - invalid
-        return None;
+        // Cryptomator represents an empty file with an authenticated header only.
+        return Some(0);
     }
 
     let full_chunks = content_size / chunk_size as u64;
@@ -188,7 +190,7 @@ pub fn encrypted_to_plaintext_size_for_cipher(
 /// Calculate plaintext file size, returning 0 for edge cases (GCM format).
 ///
 /// This is a convenience wrapper around [`encrypted_to_plaintext_size`] that
-/// returns 0 for empty files (single empty chunk) and invalid sizes.
+/// returns 0 for canonical or legacy empty files and invalid sizes.
 pub fn encrypted_to_plaintext_size_or_zero(encrypted_size: u64) -> u64 {
     encrypted_to_plaintext_size_or_zero_for_cipher(encrypted_size, CipherCombo::SivGcm)
 }
@@ -676,8 +678,13 @@ impl VaultFileReader {
         };
 
         // Calculate plaintext size
-        let plaintext_size =
-            encrypted_to_plaintext_size_or_zero_for_cipher(encrypted_size, cipher_combo);
+        let plaintext_size = encrypted_to_plaintext_size_for_cipher(encrypted_size, cipher_combo)
+            .ok_or_else(|| {
+            StreamingError::io_with_context(
+                io::Error::new(io::ErrorKind::InvalidData, "incomplete encrypted chunk"),
+                context.clone(),
+            )
+        })?;
 
         debug!(
             cipher_combo = ?cipher_combo,
@@ -694,14 +701,18 @@ impl VaultFileReader {
             path.to_path_buf(),
         );
 
-        Ok(Self {
+        let mut reader = Self {
             file,
             decryptor,
             plaintext_size,
             chunk_cache: LruCache::new(NonZeroUsize::new(CHUNK_CACHE_CAPACITY).unwrap()),
             dir_lock_guard: None,
             file_lock_guard: None,
-        })
+        };
+        if plaintext_size == 0 && encrypted_size > header_size as u64 {
+            reader.read_chunk(0).await?;
+        }
+        Ok(reader)
     }
 
     /// Set the lock guards to hold for the lifetime of this reader.
@@ -1014,8 +1025,13 @@ impl VaultFileReaderSync {
         };
 
         // Calculate plaintext size
-        let plaintext_size =
-            encrypted_to_plaintext_size_or_zero_for_cipher(encrypted_size, cipher_combo);
+        let plaintext_size = encrypted_to_plaintext_size_for_cipher(encrypted_size, cipher_combo)
+            .ok_or_else(|| {
+            StreamingError::io_with_context(
+                io::Error::new(io::ErrorKind::InvalidData, "incomplete encrypted chunk"),
+                context.clone(),
+            )
+        })?;
 
         debug!(
             cipher_combo = ?cipher_combo,
@@ -1032,12 +1048,16 @@ impl VaultFileReaderSync {
             path.to_path_buf(),
         );
 
-        Ok(Self {
+        let mut reader = Self {
             file,
             decryptor,
             plaintext_size,
             chunk_cache: LruCache::new(NonZeroUsize::new(CHUNK_CACHE_CAPACITY).unwrap()),
-        })
+        };
+        if plaintext_size == 0 && encrypted_size > header_size as u64 {
+            reader.read_chunk(0)?;
+        }
+        Ok(reader)
     }
 
     /// Get the total plaintext size of the file.
@@ -1582,8 +1602,8 @@ mod tests {
         assert_eq!(encrypted_to_plaintext_size(0), None);
         assert_eq!(encrypted_to_plaintext_size(67), None);
 
-        // Header only (no content) - invalid
-        assert_eq!(encrypted_to_plaintext_size(68), None);
+        // Header-only files are the canonical empty representation
+        assert_eq!(encrypted_to_plaintext_size(68), Some(0));
 
         // Single empty chunk (empty file)
         assert_eq!(encrypted_to_plaintext_size(68 + 28), Some(0));

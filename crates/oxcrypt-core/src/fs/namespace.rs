@@ -92,12 +92,16 @@ pub(crate) fn replace(
     } else {
         entry.clone()
     };
-    // Ciphertext and directory pointers are immutable under atomic write-back.
-    // A hard link stages the data without copying or decrypting the file.
+    // An interrupted rename may retain both names. Independent COW/ciphertext
+    // copies prevent a later in-place writer from changing both aliases.
     let source_payload = payload(source, kind);
-    if fs::hard_link(&source_payload, &content).is_err() {
-        fs::copy(&source_payload, &content)?;
-    }
+    #[cfg(feature = "async")]
+    crate::fs::streaming::editor::clone_ciphertext(
+        &mut fs::File::open(&source_payload)?,
+        &content,
+    )?;
+    #[cfg(not(feature = "async"))]
+    fs::copy(&source_payload, &content)?;
     fs::File::open(&content)?.sync_all()?;
     if let Some(name) = shortened_name {
         let name_path = entry.join("name.c9s");
@@ -130,4 +134,38 @@ pub(crate) fn replace(
     }
     crate::fs::durability::sync_directory_chain(source_parent, root)?;
     Ok(())
+}
+
+/// Exchange existing payloads atomically, preserving open-file identity.
+pub(crate) fn exchange(first: &Path, second: &Path, root: &Path) -> io::Result<()> {
+    fs::File::open(first)?.sync_all()?;
+    fs::File::open(second)?.sync_all()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        first,
+        rustix::fs::CWD,
+        second,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic exchange unavailable",
+    ));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        crate::fs::durability::sync_directory_chain(
+            first
+                .parent()
+                .ok_or_else(|| io::Error::other("missing parent"))?,
+            root,
+        )?;
+        crate::fs::durability::sync_directory_chain(
+            second
+                .parent()
+                .ok_or_else(|| io::Error::other("missing parent"))?,
+            root,
+        )
+    }
 }

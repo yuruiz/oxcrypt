@@ -5,7 +5,7 @@
 
 use crate::dir_entry::CryptomatorDirEntry;
 use crate::error::{WebDavError, vault_error_to_fs_error, write_error_to_fs_error};
-use crate::file::CryptomatorFile;
+use crate::file::{CryptomatorFile, WriteBufferTable};
 use crate::metadata::CryptomatorMetaData;
 use dav_server::davpath::DavPath;
 use dav_server::fs::{
@@ -16,14 +16,11 @@ use futures::stream;
 use oxcrypt_core::vault::DirId;
 use oxcrypt_core::vault::operations_async::VaultOperationsAsync;
 use oxcrypt_mount::moka_cache::SyncTtlCache;
-use oxcrypt_mount::{HandleTable, VaultStats, WriteBuffer};
+use oxcrypt_mount::{EditBuffer, HandleTable, VaultStats};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace};
-
-/// Type alias for write buffer table (path -> WriteBuffer).
-type WriteBufferTable = HandleTable<String, WriteBuffer>;
 
 /// Type alias for metadata cache (path -> CryptomatorMetaData).
 type MetadataCache = SyncTtlCache<String, CryptomatorMetaData>;
@@ -257,31 +254,19 @@ impl CryptomatorWebDav {
     async fn flush_write_buffer(&self, path: &str) -> Result<(), FsError> {
         let _guard = self.flush_lock.lock().await;
         let path_key = path.to_string();
-        let Some(buffer) = self.write_buffers.get(&path_key) else {
+        let Some(buffer) = self
+            .write_buffers
+            .get(&path_key)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
             return Ok(());
         };
-        if !buffer.is_dirty() {
-            return Ok(());
-        }
-        let revision = buffer.revision();
-        let content = buffer.snapshot();
-        let dir_id = buffer.dir_id().clone();
-        let filename = buffer.filename().to_owned();
-        drop(buffer);
-        let encrypted_path = self
-            .ops
-            .write_file(&dir_id, &filename, &content)
+        buffer
+            .commit(&self.ops)
             .await
             .map_err(write_error_to_fs_error)?;
-        self.ops
-            .sync_encrypted_file(&encrypted_path, false)
-            .await
-            .map_err(write_error_to_fs_error)?;
-        if let Some(mut buffer) = self.write_buffers.get_mut(&path_key)
-            && Arc::ptr_eq(&buffer.snapshot(), &content)
-        {
-            buffer.mark_clean_if_revision(revision);
-        }
+        self.write_buffers
+            .retain(|key, current| key != &path_key || !Arc::ptr_eq(current, &buffer));
         self.metadata_cache.invalidate(&path_key);
         Ok(())
     }
@@ -450,13 +435,8 @@ impl CryptomatorWebDav {
             for file in files {
                 let source_path = Self::join_path(&current_from_path, &file.name);
                 self.flush_write_buffer(&source_path).await?;
-                let content = self
-                    .ops
-                    .read_file(&current_from_id, &file.name)
-                    .await
-                    .map_err(vault_error_to_fs_error)?;
                 self.ops
-                    .write_file(&current_to_id, &file.name, &content.content)
+                    .copy_file_ciphertext(&current_from_id, &file.name, &current_to_id, &file.name)
                     .await
                     .map_err(write_error_to_fs_error)?;
                 let dest_path = Self::join_path(&current_to_path, &file.name);
@@ -508,111 +488,60 @@ impl DavFileSystem for CryptomatorWebDav {
         options: OpenOptions,
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         Box::pin(async move {
-            let open_start = Instant::now();
             let vault_path = Self::parse_path(path);
             debug!(vault_path = %vault_path, options = ?options, "Opening file");
 
-            if options.create_new && self.write_buffers.get_mut(&vault_path).is_some() {
-                return Err(FsError::Exists);
-            }
-
-            // Check if we have an existing write buffer for this path
-            if let Some(buf_ref) = self.write_buffers.get_mut(&vault_path) {
-                let filename = buf_ref.filename().to_string();
-                drop(buf_ref);
-                // Return a file handle that references the existing buffer
-                // For simplicity, we create a new buffer with the same content
-                let buffer = self.write_buffers.remove(&vault_path).ok_or_else(|| {
-                    tracing::error!(path = %vault_path, "Write buffer disappeared between check and remove");
-                    FsError::GeneralFailure
-                })?;
-                let file = CryptomatorFile::writer(
-                    buffer,
-                    filename,
-                    self.ops.clone(),
-                    vault_path.clone(),
-                    self.metadata_cache.clone(),
-                    self.stats.clone(),
-                );
-                return Ok(Box::new(file) as Box<dyn DavFile>);
-            }
-
+            let (dir_id, filename) = self.resolve_path(&vault_path).await?;
             if options.write || options.create || options.create_new {
-                // Write mode: create a write buffer
-                let resolve_start = Instant::now();
-                let (dir_id, filename) = self.resolve_path(&vault_path).await?;
-                let resolve_elapsed = resolve_start.elapsed();
-                if resolve_elapsed.as_millis() > 10 {
-                    tracing::warn!(path = %vault_path, elapsed_ms = resolve_elapsed.as_millis(), "Slow resolve_path");
-                }
-
+                let _guard = self.flush_lock.lock().await;
                 if options.create_new {
+                    if self.write_buffers.contains(&vault_path) {
+                        return Err(FsError::Exists);
+                    }
                     match self.find_entry(&vault_path).await {
                         Ok(_) => return Err(FsError::Exists),
                         Err(FsError::NotFound) => {}
-                        Err(e) => return Err(e),
+                        Err(error) => return Err(error),
                     }
                 }
-
-                let buffer = if options.create_new {
-                    // New file, start empty
-                    WriteBuffer::new_for_create(dir_id, filename.clone())
-                } else if options.truncate {
-                    // Truncate: file will be rewritten from scratch
-                    // Use new_for_create to mark as dirty so empty files are created
-                    WriteBuffer::new_for_create(dir_id, filename.clone())
-                } else {
-                    // Open existing file for append/modify
-                    match self.ops.read_file(&dir_id, &filename).await {
-                        Ok(content) => WriteBuffer::new(dir_id, filename.clone(), content.content),
-                        Err(error) => {
-                            let error = vault_error_to_fs_error(error);
-                            if options.create && matches!(error, FsError::NotFound) {
-                                WriteBuffer::new_for_create(dir_id, filename.clone())
-                            } else {
-                                return Err(error);
-                            }
-                        }
-                    }
-                };
-
-                let file = CryptomatorFile::writer(
-                    buffer,
-                    filename,
-                    self.ops.clone(),
-                    vault_path.clone(),
-                    self.metadata_cache.clone(),
-                    self.stats.clone(),
+                let editor = Arc::new(
+                    EditBuffer::open(
+                        &self.ops,
+                        dir_id,
+                        filename.clone(),
+                        options.create || options.create_new,
+                        options.truncate,
+                    )
+                    .await
+                    .map_err(write_error_to_fs_error)?,
                 );
-                let open_elapsed = open_start.elapsed();
-                if open_elapsed.as_millis() > 50 {
-                    tracing::warn!(path = %vault_path, elapsed_ms = open_elapsed.as_millis(), "Slow write open");
+                self.write_buffers
+                    .insert(vault_path.clone(), Arc::clone(&editor));
+                let mut file = CryptomatorFile::writer(
+                    editor,
+                    filename,
+                    Arc::clone(&self.ops),
+                    vault_path,
+                    Arc::clone(&self.metadata_cache),
+                    Arc::clone(&self.stats),
+                    Arc::clone(&self.write_buffers),
+                    Arc::clone(&self.flush_lock),
+                );
+                if options.append {
+                    file.seek(std::io::SeekFrom::End(0)).await?;
                 }
                 Ok(Box::new(file) as Box<dyn DavFile>)
             } else {
-                // Read mode: load file content into memory buffer
-                // NOTE: We use read_file instead of open_file because open_file returns
-                // a VaultFileReader that holds directory read locks for its lifetime.
-                // This could block write operations (like delete) on the same directory.
-                // By reading the entire file into memory at open time, we release locks
-                // immediately and avoid contention.
-                let resolve_start = Instant::now();
-                let (dir_id, filename) = self.resolve_path(&vault_path).await?;
-                let resolve_elapsed = resolve_start.elapsed();
-                if resolve_elapsed.as_millis() > 10 {
-                    tracing::warn!(path = %vault_path, elapsed_ms = resolve_elapsed.as_millis(), "Slow resolve_path (read)");
-                }
-                let decrypted = self
+                let reader = self
                     .ops
-                    .read_file(&dir_id, &filename)
+                    .open_file_unlocked(&dir_id, &filename)
                     .await
                     .map_err(vault_error_to_fs_error)?;
-                let file = CryptomatorFile::reader(decrypted.content, filename, self.stats.clone());
-                let open_elapsed = open_start.elapsed();
-                if open_elapsed.as_millis() > 50 {
-                    tracing::warn!(path = %vault_path, elapsed_ms = open_elapsed.as_millis(), "Slow read open");
-                }
-                Ok(Box::new(file) as Box<dyn DavFile>)
+                Ok(Box::new(CryptomatorFile::reader(
+                    reader,
+                    filename,
+                    Arc::clone(&self.stats),
+                )) as Box<dyn DavFile>)
             }
         })
     }
@@ -952,26 +881,10 @@ impl DavFileSystem for CryptomatorWebDav {
                 self.metadata_cache.invalidate(&to_path);
             } else {
                 self.flush_write_buffer(&from_path).await?;
-                // Read source file
-                let content = match self.ops.read_file(&from_dir_id, &from_name).await {
-                    Ok(content) => content,
-                    Err(e) => {
-                        self.stats.record_error();
-                        self.stats.record_metadata_latency(start.elapsed());
-                        return Err(vault_error_to_fs_error(e));
-                    }
-                };
-
-                // Write to destination
-                if let Err(e) = self
-                    .ops
-                    .write_file(&to_dir_id, &to_name, &content.content)
+                self.ops
+                    .copy_file_ciphertext(&from_dir_id, &from_name, &to_dir_id, &to_name)
                     .await
-                {
-                    self.stats.record_error();
-                    self.stats.record_metadata_latency(start.elapsed());
-                    return Err(write_error_to_fs_error(e));
-                }
+                    .map_err(write_error_to_fs_error)?;
 
                 // Invalidate cache for the destination
                 self.metadata_cache.invalidate(&to_path);
@@ -1022,10 +935,12 @@ mod tests {
         file.write_bytes(bytes::Bytes::from_static(b"pending"))
             .await
             .unwrap();
-        std::fs::remove_file(&path).unwrap();
+        let backup = path.with_extension("fault-backup");
+        std::fs::rename(&path, &backup).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(file.flush().await.is_err());
         std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
         file.flush().await.unwrap();
         assert_eq!(
             ops.read_file(&DirId::root(), "note").await.unwrap().content,
@@ -1045,17 +960,27 @@ mod tests {
             .write_file(&DirId::root(), "note", b"old")
             .await
             .unwrap();
-        std::fs::remove_file(&path).unwrap();
+        let buffer = Arc::new(
+            EditBuffer::open(&ops, DirId::root(), "note".into(), false, true)
+                .await
+                .unwrap(),
+        );
+        buffer.write(0, b"pending").unwrap();
+        let backup = path.with_extension("fault-backup");
+        std::fs::rename(&path, &backup).unwrap();
         std::fs::create_dir(&path).unwrap();
-        let mut buffer = WriteBuffer::new_for_create(DirId::root(), "note".into());
-        buffer.write(0, b"pending");
         fs.write_buffers.insert("/note".into(), buffer);
         assert!(fs.flush_write_buffer("/note").await.is_err());
         assert_eq!(
-            fs.write_buffers.get(&"/note".into()).unwrap().content(),
+            fs.write_buffers
+                .get(&"/note".into())
+                .unwrap()
+                .read(0, 7)
+                .unwrap(),
             b"pending"
         );
         std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
         fs.flush_write_buffer("/note").await.unwrap();
         assert_eq!(
             ops.read_file(&DirId::root(), "note").await.unwrap().content,
@@ -1083,8 +1008,13 @@ mod tests {
             create: true,
             ..OpenOptions::default()
         };
+        let mut handle = fs
+            .open(&DavPath::new("/note").unwrap(), options)
+            .await
+            .unwrap();
         assert!(
-            fs.open(&DavPath::new("/note").unwrap(), options)
+            handle
+                .write_bytes(bytes::Bytes::from_static(b"edit"))
                 .await
                 .is_err()
         );
