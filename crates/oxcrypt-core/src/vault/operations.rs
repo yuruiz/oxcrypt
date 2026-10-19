@@ -3123,12 +3123,12 @@ impl VaultOperations {
 
         // If shortened, write the name.c9s file
         if is_shortened {
-            fs::write(symlink_dir.join("name.c9s"), &encrypted_name)?;
+            self.atomic_write(&symlink_dir.join("name.c9s"), encrypted_name.as_bytes())?;
         }
 
         // Encrypt and write the symlink target
         let encrypted_target = encrypt_symlink_target(target, &self.master_key)?;
-        fs::write(symlink_dir.join("symlink.c9r"), &encrypted_target)?;
+        self.atomic_write(&symlink_dir.join("symlink.c9r"), &encrypted_target)?;
 
         info!("Symlink created successfully");
         Ok(())
@@ -3159,6 +3159,7 @@ impl VaultOperations {
 
         if symlink_dir.exists() && symlink_dir.join("symlink.c9r").exists() {
             fs::remove_dir_all(&symlink_dir)?;
+            crate::fs::durability::sync_directory_chain(&dir_path, self.vault_path())?;
             info!("Symlink deleted successfully");
             return Ok(());
         }
@@ -3169,6 +3170,7 @@ impl VaultOperations {
 
         if shortened_dir.exists() && shortened_dir.join("symlink.c9r").exists() {
             fs::remove_dir_all(&shortened_dir)?;
+            crate::fs::durability::sync_directory_chain(&dir_path, self.vault_path())?;
             info!("Shortened symlink deleted successfully");
             return Ok(());
         }
