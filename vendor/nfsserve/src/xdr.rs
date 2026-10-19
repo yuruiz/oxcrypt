@@ -121,6 +121,9 @@ impl XDR for Vec<u8> {
     fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
         let mut length: u32 = 0;
         length.deserialize(src)?;
+        if length as usize > crate::limits::MAX_RPC_BYTES {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "XDR length exceeds RPC budget"));
+        }
         self.resize(length as usize, 0);
         src.read_exact(self)?;
         // read padding
@@ -153,6 +156,9 @@ impl XDR for Vec<u32> {
     fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
         let mut length: u32 = 0;
         length.deserialize(src)?;
+        if length as usize > crate::limits::MAX_RPC_BYTES / 4 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "XDR length exceeds RPC budget"));
+        }
         self.resize(length as usize, 0);
         for i in self {
             i.deserialize(src)?;

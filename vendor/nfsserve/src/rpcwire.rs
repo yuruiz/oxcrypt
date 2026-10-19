@@ -16,9 +16,9 @@ use crate::nfs_handlers;
 use crate::portmap;
 use crate::portmap_handlers;
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use std::sync::Arc;
 
 // Information from RFC 5531
 // https://datatracker.ietf.org/doc/html/rfc5531
@@ -95,6 +95,8 @@ async fn handle_rpc(
 async fn read_fragment(
     socket: &mut DuplexStream,
     append_to: &mut Vec<u8>,
+    slot: &mut Option<OwnedSemaphorePermit>,
+    slots: &Arc<Semaphore>,
 ) -> Result<bool, anyhow::Error> {
     let mut header_buf = [0_u8; 4];
     socket.read_exact(&mut header_buf).await?;
@@ -103,7 +105,12 @@ async fn read_fragment(
     let length = (fragment_header & ((1 << 31) - 1)) as usize;
     trace!("Reading fragment length:{}, last:{}", length, is_last);
     let start_offset = append_to.len();
-    append_to.resize(append_to.len() + length, 0);
+    let total = start_offset.checked_add(length).filter(|total| *total <= crate::limits::MAX_RPC_BYTES)
+        .ok_or_else(|| anyhow!("RPC record exceeds byte budget"))?;
+    if slot.is_none() {
+        *slot = Some(Arc::clone(slots).acquire_owned().await?);
+    }
+    append_to.resize(total, 0);
     socket.read_exact(&mut append_to[start_offset..]).await?;
     trace!(
         "Finishing Reading fragment length:{}, last:{}",
@@ -113,22 +120,7 @@ async fn read_fragment(
     Ok(is_last)
 }
 
-pub async fn write_fragment(
-    socket: &mut tokio::net::TcpStream,
-    buf: &Vec<u8>,
-) -> Result<(), anyhow::Error> {
-    // TODO: split into many fragments
-    assert!(buf.len() < (1 << 31));
-    // set the last flag
-    let fragment_header = buf.len() as u32 + (1 << 31);
-    let header_buf = u32::to_be_bytes(fragment_header);
-    socket.write_all(&header_buf).await?;
-    trace!("Writing fragment length:{}", buf.len());
-    socket.write_all(buf).await?;
-    Ok(())
-}
-
-pub type SocketMessageType = Result<Vec<u8>, anyhow::Error>;
+pub type SocketMessageType = (Result<Vec<u8>, anyhow::Error>, OwnedSemaphorePermit);
 
 /// The Socket Message Handler reads from a TcpStream and spawns off
 /// subtasks to handle each message. replies are queued into the
@@ -136,8 +128,10 @@ pub type SocketMessageType = Result<Vec<u8>, anyhow::Error>;
 #[derive(Debug)]
 pub struct SocketMessageHandler {
     cur_fragment: Vec<u8>,
+    fragment_count: usize,
+    slot: Option<OwnedSemaphorePermit>,
     socket_receive_channel: DuplexStream,
-    reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
+    reply_send_channel: mpsc::Sender<SocketMessageType>,
     context: RPCContext,
 }
 
@@ -148,13 +142,15 @@ impl SocketMessageHandler {
     ) -> (
         Self,
         DuplexStream,
-        mpsc::UnboundedReceiver<SocketMessageType>,
+        mpsc::Receiver<SocketMessageType>,
     ) {
         let (socksend, sockrecv) = tokio::io::duplex(256000);
-        let (msgsend, msgrecv) = mpsc::unbounded_channel();
+        let (msgsend, msgrecv) = mpsc::channel(crate::limits::MAX_REQUESTS);
         (
             Self {
                 cur_fragment: Vec::new(),
+                fragment_count: 0,
+                slot: None,
                 socket_receive_channel: sockrecv,
                 reply_send_channel: msgsend,
                 context: context.clone(),
@@ -166,9 +162,15 @@ impl SocketMessageHandler {
 
     /// Reads a fragment from the socket. This should be looped.
     pub async fn read(&mut self) -> Result<(), anyhow::Error> {
-        let is_last =
-            read_fragment(&mut self.socket_receive_channel, &mut self.cur_fragment).await?;
+        self.fragment_count += 1;
+        if self.fragment_count > crate::limits::MAX_FRAGMENTS {
+            return Err(anyhow!("RPC record has too many fragments"));
+        }
+        let is_last = read_fragment(&mut self.socket_receive_channel, &mut self.cur_fragment,
+            &mut self.slot, &self.context.request_slots).await?;
         if is_last {
+            self.fragment_count = 0;
+            let slot = self.slot.take().ok_or_else(|| anyhow!("missing RPC budget permit"))?;
             let fragment = std::mem::take(&mut self.cur_fragment);
             let context = self.context.clone();
             let send = self.reply_send_channel.clone();
@@ -180,11 +182,11 @@ impl SocketMessageHandler {
                 match maybe_reply {
                     Err(e) => {
                         error!("RPC Error: {:?}", e);
-                        let _ = send.send(Err(e));
+                        let _ = send.send((Err(e), slot)).await;
                     }
                     Ok(_) => {
                         let _ = std::io::Write::flush(&mut write_cursor);
-                        let _ = send.send(Ok(write_buf));
+                        let _ = send.send((Ok(write_buf), slot)).await;
                     }
                 }
             });

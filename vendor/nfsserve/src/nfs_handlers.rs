@@ -901,11 +901,17 @@ pub async fn nfsproc3_readdirplus(
         return Ok(());
     }*/
     // subtract off the final entryplus* field (which must be false) and the eof
-    let max_bytes_allowed = args.maxcount as usize - 128;
+    if args.maxcount < 128 {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
+        dir_attr.serialize(output)?;
+        return Ok(());
+    }
+    let max_bytes_allowed = args.maxcount.min(crate::vfs::MAX_TRANSFER_SIZE) as usize - 128;
     // args.dircount is bytes of just fileid, name, cookie.
     // This is hard to ballpark, so we just divide it by 16
-    let estimated_max_results = args.dircount / 16;
-    let max_dircount_bytes = args.dircount as usize;
+    let estimated_max_results = args.dircount.min(crate::vfs::MAX_TRANSFER_SIZE) / 16;
+    let max_dircount_bytes = args.dircount.min(crate::vfs::MAX_TRANSFER_SIZE) as usize;
     let mut ctr = 0;
     match context
         .vfs
@@ -1030,10 +1036,16 @@ pub async fn nfsproc3_readdir(
     debug!(" -- Dir version {:?}", dirversion);
     let has_version = args.cookieverf != nfs::cookieverf3::default();
     // subtract off the final entryplus* field (which must be false) and the eof
-    let max_bytes_allowed = args.dircount as usize - 128;
+    if args.dircount < 128 {
+        make_success_reply(xid).serialize(output)?;
+        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
+        dir_attr.serialize(output)?;
+        return Ok(());
+    }
+    let max_bytes_allowed = args.dircount.min(crate::vfs::MAX_TRANSFER_SIZE) as usize - 128;
     // args.dircount is bytes of just fileid, name, cookie.
     // This is hard to ballpark, so we just divide it by 16
-    let estimated_max_results = args.dircount / 16;
+    let estimated_max_results = args.dircount.min(crate::vfs::MAX_TRANSFER_SIZE) / 16;
     let mut ctr = 0;
     match context
         .vfs
