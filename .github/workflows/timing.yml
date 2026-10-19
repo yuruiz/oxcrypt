@@ -26,17 +26,11 @@ jobs:
         run: python3 -B scripts/test_check_timing_results.py
 
       - name: Build timing benchmarks
-        run: cargo bench --locked -p oxcrypt-core --bench timing_leaks --no-run
+        run: cargo bench --locked -p oxcrypt-core --bench timing_leaks --no-run --message-format=json > timing-build.json
 
       - name: Run security-critical timing tests
         shell: bash
-        run: |
-          set -euo pipefail
-          for test in timing_hmac_verify timing_key_unwrap; do
-            timeout 120 cargo bench --locked -p oxcrypt-core --bench timing_leaks -- --filter "$test" 2>&1 | tee "$test.txt"
-          done
-          cat timing_hmac_verify.txt timing_key_unwrap.txt > timing_results.txt
-          python3 scripts/check-timing-results.py timing_results.txt
+        run: python3 scripts/run-timing-tests.py timing-build.json
         env:
           RAYON_NUM_THREADS: 1
 
