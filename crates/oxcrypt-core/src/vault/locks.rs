@@ -171,6 +171,8 @@ pub type FileLockKey = (DirId, String);
 /// ```
 #[derive(Debug, Default)]
 pub struct VaultLockManager {
+    /// Serializes directory topology changes before per-directory locks.
+    topology: Arc<tokio::sync::Mutex<()>>,
     /// Per-directory locks for listing and directory metadata operations.
     directory_locks: DashMap<DirId, Arc<RwLock<()>>>,
 
@@ -183,9 +185,15 @@ impl VaultLockManager {
     /// Create a new lock manager.
     pub fn new() -> Self {
         Self {
+            topology: Arc::new(tokio::sync::Mutex::new(())),
             directory_locks: DashMap::new(),
             file_locks: DashMap::new(),
         }
+    }
+
+    /// Keep a directory ancestry check valid until its namespace change finishes.
+    pub(crate) async fn topology_write(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.topology).lock_owned().await
     }
 
     /// Get or create a directory lock.

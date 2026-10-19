@@ -2283,6 +2283,7 @@ impl VaultOperationsAsync {
     ) -> Result<DirId, VaultWriteError> {
         info!("Creating new directory in vault");
 
+        let _topology_guard = self.lock_manager.topology_write().await;
         // Acquire parent directory write lock
         let _parent_guard = self.lock_directory_write(parent_dir_id).await;
         trace!("Acquired parent directory write lock for create_directory");
@@ -2447,6 +2448,7 @@ impl VaultOperationsAsync {
     ) -> Result<(), VaultWriteError> {
         info!("Deleting directory from vault");
 
+        let _topology_guard = self.lock_manager.topology_write().await;
         // Acquire parent directory write lock first
         let _parent_guard = self.lock_directory_write(parent_dir_id).await;
         trace!("Acquired parent directory write lock for delete_directory");
@@ -2732,6 +2734,50 @@ impl VaultOperationsAsync {
         .map_err(Into::into)
     }
 
+    /// Reject moving an entry into itself or any of its descendants.
+    /// Callers hold the shared topology guard while checking and publishing.
+    async fn check_directory_destination(
+        &self,
+        source: &DirId,
+        destination: &DirId,
+    ) -> Result<(), VaultWriteError> {
+        let mut pending = vec![source.clone()];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(directory) = pending.pop() {
+            if &directory == destination {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a directory cannot be moved into itself or its descendants",
+                )
+                .into());
+            }
+            if !visited.insert(directory.clone()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "directory graph contains a cycle or alias",
+                )
+                .into());
+            }
+            let mut entries =
+                fs::read_dir(self.calculate_directory_storage_path(&directory)?).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !(name.ends_with(".c9r") || name.ends_with(".c9s"))
+                    || !entry.file_type().await?.is_dir()
+                {
+                    continue;
+                }
+                match fs::read_to_string(entry.path().join("dir.c9r")).await {
+                    Ok(id) => pending.push(DirId::from_raw(id.trim())),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Publish a replacement without unlinking its previous destination first.
     pub async fn rename_entry_atomic(
         &self,
@@ -2744,6 +2790,7 @@ impl VaultOperationsAsync {
         if source_dir == target_dir && source_name == target_name {
             return Ok(());
         }
+        let topology_guard = self.lock_manager.topology_write().await;
         let parent_guards = self
             .lock_directories_write_ordered(&[source_dir, target_dir])
             .await;
@@ -2766,6 +2813,12 @@ impl VaultOperationsAsync {
             .calculate_directory_storage_path(target_dir)?
             .join(entry_name(&target_encrypted));
         let source_kind = namespace::inspect(&source)?;
+        if source_kind == Kind::Directory {
+            let source_id =
+                DirId::from_raw(fs::read_to_string(source.join("dir.c9r")).await?.trim());
+            self.check_directory_destination(&source_id, target_dir)
+                .await?;
+        }
         let target_kind = match namespace::inspect(&target) {
             Ok(kind) => Some(kind),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -2814,7 +2867,7 @@ impl VaultOperationsAsync {
         let root = self.vault_path().to_path_buf();
         let shortened = (target_encrypted.len() > threshold).then_some(target_encrypted);
         tokio::task::spawn_blocking(move || {
-            let _guards = (parent_guards, child_guard);
+            let _guards = (topology_guard, parent_guards, child_guard);
             namespace::replace(&source, &target, shortened.as_deref(), &root)
         })
         .await
@@ -2968,6 +3021,7 @@ impl VaultOperationsAsync {
             });
         }
 
+        let _topology_guard = self.lock_manager.topology_write().await;
         // Acquire parent directory write lock
         let _parent_guard = self.lock_directory_write(parent_dir_id).await;
         trace!("Acquired parent directory write lock for rename_directory");
@@ -3088,6 +3142,7 @@ impl VaultOperationsAsync {
                 .await;
         }
 
+        let _topology_guard = self.lock_manager.topology_write().await;
         // Acquire parent directory write locks in consistent order to prevent deadlocks
         let _dir_guards = self
             .lock_directories_write_ordered(&[src_parent_dir_id, dest_parent_dir_id])
@@ -3111,6 +3166,9 @@ impl VaultOperationsAsync {
                 name: src_name.to_string(),
                 context: Box::new(src_ctx.clone()),
             })?;
+
+        self.check_directory_destination(&source_info.directory_id, dest_parent_dir_id)
+            .await?;
 
         if self
             .find_directory_unlocked(dest_parent_dir_id, dest_name)
@@ -3577,6 +3635,7 @@ impl VaultOperationsAsync {
             });
         }
 
+        let topology_guard = self.lock_manager.topology_write().await;
         // Acquire parent directory write lock
         let parent_guard = self.lock_directory_write(parent_dir_id).await;
         trace!("Acquired parent directory write lock for atomic_swap_directories");
@@ -3628,7 +3687,7 @@ impl VaultOperationsAsync {
 
         let root = self.vault_path().to_owned();
         tokio::task::spawn_blocking(move || {
-            let _guard = parent_guard;
+            let _guards = (parent_guard, topology_guard);
             crate::fs::namespace::exchange(
                 &dir_a_info.encrypted_path.join("dir.c9r"),
                 &dir_b_info.encrypted_path.join("dir.c9r"),
