@@ -75,3 +75,86 @@ async fn http_and_native_vault_operations_share_unicode_and_literal_percent_name
     assert_eq!(response.bytes().await.unwrap().as_ref(), b"nested");
     server.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn unicode_alias_move_and_copy_do_not_delete_the_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let key = Arc::new(oxcrypt_core::crypto::keys::MasterKey::random().unwrap());
+    let ops = Arc::new(VaultOperationsAsync::new(temp.path(), key));
+    let mut server = WebDavServer::start(
+        CryptomatorWebDav::new(Arc::clone(&ops)),
+        ServerConfig::default(),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let mut statuses = Vec::new();
+    for method in ["MOVE", "COPY"] {
+        ops.write_file(&DirId::root(), "café", b"preserved")
+            .await
+            .unwrap();
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                url(&server.url(), &["café"]),
+            )
+            .header("Destination", url(&server.url(), &["cafe\u{301}"]).as_str())
+            .header("Overwrite", "T")
+            .send()
+            .await
+            .unwrap();
+        let remaining = ops.read_file(&DirId::root(), "café").await;
+        assert!(
+            remaining.is_ok(),
+            "{method} deleted the source through its Unicode alias"
+        );
+        assert_eq!(remaining.unwrap().content, b"preserved");
+        statuses.push(response.status());
+    }
+    assert!(
+        statuses
+            .iter()
+            .all(|status| *status == reqwest::StatusCode::FORBIDDEN),
+        "{statuses:?}"
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn unicode_alias_ancestor_overwrite_keeps_the_complete_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    let key = Arc::new(oxcrypt_core::crypto::keys::MasterKey::random().unwrap());
+    let ops = Arc::new(VaultOperationsAsync::new(temp.path(), key));
+    let mut server = WebDavServer::start(
+        CryptomatorWebDav::new(Arc::clone(&ops)),
+        ServerConfig::default(),
+    )
+    .await
+    .unwrap();
+    let parent = ops.create_directory(&DirId::root(), "café").await.unwrap();
+    let child = ops.create_directory(&parent, "child").await.unwrap();
+    ops.write_file(&parent, "sibling", b"preserved")
+        .await
+        .unwrap();
+    ops.write_file(&child, "note", b"preserved").await.unwrap();
+    let response = reqwest::Client::new()
+        .request(
+            reqwest::Method::from_bytes(b"MOVE").unwrap(),
+            url(&server.url(), &["cafe\u{301}", "child"]),
+        )
+        .header("Destination", url(&server.url(), &["café"]).as_str())
+        .header("Overwrite", "T")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        ops.read_file(&parent, "sibling").await.is_ok(),
+        "ancestor overwrite deleted sibling"
+    );
+    assert!(
+        ops.read_file(&child, "note").await.is_ok(),
+        "ancestor overwrite deleted source"
+    );
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    server.stop().await.unwrap();
+}

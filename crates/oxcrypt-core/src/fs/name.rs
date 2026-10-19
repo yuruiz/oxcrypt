@@ -224,7 +224,7 @@ pub fn hash_dir_id(dir_id: &str, master_key: &MasterKey) -> Result<String, NameE
 /// avoids an allocation in the common case. macOS uses NFD, which will trigger
 /// normalization.
 #[inline]
-fn normalize_filename(name: &str) -> Cow<'_, str> {
+pub fn normalize_filename(name: &str) -> Cow<'_, str> {
     match is_nfc_quick(name.chars()) {
         IsNormalized::Yes => Cow::Borrowed(name),
         // IsNormalized::Maybe or IsNormalized::No - need to normalize

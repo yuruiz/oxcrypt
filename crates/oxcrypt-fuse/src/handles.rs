@@ -157,6 +157,9 @@ impl FuseHandleTable {
     }
 
     pub(crate) fn writer_handles(&self, dir: &DirId, name: &str) -> Vec<u64> {
+        let name = oxcrypt_core::fs::name::normalize_filename(name);
+        let name = name.as_ref();
+
         let mut ids = Vec::new();
         self.inner.retain(|id, handle| {
             if let Some((editor, writable)) = handle.editor()
@@ -179,6 +182,9 @@ impl FuseHandleTable {
     }
 
     pub(crate) fn detach_writers(&self, dir: &DirId, name: &str) {
+        let name = oxcrypt_core::fs::name::normalize_filename(name);
+        let name = name.as_ref();
+
         for entry in &self.editors {
             if let Some(editor) = entry.value().upgrade()
                 && editor.location() == (dir.clone(), name.to_owned())
@@ -205,6 +211,11 @@ impl FuseHandleTable {
         to_dir: &DirId,
         to_name: &str,
     ) {
+        let from_name = oxcrypt_core::fs::name::normalize_filename(from_name);
+        let from_name = from_name.as_ref();
+        let to_name = oxcrypt_core::fs::name::normalize_filename(to_name);
+        let to_name = to_name.as_ref();
+
         for entry in &self.editors {
             if let Some(editor) = entry.value().upgrade()
                 && !editor.is_detached()
@@ -233,6 +244,11 @@ impl FuseHandleTable {
         b_dir: &DirId,
         b_name: &str,
     ) {
+        let a_name = oxcrypt_core::fs::name::normalize_filename(a_name);
+        let a_name = a_name.as_ref();
+        let b_name = oxcrypt_core::fs::name::normalize_filename(b_name);
+        let b_name = b_name.as_ref();
+
         for entry in &self.editors {
             if let Some(editor) = entry.value().upgrade()
                 && !editor.is_detached()
@@ -411,6 +427,48 @@ impl FuseHandleTableExt for FuseHandleTable {
 mod tests {
     use crate::handles::*;
     use oxcrypt_core::vault::DirId;
+
+    #[tokio::test]
+    async fn unicode_aliases_preserve_writer_relocation_and_detachment() {
+        use oxcrypt_core::{crypto::keys::MasterKey, vault::VaultOperationsAsync};
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let ops = VaultOperationsAsync::new(temp.path(), Arc::new(MasterKey::random().unwrap()));
+        let root = DirId::root();
+        for chunked in [false, true] {
+            let table = FuseHandleTable::new_auto_id();
+            let handle = if chunked {
+                let buffer = Arc::new(
+                    oxcrypt_mount::EditBuffer::open(
+                        &ops,
+                        root.clone(),
+                        "cafe\u{301}".into(),
+                        true,
+                        false,
+                    )
+                    .await
+                    .unwrap(),
+                );
+                table.editors.insert(2, Arc::downgrade(&buffer));
+                FuseHandle::Editor {
+                    buffer,
+                    writable: true,
+                }
+            } else {
+                FuseHandle::WriteBuffer(WriteBuffer::new_for_create(
+                    root.clone(),
+                    "cafe\u{301}".into(),
+                ))
+            };
+            let id = table.insert_auto(handle);
+            assert_eq!(table.writer_handles(&root, "café"), vec![id]);
+            table.relocate_writers(&root, "cafe\u{301}", &root, "renamed");
+            assert_eq!(table.writer_handles(&root, "renamed"), vec![id]);
+            table.relocate_writers(&root, "renamed", &root, "cafe\u{301}");
+            table.detach_writers(&root, "café");
+            assert!(table.writer_handles(&root, "café").is_empty());
+        }
+    }
 
     fn test_dir_id() -> DirId {
         DirId::from_raw("test-dir-id")

@@ -30,6 +30,7 @@ impl EditBuffer {
         create: bool,
         truncate: bool,
     ) -> Result<Self, oxcrypt_core::error::VaultWriteError> {
+        let name = crate::write_buffer::normalize_owned_filename(name);
         Ok(Self {
             inner: ops.edit_file(&dir, &name, create, truncate).await?,
             location: RwLock::new((dir, name)),
@@ -78,7 +79,7 @@ impl EditBuffer {
     }
     /// Follow a rename while preserving all open handles and dirty chunks.
     pub fn relocate(&self, dir: DirId, name: String) {
-        *self.location.write() = (dir, name);
+        *self.location.write() = (dir, crate::write_buffer::normalize_owned_filename(name));
     }
     /// Detach an overwritten inode from its former pathname.
     pub fn detach(&self) {

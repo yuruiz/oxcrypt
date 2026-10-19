@@ -12,6 +12,14 @@
 use oxcrypt_core::vault::DirId;
 use std::sync::Arc;
 
+/// Canonicalize an owned name while reusing an already-normalized allocation.
+pub(crate) fn normalize_owned_filename(filename: String) -> String {
+    match oxcrypt_core::fs::name::normalize_filename(&filename) {
+        std::borrow::Cow::Borrowed(_) => filename,
+        std::borrow::Cow::Owned(normalized) => normalized,
+    }
+}
+
 /// A buffer for random-access writes to vault files.
 ///
 /// This implements whole-file read-modify-write with copy-on-write snapshots.
@@ -63,7 +71,7 @@ impl WriteBuffer {
             revision: 0,
             detached: false,
             dir_id,
-            filename,
+            filename: normalize_owned_filename(filename),
         }
     }
 
@@ -89,7 +97,7 @@ impl WriteBuffer {
             detached: false,
             dirty: true, // New file needs to be written
             dir_id,
-            filename,
+            filename: normalize_owned_filename(filename),
         }
     }
 
@@ -104,7 +112,7 @@ impl WriteBuffer {
             detached: false,
             dirty: true, // Must write to create the file
             dir_id,
-            filename,
+            filename: normalize_owned_filename(filename),
         }
     }
 
@@ -221,7 +229,7 @@ impl WriteBuffer {
     /// Update the namespace location without changing the buffered file contents.
     pub fn relocate(&mut self, dir_id: DirId, filename: String) {
         self.dir_id = dir_id;
-        self.filename = filename;
+        self.filename = normalize_owned_filename(filename);
     }
 
     /// Get the directory ID.

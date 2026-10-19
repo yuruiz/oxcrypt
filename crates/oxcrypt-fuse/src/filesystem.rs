@@ -4533,7 +4533,10 @@ impl Filesystem for CryptomatorFS {
         let dest_parent_path = newparent_entry.path.clone();
         drop(newparent_entry);
 
-        if parent == newparent && name_str == newname_str {
+        if parent == newparent
+            && oxcrypt_core::fs::name::normalize_filename(name_str)
+                == oxcrypt_core::fs::name::normalize_filename(newname_str)
+        {
             reply.ok();
             return;
         }

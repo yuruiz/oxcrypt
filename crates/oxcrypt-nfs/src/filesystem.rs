@@ -1039,7 +1039,10 @@ impl NFSFileSystem for CryptomatorNFS {
             }
         };
         debug!(from_dirid, from_name, to_dirid, to_name, "rename");
-        if from_dirid == to_dirid && from_name == to_name {
+        if from_dirid == to_dirid
+            && oxcrypt_core::fs::name::normalize_filename(from_name)
+                == oxcrypt_core::fs::name::normalize_filename(to_name)
+        {
             return Ok(());
         }
 

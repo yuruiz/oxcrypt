@@ -186,23 +186,19 @@ fn validate_copy_move_paths<B>(request: &Request<B>) -> Result<(), hyper::Status
     let destination: hyper::Uri = destination.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     let source = DavPath::new(request.uri().path()).map_err(|_| StatusCode::BAD_REQUEST)?;
     let target = DavPath::new(destination.path()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let source = source
-        .as_bytes()
-        .strip_suffix(b"/")
-        .unwrap_or(source.as_bytes());
-    let target = target
-        .as_bytes()
-        .strip_suffix(b"/")
-        .unwrap_or(target.as_bytes());
-    let descendant = |path: &[u8], parent: &[u8]| {
+    let source = std::str::from_utf8(source.as_bytes()).map_err(|_| StatusCode::FORBIDDEN)?;
+    let target = std::str::from_utf8(target.as_bytes()).map_err(|_| StatusCode::FORBIDDEN)?;
+    let source = oxcrypt_core::fs::name::normalize_filename(source.trim_end_matches('/'));
+    let target = oxcrypt_core::fs::name::normalize_filename(target.trim_end_matches('/'));
+    let descendant = |path: &str, parent: &str| {
         path.strip_prefix(parent)
-            .is_some_and(|suffix| suffix.starts_with(b"/"))
+            .is_some_and(|suffix| suffix.starts_with('/'))
     };
     // dav-server can recursively delete an overwritten destination before
     // calling the filesystem. Reject overlapping trees before that deletion.
     if source == target
-        || descendant(source, target)
-        || (method == "MOVE" && descendant(target, source))
+        || descendant(&source, &target)
+        || (method == "MOVE" && descendant(&target, &source))
     {
         return Err(StatusCode::FORBIDDEN);
     }

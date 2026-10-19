@@ -2572,6 +2572,11 @@ impl VaultOperationsAsync {
         target_dir: &DirId,
         target_name: &str,
     ) -> Result<PathBuf, VaultWriteError> {
+        let source_name = crate::fs::name::normalize_filename(source_name);
+        let source_name = source_name.as_ref();
+        let target_name = crate::fs::name::normalize_filename(target_name);
+        let target_name = target_name.as_ref();
+
         if source_dir == target_dir && source_name == target_name {
             return Err(VaultWriteError::SameSourceAndDestination {
                 context: VaultOpContext::new().into_box(),
@@ -2799,6 +2804,11 @@ impl VaultOperationsAsync {
         target_dir: &DirId,
         target_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let source_name = crate::fs::name::normalize_filename(source_name);
+        let source_name = source_name.as_ref();
+        let target_name = crate::fs::name::normalize_filename(target_name);
+        let target_name = target_name.as_ref();
+
         use crate::fs::namespace::{self, Kind};
         if source_dir == target_dir && source_name == target_name {
             return Ok(());
@@ -2904,6 +2914,11 @@ impl VaultOperationsAsync {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let old_name = crate::fs::name::normalize_filename(old_name);
+        let old_name = old_name.as_ref();
+        let new_name = crate::fs::name::normalize_filename(new_name);
+        let new_name = new_name.as_ref();
+
         info!("Renaming file in vault");
 
         let ctx = VaultOpContext::new()
@@ -3025,6 +3040,11 @@ impl VaultOperationsAsync {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let old_name = crate::fs::name::normalize_filename(old_name);
+        let old_name = old_name.as_ref();
+        let new_name = crate::fs::name::normalize_filename(new_name);
+        let new_name = new_name.as_ref();
+
         info!("Renaming directory in vault");
 
         let ctx = VaultOpContext::new()
@@ -3140,6 +3160,11 @@ impl VaultOperationsAsync {
         dest_parent_dir_id: &DirId,
         dest_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let src_name = crate::fs::name::normalize_filename(src_name);
+        let src_name = src_name.as_ref();
+        let dest_name = crate::fs::name::normalize_filename(dest_name);
+        let dest_name = dest_name.as_ref();
+
         info!("Moving and renaming directory in vault");
 
         let src_ctx = VaultOpContext::new()
@@ -3255,6 +3280,9 @@ impl VaultOperationsAsync {
         filename: &str,
         dest_dir_id: &DirId,
     ) -> Result<(), VaultWriteError> {
+        let filename = crate::fs::name::normalize_filename(filename);
+        let filename = filename.as_ref();
+
         info!("Moving file in vault");
 
         let src_ctx = VaultOpContext::new()
@@ -3397,6 +3425,11 @@ impl VaultOperationsAsync {
         dest_dir_id: &DirId,
         dest_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let src_name = crate::fs::name::normalize_filename(src_name);
+        let src_name = src_name.as_ref();
+        let dest_name = crate::fs::name::normalize_filename(dest_name);
+        let dest_name = dest_name.as_ref();
+
         info!("Moving and renaming file in vault");
 
         let src_ctx = VaultOpContext::new()
@@ -4203,6 +4236,11 @@ impl VaultOperationsAsync {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let old_name = crate::fs::name::normalize_filename(old_name);
+        let old_name = old_name.as_ref();
+        let new_name = crate::fs::name::normalize_filename(new_name);
+        let new_name = new_name.as_ref();
+
         info!("Renaming symlink in vault");
 
         let ctx = VaultOpContext::new()
@@ -4328,6 +4366,11 @@ impl VaultOperationsAsync {
         dest_dir_id: &DirId,
         dest_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let src_name = crate::fs::name::normalize_filename(src_name);
+        let src_name = src_name.as_ref();
+        let dest_name = crate::fs::name::normalize_filename(dest_name);
+        let dest_name = dest_name.as_ref();
+
         info!("Moving and renaming symlink in vault");
 
         let src_ctx = VaultOpContext::new()

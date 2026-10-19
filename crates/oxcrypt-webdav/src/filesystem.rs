@@ -191,6 +191,7 @@ impl CryptomatorWebDav {
         // Remove leading slash if present, then re-add it for consistency
         // Also remove trailing slash which would cause parsing issues
         let normalized = path_str.trim_start_matches('/').trim_end_matches('/');
+        let normalized = oxcrypt_core::fs::name::normalize_filename(normalized);
         tracing::trace!(raw_path = %path_str, normalized = %normalized, "parse_path");
         if normalized.is_empty() {
             Ok(String::new())

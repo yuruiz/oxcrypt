@@ -2526,6 +2526,11 @@ impl VaultOperations {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let old_name = crate::fs::name::normalize_filename(old_name);
+        let old_name = old_name.as_ref();
+        let new_name = crate::fs::name::normalize_filename(new_name);
+        let new_name = new_name.as_ref();
+
         info!("Renaming file in vault");
 
         let ctx = VaultOpContext::new()
@@ -2611,6 +2616,11 @@ impl VaultOperations {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let old_name = crate::fs::name::normalize_filename(old_name);
+        let old_name = old_name.as_ref();
+        let new_name = crate::fs::name::normalize_filename(new_name);
+        let new_name = new_name.as_ref();
+
         let ctx = VaultOpContext::new()
             .with_filename(old_name)
             .with_dir_id(parent_dir_id.as_str());
@@ -2747,6 +2757,9 @@ impl VaultOperations {
         filename: &str,
         dest_dir_id: &DirId,
     ) -> Result<(), VaultWriteError> {
+        let filename = crate::fs::name::normalize_filename(filename);
+        let filename = filename.as_ref();
+
         let src_ctx = VaultOpContext::new()
             .with_filename(filename)
             .with_dir_id(src_dir_id.as_str());
@@ -2837,6 +2850,11 @@ impl VaultOperations {
         dest_dir_id: &DirId,
         new_name: &str,
     ) -> Result<(), VaultWriteError> {
+        let old_name = crate::fs::name::normalize_filename(old_name);
+        let old_name = old_name.as_ref();
+        let new_name = crate::fs::name::normalize_filename(new_name);
+        let new_name = new_name.as_ref();
+
         // Check for no-op
         if src_dir_id == dest_dir_id && old_name == new_name {
             return Err(VaultWriteError::SameSourceAndDestination {

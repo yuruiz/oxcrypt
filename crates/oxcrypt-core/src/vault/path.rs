@@ -165,10 +165,12 @@ impl VaultPath {
 
     /// Create a new vault path from a string.
     ///
-    /// Leading slashes are stripped, and the path is normalized.
+    /// Leading slashes are stripped and Unicode is normalized to NFC, matching filename encryption.
     pub fn new(path: impl AsRef<str>) -> Self {
         let s = path.as_ref().trim_start_matches('/');
-        VaultPath(RelativePathBuf::from(s))
+        VaultPath(RelativePathBuf::from(
+            crate::fs::name::normalize_filename(s).as_ref(),
+        ))
     }
 
     /// Check if this is the root path.
@@ -202,7 +204,10 @@ impl VaultPath {
     /// ```
     #[must_use]
     pub fn join(&self, component: impl AsRef<str>) -> Self {
-        VaultPath(self.0.join(component.as_ref()))
+        VaultPath(
+            self.0
+                .join(crate::fs::name::normalize_filename(component.as_ref()).as_ref()),
+        )
     }
 
     /// Get the parent path, if any.
