@@ -1,6 +1,7 @@
 //! Atomic publication of a complete encrypted directory entry.
 use std::{fs, io, path::Path};
 
+#[cfg(feature = "async")]
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Kind {
     File,
@@ -37,6 +38,7 @@ pub(crate) fn check_file_container(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "async")]
 pub(crate) fn inspect(path: &Path) -> io::Result<Kind> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_file() {
@@ -69,6 +71,7 @@ pub(crate) fn inspect(path: &Path) -> io::Result<Kind> {
     ))
 }
 
+#[cfg(feature = "async")]
 fn payload(path: &Path, kind: Kind) -> std::path::PathBuf {
     if path.is_file() {
         path.to_path_buf()
@@ -81,6 +84,7 @@ fn payload(path: &Path, kind: Kind) -> std::path::PathBuf {
     }
 }
 
+#[cfg(feature = "async")]
 fn remove_entry(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path)?.is_dir() {
         fs::remove_dir_all(path)
@@ -92,6 +96,7 @@ fn remove_entry(path: &Path) -> io::Result<()> {
 /// Never remove the destination before publishing its replacement. Where the
 /// physical representation changes, stage a complete entry and exchange it.
 /// A crash after publication can leave a duplicate source, never a missing target.
+#[cfg(feature = "async")]
 pub(crate) fn replace(
     source: &Path,
     target: &Path,
@@ -176,6 +181,7 @@ pub(crate) fn replace(
 }
 
 /// Exchange existing payloads atomically, preserving open-file identity.
+#[cfg(feature = "async")]
 pub(crate) fn exchange(first: &Path, second: &Path, root: &Path) -> io::Result<()> {
     fs::File::open(first)?.sync_all()?;
     fs::File::open(second)?.sync_all()?;

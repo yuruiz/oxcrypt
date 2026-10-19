@@ -11,6 +11,8 @@
 //! # Example
 //!
 //! ```no_run
+//! # #[cfg(feature = "async")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use oxcrypt_core::vault::{PasswordValidator, VaultOperationsAsync};
 //! use std::time::Duration;
 //!
@@ -19,20 +21,25 @@
 //! let validated = validator.validate("password", Duration::from_secs(5))?;
 //!
 //! // Phase 2: Create operations (uses already-validated key)
-//! let ops = VaultOperationsAsync::from_validated(validated);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! let ops = VaultOperationsAsync::from_validated(&validated);
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "async"))]
+//! # fn main() {}
 //! ```
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "async")]
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
 use crate::crypto::CryptoError;
+#[cfg(feature = "async")]
 use crate::crypto::keys::MasterKey;
 
-use super::config::{CipherCombo, validate_vault_claims};
-use super::master_key::MasterKeyFile;
+use crate::vault::config::{CipherCombo, validate_vault_claims};
+use crate::vault::master_key::MasterKeyFile;
 
 /// Default timeout for filesystem operations during password validation.
 pub const DEFAULT_VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -77,18 +84,17 @@ pub enum PasswordValidationError {
     Crypto(#[from] CryptoError),
 }
 
-/// A validated password with the derived master key.
+/// Validated vault configuration, with a retained master key for async mounting.
 ///
-/// This is proof that the password was validated successfully. It contains
-/// the unlocked master key and vault configuration, ready for mounting.
-///
-/// This type intentionally does not implement `Clone` to ensure the master key
-/// is only used once.
+/// This is proof that the password was validated successfully. With the async
+/// feature enabled it retains the protected master key for mount operations.
+/// Synchronous validation releases the derived key after checking the config.
 #[derive(Debug)]
 pub struct ValidatedPassword {
     /// Path to the vault.
     pub(crate) vault_path: PathBuf,
     /// The unlocked master key.
+    #[cfg(feature = "async")]
     pub(crate) master_key: Arc<MasterKey>,
     /// The cipher combination from vault config.
     pub(crate) cipher_combo: CipherCombo,
@@ -115,6 +121,7 @@ impl ValidatedPassword {
     /// Get a reference to the master key.
     ///
     /// This is primarily for internal use by the vault operations.
+    #[cfg(feature = "async")]
     pub(crate) fn master_key(&self) -> Arc<MasterKey> {
         Arc::clone(&self.master_key)
     }
@@ -256,6 +263,7 @@ impl PasswordValidator {
 
         Ok(ValidatedPassword {
             vault_path: self.vault_path.clone(),
+            #[cfg(feature = "async")]
             master_key: Arc::new(master_key),
             cipher_combo,
             shortening_threshold,
