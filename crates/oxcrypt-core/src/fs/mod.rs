@@ -1,6 +1,7 @@
 //! Filesystem abstractions for Cryptomator vaults
 
 pub mod directory;
+pub(crate) mod durability;
 pub mod file;
 pub mod file_ctrmac;
 pub mod name;

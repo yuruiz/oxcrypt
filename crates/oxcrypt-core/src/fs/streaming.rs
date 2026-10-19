@@ -1472,7 +1472,13 @@ impl VaultFileWriter {
         // Atomic rename
         tokio::fs::rename(&self.temp_path, &self.dest_path)
             .await
-            .map_err(|e| StreamingError::io_with_context(e, context))?;
+            .map_err(|e| StreamingError::io_with_context(e, context.clone()))?;
+
+        if let Some(parent) = self.dest_path.parent() {
+            crate::fs::durability::sync_directory_chain_async(parent, parent)
+                .await
+                .map_err(|error| StreamingError::io_with_context(error, context))?;
+        }
 
         debug!(
             chunks = self.chunks_written,

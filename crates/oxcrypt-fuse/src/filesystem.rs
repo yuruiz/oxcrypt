@@ -2804,9 +2804,23 @@ impl Filesystem for CryptomatorFS {
     ) {
         let ino = ino.0;
         trace!(inode = ino, "fsyncdir");
-        // Directories are written synchronously in Cryptomator (dir.c9r files),
-        // so fsyncdir is a no-op.
-        reply.ok();
+        let Some(entry) = self.inodes.get(ino) else {
+            reply.error(fuser::Errno::from_i32(libc::ENOENT));
+            return;
+        };
+        let Some(dir_id) = entry.dir_id() else {
+            reply.error(fuser::Errno::from_i32(libc::ENOTDIR));
+            return;
+        };
+        drop(entry);
+        let ops = self.ops_clone();
+        match self.exec(async move { ops.sync_directory(&dir_id).await }) {
+            Ok(Ok(())) => reply.ok(),
+            Ok(Err(error)) => reply.error(fuser::Errno::from_i32(
+                crate::error::write_error_to_errno(&error),
+            )),
+            Err(error) => reply.error(fuser::Errno::from_i32(error.to_errno())),
+        }
     }
 
     fn access(

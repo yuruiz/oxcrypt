@@ -55,6 +55,10 @@ fn edits_atomic_save_and_long_names_survive_remount() {
     fs::write(root.join("notes").join(&long_name), b"long unicode name").unwrap();
     eprintln!("directory rename");
     fs::rename(root.join("notes"), root.join("archive")).unwrap();
+    fs::File::open(root.join("archive"))
+        .unwrap()
+        .sync_all()
+        .unwrap();
     eprintln!("unmount");
     mount.unmount().unwrap();
 

@@ -1808,6 +1808,10 @@ impl VaultOperationsAsync {
             storage_path.join(format!("{encrypted_name}.c9r"))
         };
 
+        if let Some(parent) = dest_path.parent() {
+            crate::fs::durability::sync_directory_chain_async(parent, self.vault_path()).await?;
+        }
+
         // Create the streaming writer
         let writer = VaultFileWriter::create(&dest_path, &self.master_key)
             .await
@@ -1983,58 +1987,35 @@ impl VaultOperationsAsync {
         Ok(contents_path)
     }
 
-    /// Write data to a file, using atomic write pattern only for overwrites.
-    ///
-    /// - **New files**: Direct write (if it fails, nothing is lost)
-    /// - **Existing files**: Temp file + rename (protects existing data from corruption)
-    ///
-    /// This matches the safety guarantees of a typical filesystem where overwrites
-    /// risk data loss on failure, but new file creation does not.
+    /// Commit a fully written and synced temporary file, then sync its namespace.
+    /// The temporary path is removed on failure or cancellation.
     async fn safe_write(&self, path: &Path, data: &[u8]) -> Result<(), VaultWriteError> {
-        let file_exists = fs::metadata(path).await.is_ok();
-
-        if file_exists {
-            // Overwrite: use atomic pattern to protect existing data
-            let parent = path
-                .parent()
-                .ok_or_else(|| VaultWriteError::AtomicWriteFailed {
-                    reason: "No parent directory".to_string(),
-                    context: Box::new(VaultOpContext::new().with_encrypted_path(path)),
-                })?;
-
-            let temp_path = parent.join(format!(".tmp.{}", uuid::Uuid::new_v4()));
-
-            // Write to temp file
-            fs::write(&temp_path, data)
+        use tokio::io::AsyncWriteExt;
+        let parent = path
+            .parent()
+            .ok_or_else(|| VaultWriteError::AtomicWriteFailed {
+                reason: "No parent directory".into(),
+                context: VaultOpContext::new().with_encrypted_path(path).into_box(),
+            })?;
+        let parent_owned = parent.to_path_buf();
+        let temp =
+            tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent_owned))
                 .await
-                .map_err(|e| VaultWriteError::Io {
-                    source: e,
-                    context: Box::new(VaultOpContext::new().with_encrypted_path(&temp_path)),
-                })?;
+                .map_err(|error| std::io::Error::other(error.to_string()))??;
+        let (file, temporary_path) = temp.into_parts();
+        let mut file = fs::File::from_std(file);
+        file.write_all(data).await?;
+        file.sync_all().await?;
+        fs::rename(&temporary_path, path).await?;
+        crate::fs::durability::sync_directory_chain_async(parent, self.vault_path()).await?;
+        Ok(())
+    }
 
-            // Atomic rename (if this fails, original file is still intact)
-            if let Err(e) = fs::rename(&temp_path, path).await {
-                // Best effort cleanup of temp file using async fs
-                // We spawn this as a background task since we can't await in map_err
-                let temp_path_clone = temp_path.clone();
-                tokio::spawn(async move {
-                    let _ = fs::remove_file(&temp_path_clone).await;
-                });
-                return Err(VaultWriteError::Io {
-                    source: e,
-                    context: Box::new(VaultOpContext::new().with_encrypted_path(path)),
-                });
-            }
-        } else {
-            // New file: direct write (no existing data at risk)
-            fs::write(path, data)
-                .await
-                .map_err(|e| VaultWriteError::Io {
-                    source: e,
-                    context: Box::new(VaultOpContext::new().with_encrypted_path(path)),
-                })?;
-        }
-
+    /// Persist a logical directory's backing directory and the containing namespace.
+    pub async fn sync_directory(&self, directory_id: &DirId) -> Result<(), VaultWriteError> {
+        let _guard = self.lock_directory_write(directory_id).await;
+        let path = self.calculate_directory_storage_path(directory_id)?;
+        crate::fs::durability::sync_directory_chain_async(&path, self.vault_path()).await?;
         Ok(())
     }
 
@@ -2076,6 +2057,9 @@ impl VaultOperationsAsync {
             })?;
         }
 
+        if let Some(parent) = encrypted_path.parent() {
+            crate::fs::durability::sync_directory_chain_async(parent, self.vault_path()).await?;
+        }
         Ok(())
     }
 
