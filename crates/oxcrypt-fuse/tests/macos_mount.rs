@@ -85,3 +85,49 @@ fn edits_atomic_save_and_long_names_survive_remount() {
     eprintln!("unmount");
     mount.unmount().unwrap();
 }
+
+#[test]
+fn concurrent_reads_on_one_handle_complete_without_eagain() {
+    use std::os::unix::fs::FileExt;
+    use std::sync::{Arc, Barrier};
+    let vault = TempVault::new();
+    let mount_dir = tempfile::tempdir().unwrap();
+    let mount = FuseBackend::new()
+        .mount(
+            "oxcrypt-read-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    let data: Arc<Vec<u8>> = Arc::new(
+        (0..(4 * 1024 * 1024))
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(),
+    );
+    let path = mount.mountpoint().join("large");
+    fs::write(&path, data.as_slice()).unwrap();
+    let file = Arc::new(fs::File::open(path).unwrap());
+    let barrier = Arc::new(Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|thread| {
+            let file = Arc::clone(&file);
+            let data = Arc::clone(&data);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for iteration in 0..64 {
+                    let offset = (thread * 23131 + iteration * 16381) % (data.len() - 4096);
+                    let mut bytes = [0; 4096];
+                    file.read_exact_at(&mut bytes, offset as u64).unwrap();
+                    assert_eq!(bytes.as_slice(), &data[offset..offset + bytes.len()]);
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    drop(file);
+    mount.unmount().unwrap();
+}

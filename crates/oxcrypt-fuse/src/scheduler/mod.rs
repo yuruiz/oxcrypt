@@ -955,6 +955,7 @@ impl FuseScheduler {
             && matches!(*handle, FuseHandle::ReaderLoaned)
         {
             *handle = FuseHandle::Reader(reader);
+            self.handle_table.wake_readers();
         }
     }
 
@@ -2095,6 +2096,7 @@ fn dispatcher_loop(
                     && matches!(*handle, FuseHandle::ReaderLoaned)
                 {
                     *handle = FuseHandle::Reader(job.reader);
+                    handle_table.wake_readers();
                 }
                 warn!(request_id = ?queued.id, fh = job.fh, "Dropped queued read job on shutdown");
             }
@@ -2104,6 +2106,7 @@ fn dispatcher_loop(
                     && matches!(*handle, FuseHandle::ReaderLoaned)
                 {
                     *handle = FuseHandle::Reader(job.reader);
+                    handle_table.wake_readers();
                 }
                 if let Some(counter) = pending_writes_by_file.get(&job.ino_out)
                     && counter.fetch_sub(1, Ordering::Release) == 1
@@ -2395,6 +2398,9 @@ fn handle_read_completion(
             let reader = read_result.reader;
             let offset = read_result.offset;
 
+            // Make the handle usable before replying or waking single-flight clients.
+            restore_reader(request_id, fh, reader, handle_table);
+
             // Handle the read result
             match read_result.result {
                 Ok(data) => {
@@ -2432,24 +2438,6 @@ fn handle_read_completion(
 
                     reply.error(fuser::Errno::from_i32(errno));
                 }
-            }
-
-            // Restore reader to handle table
-            if let Some(mut handle) = handle_table.get_mut(&fh) {
-                if matches!(*handle, FuseHandle::ReaderLoaned) {
-                    *handle = FuseHandle::Reader(reader);
-                    trace!(?request_id, fh, "Reader restored to handle table");
-                } else {
-                    warn!(
-                        ?request_id,
-                        fh, "Handle modified during async read, discarding reader"
-                    );
-                }
-            } else {
-                trace!(
-                    ?request_id,
-                    fh, "Handle removed during async read, discarding reader"
-                );
             }
         }
         Some(ExecutorResult::Structural(_)) => {
@@ -2621,6 +2609,7 @@ fn restore_reader(
             fh, "Handle removed during async operation, discarding reader"
         );
     }
+    handle_table.wake_readers();
 }
 
 /// Restore a reader from a completed executor result without replying.
