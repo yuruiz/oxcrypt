@@ -2485,56 +2485,24 @@ impl VaultOperationsAsync {
             .lock_directories_write_ordered(&[parent_dir_id, &dir_info.directory_id])
             .await;
 
-        // Check directory is empty (use unlocked versions since we hold both locks)
-        let target_ctx = ctx.clone().with_dir_id(dir_info.directory_id.as_str());
-        let files = self
-            .list_files_unlocked(&dir_info.directory_id)
-            .await
-            .map_err(|e| match e {
-                VaultOperationError::Io { source, context } => VaultWriteError::Io {
-                    source,
-                    context: Box::new(context),
-                },
-                other => VaultWriteError::Io {
-                    source: std::io::Error::other(other.to_string()),
-                    context: Box::new(target_ctx.clone()),
-                },
-            })?;
-        let subdirs = self
-            .list_directories_unlocked(&dir_info.directory_id)
-            .await
-            .map_err(|e| match e {
-                VaultOperationError::Io { source, context } => VaultWriteError::Io {
-                    source,
-                    context: Box::new(context),
-                },
-                other => VaultWriteError::Io {
-                    source: std::io::Error::other(other.to_string()),
-                    context: Box::new(target_ctx.clone()),
-                },
-            })?;
-
-        if !files.is_empty() || !subdirs.is_empty() {
-            debug!(
-                file_count = files.len(),
-                subdir_count = subdirs.len(),
-                "Cannot delete non-empty directory"
-            );
-            return Err(VaultWriteError::DirectoryNotEmpty {
-                context: Box::new(target_ctx.with_encrypted_path(&dir_info.encrypted_path)),
-            });
-        }
-
-        // Remove the storage directory
+        // Physical entries include symlinks and names that cannot be decrypted.
         let storage_path = self.calculate_directory_storage_path(&dir_info.directory_id)?;
-        if fs::metadata(&storage_path).await.is_ok() {
-            fs::remove_dir_all(&storage_path)
-                .await
-                .map_err(|e| VaultWriteError::Io {
-                    source: e,
-                    context: Box::new(VaultOpContext::new().with_encrypted_path(&storage_path)),
-                })?;
+        let mut entries = fs::read_dir(&storage_path).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_name() != "dirid.c9r" {
+                return Err(VaultWriteError::DirectoryNotEmpty {
+                    context: Box::new(ctx.clone().with_encrypted_path(&dir_info.encrypted_path)),
+                });
+            }
         }
+        drop(entries);
+        match fs::remove_file(storage_path.join("dirid.c9r")).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Never recursively remove user entries after a potentially stale check.
+        fs::remove_dir(&storage_path).await?;
 
         // Remove the directory entry from parent
         if fs::metadata(&dir_info.encrypted_path).await.is_ok() {
@@ -2546,6 +2514,13 @@ impl VaultOperationsAsync {
                         VaultOpContext::new().with_encrypted_path(&dir_info.encrypted_path),
                     ),
                 })?;
+        }
+
+        if let Some(parent) = storage_path.parent() {
+            crate::fs::durability::sync_directory_chain_async(parent, self.vault_path()).await?;
+        }
+        if let Some(parent) = dir_info.encrypted_path.parent() {
+            crate::fs::durability::sync_directory_chain_async(parent, self.vault_path()).await?;
         }
 
         info!("Directory deleted successfully");
