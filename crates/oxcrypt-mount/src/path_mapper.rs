@@ -305,6 +305,14 @@ where
         self.path_to_id.get(path).map(|r| *r)
     }
 
+    /// Snapshot path mappings for a caller that coordinates namespace mutations.
+    pub fn paths(&self) -> Vec<(VaultPath, u64)> {
+        self.path_to_id
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect()
+    }
+
     /// Gets an entry by ID.
     pub fn get(&self, id: u64) -> Option<Ref<'_, u64, Entry>> {
         self.id_to_entry.get(&id)

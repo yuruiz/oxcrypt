@@ -7,7 +7,7 @@
 //! providing consistent behavior across mount backends.
 
 use dashmap::mapref::one::{Ref, RefMut};
-use oxcrypt_core::vault::path::VaultPath;
+use oxcrypt_core::vault::path::{DirId, VaultPath};
 use oxcrypt_mount::path_mapper::{EntryKind, PathEntry, PathTable};
 
 /// The root file ID (NFS convention, matching FUSE).
@@ -92,6 +92,56 @@ impl NfsInodeTable {
             .update_path(id, old_path, new_path.clone(), |entry, path| {
                 entry.path = path;
             });
+    }
+
+    /// Move cached paths and the moved entry's backing name together.
+    /// The caller must hold its namespace write lock.
+    pub fn rename_subtree(&self, old: &VaultPath, new: &VaultPath, parent: &DirId, name: &str) {
+        let prefix = format!("{}/", old.as_str());
+        for (path, id) in self.inner.paths() {
+            let target = if path == *old {
+                new.clone()
+            } else if let Some(suffix) = path.as_str().strip_prefix(&prefix) {
+                new.join(suffix)
+            } else {
+                continue;
+            };
+            self.inner.update_path(id, &path, target, |entry, target| {
+                if path == *old {
+                    match &mut entry.kind {
+                        InodeKind::File {
+                            dir_id,
+                            name: filename,
+                        }
+                        | InodeKind::Symlink {
+                            dir_id,
+                            name: filename,
+                        } => {
+                            *dir_id = parent.clone();
+                            name.clone_into(filename);
+                        }
+                        InodeKind::Root | InodeKind::Directory { .. } => {}
+                    }
+                }
+                entry.path = target;
+            });
+        }
+    }
+
+    /// Expire handles for an entry and all cached descendants after removal.
+    pub fn remove_subtree(&self, path: &VaultPath) -> Vec<u64> {
+        let prefix = format!("{}/", path.as_str());
+        let ids: Vec<_> = self
+            .inner
+            .paths()
+            .into_iter()
+            .filter(|(candidate, _)| candidate == path || candidate.as_str().starts_with(&prefix))
+            .map(|(_, id)| id)
+            .collect();
+        for id in &ids {
+            self.remove_by_id(*id);
+        }
+        ids
     }
 
     /// Updates the kind of an existing entry.

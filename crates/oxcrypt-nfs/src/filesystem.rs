@@ -48,6 +48,8 @@ pub struct CryptomatorNFS {
     /// Write buffers for files with pending writes.
     /// Key: file ID, Value: WriteBuffer containing pending data.
     flush_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Keeps path resolution and handle identities stable throughout an RPC.
+    namespace: tokio::sync::RwLock<()>,
     /// Pending encrypted edits, retained after write-back failures.
     editors: Arc<DashMap<fileid3, Arc<EditBuffer>>>,
     /// Server generation number (for cookieverf3).
@@ -112,6 +114,7 @@ impl CryptomatorNFS {
             ops,
             inodes: NfsInodeTable::new(),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            namespace: tokio::sync::RwLock::new(()),
             editors: Arc::new(DashMap::new()),
             generation,
             uid: unsafe { libc::getuid() },
@@ -268,6 +271,137 @@ impl CryptomatorNFS {
         // This is consistent with previous behavior and with how we handle chmod/chown.
     }
 
+    async fn getattr_unlocked(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
+        let start = Instant::now();
+        self.stats.record_metadata_op();
+        trace!(id, "getattr");
+
+        let entry = match self.get_entry(id) {
+            Ok(e) => e,
+            Err(e) => {
+                self.stats.record_metadata_latency(start.elapsed());
+                self.stats.record_error();
+                return Err(e);
+            }
+        };
+
+        let result = match &entry.kind {
+            InodeKind::Root | InodeKind::Directory { .. } => Ok(self.dir_attr(id, None)),
+            InodeKind::File { dir_id, name } => {
+                // Check if we have a buffer with pending writes - use that size
+                if let Some(buffer) = self.editors.get(&id) {
+                    return {
+                        self.stats.record_metadata_latency(start.elapsed());
+                        // Buffer has pending changes, use current time
+                        Ok(self.file_attr(id, buffer.len(), None))
+                    };
+                }
+
+                // Get file info from vault
+                match self.ops.find_file(dir_id, name).await {
+                    Ok(Some(file_info)) => {
+                        // Convert encrypted size to plaintext size
+                        let cipher = self.ops.cipher_combo();
+                        let size = encrypted_to_plaintext_size_or_zero_for_cipher(
+                            file_info.encrypted_size,
+                            cipher,
+                        );
+                        // Read mtime from encrypted file
+                        let mtime = Self::get_mtime(&file_info.encrypted_path);
+                        Ok(self.file_attr(id, size, mtime))
+                    }
+                    Ok(None) => {
+                        self.stats.record_error();
+                        Err(nfsstat3::NFS3ERR_NOENT)
+                    }
+                    Err(e) => {
+                        self.stats.record_error();
+                        Err(vault_error_to_nfsstat(&e))
+                    }
+                }
+            }
+            InodeKind::Symlink { dir_id, name } => {
+                // Get symlink target length using O(1) lookup
+                match self.ops.find_symlink(dir_id, name).await {
+                    Ok(Some(symlink_info)) => {
+                        // Read mtime from encrypted symlink file
+                        let mtime = Self::get_mtime(&symlink_info.encrypted_path);
+                        Ok(self.symlink_attr(id, symlink_info.target.len() as u64, mtime))
+                    }
+                    Ok(None) => {
+                        self.stats.record_error();
+                        Err(nfsstat3::NFS3ERR_NOENT)
+                    }
+                    Err(e) => {
+                        self.stats.record_error();
+                        Err(vault_error_to_nfsstat(&e))
+                    }
+                }
+            }
+        };
+
+        self.stats.record_metadata_latency(start.elapsed());
+        result
+    }
+
+    async fn create_unlocked(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
+        _attr: sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let start = Instant::now();
+        self.stats.record_metadata_op();
+
+        let name = match Self::filename_to_str(filename) {
+            Ok(n) => n,
+            Err(e) => {
+                self.stats.record_error();
+                self.stats.record_metadata_latency(start.elapsed());
+                return Err(e);
+            }
+        };
+        debug!(dirid, name, "create");
+
+        let parent_path = match self.get_parent_path(dirid) {
+            Ok(p) => p,
+            Err(e) => {
+                self.stats.record_error();
+                self.stats.record_metadata_latency(start.elapsed());
+                return Err(e);
+            }
+        };
+        let dir_id = match self.get_dir_entry(dirid) {
+            Ok(d) => d,
+            Err(e) => {
+                self.stats.record_error();
+                self.stats.record_metadata_latency(start.elapsed());
+                return Err(e);
+            }
+        };
+
+        // Create empty file
+        if let Err(e) = self.ops.write_file(&dir_id, name, &[]).await {
+            self.stats.record_error();
+            self.stats.record_metadata_latency(start.elapsed());
+            return Err(vault_error_to_nfsstat(&e));
+        }
+
+        // Register in inode table
+        let child_path = parent_path.join(name);
+        let kind = InodeKind::File {
+            dir_id: dir_id.clone(),
+            name: name.to_string(),
+        };
+        let id = self.inodes.get_or_insert(&child_path, kind);
+        self.editors.remove(&id);
+
+        // Newly created file, use current time
+        let attr = self.file_attr(id, 0, None);
+        self.stats.record_metadata_latency(start.elapsed());
+        Ok((id, attr))
+    }
+
     /// Gets an inode entry or returns NFS3ERR_STALE.
     fn get_entry(
         &self,
@@ -309,6 +443,7 @@ impl NFSFileSystem for CryptomatorNFS {
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
+        let _namespace = self.namespace.read().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
 
@@ -387,79 +522,13 @@ impl NFSFileSystem for CryptomatorNFS {
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let start = Instant::now();
-        self.stats.record_metadata_op();
-        trace!(id, "getattr");
-
-        let entry = match self.get_entry(id) {
-            Ok(e) => e,
-            Err(e) => {
-                self.stats.record_metadata_latency(start.elapsed());
-                self.stats.record_error();
-                return Err(e);
-            }
-        };
-
-        let result = match &entry.kind {
-            InodeKind::Root | InodeKind::Directory { .. } => Ok(self.dir_attr(id, None)),
-            InodeKind::File { dir_id, name } => {
-                // Check if we have a buffer with pending writes - use that size
-                if let Some(buffer) = self.editors.get(&id) {
-                    return {
-                        self.stats.record_metadata_latency(start.elapsed());
-                        // Buffer has pending changes, use current time
-                        Ok(self.file_attr(id, buffer.len(), None))
-                    };
-                }
-
-                // Get file info from vault
-                match self.ops.find_file(dir_id, name).await {
-                    Ok(Some(file_info)) => {
-                        // Convert encrypted size to plaintext size
-                        let cipher = self.ops.cipher_combo();
-                        let size = encrypted_to_plaintext_size_or_zero_for_cipher(
-                            file_info.encrypted_size,
-                            cipher,
-                        );
-                        // Read mtime from encrypted file
-                        let mtime = Self::get_mtime(&file_info.encrypted_path);
-                        Ok(self.file_attr(id, size, mtime))
-                    }
-                    Ok(None) => {
-                        self.stats.record_error();
-                        Err(nfsstat3::NFS3ERR_NOENT)
-                    }
-                    Err(e) => {
-                        self.stats.record_error();
-                        Err(vault_error_to_nfsstat(&e))
-                    }
-                }
-            }
-            InodeKind::Symlink { dir_id, name } => {
-                // Get symlink target length using O(1) lookup
-                match self.ops.find_symlink(dir_id, name).await {
-                    Ok(Some(symlink_info)) => {
-                        // Read mtime from encrypted symlink file
-                        let mtime = Self::get_mtime(&symlink_info.encrypted_path);
-                        Ok(self.symlink_attr(id, symlink_info.target.len() as u64, mtime))
-                    }
-                    Ok(None) => {
-                        self.stats.record_error();
-                        Err(nfsstat3::NFS3ERR_NOENT)
-                    }
-                    Err(e) => {
-                        self.stats.record_error();
-                        Err(vault_error_to_nfsstat(&e))
-                    }
-                }
-            }
-        };
-
-        self.stats.record_metadata_latency(start.elapsed());
-        result
+        let _namespace = self.namespace.read().await;
+        self.getattr_unlocked(id).await
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        let _namespace = self.namespace.read().await;
+        let _mutation = self.flush_lock.lock().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
         trace!(id, ?setattr, "setattr");
@@ -483,7 +552,6 @@ impl NFSFileSystem for CryptomatorNFS {
                 let name = name.to_string();
                 drop(entry); // Release the borrow before async operations
 
-                let _mutation = self.flush_lock.lock().await;
                 let editor = self.editor(id, &dir_id, &name).await?;
                 editor
                     .truncate(size)
@@ -510,7 +578,7 @@ impl NFSFileSystem for CryptomatorNFS {
 
         self.stats.record_metadata_latency(start.elapsed());
         // Return current attributes (getattr records its own metadata op)
-        self.getattr(id).await
+        self.getattr_unlocked(id).await
     }
 
     async fn read(
@@ -519,6 +587,7 @@ impl NFSFileSystem for CryptomatorNFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        let _namespace = self.namespace.read().await;
         let op_start = Instant::now();
         trace!(id, offset, count, "read");
 
@@ -561,6 +630,8 @@ impl NFSFileSystem for CryptomatorNFS {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        let _namespace = self.namespace.read().await;
+        let _mutation = self.flush_lock.lock().await;
         let op_start = Instant::now();
         debug!(id, offset, data_len = data.len(), "write");
 
@@ -592,7 +663,6 @@ impl NFSFileSystem for CryptomatorNFS {
         };
         drop(entry); // Release the borrow before async operations
 
-        let _mutation = self.flush_lock.lock().await;
         let editor = self.editor(id, &dir_id, &name).await?;
         let mut written = 0;
         while written < data.len() {
@@ -615,57 +685,11 @@ impl NFSFileSystem for CryptomatorNFS {
         &self,
         dirid: fileid3,
         filename: &filename3,
-        _attr: sattr3,
+        attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let start = Instant::now();
-        self.stats.record_metadata_op();
-
-        let name = match Self::filename_to_str(filename) {
-            Ok(n) => n,
-            Err(e) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(e);
-            }
-        };
-        debug!(dirid, name, "create");
-
-        let parent_path = match self.get_parent_path(dirid) {
-            Ok(p) => p,
-            Err(e) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(e);
-            }
-        };
-        let dir_id = match self.get_dir_entry(dirid) {
-            Ok(d) => d,
-            Err(e) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(e);
-            }
-        };
-
-        // Create empty file
-        if let Err(e) = self.ops.write_file(&dir_id, name, &[]).await {
-            self.stats.record_error();
-            self.stats.record_metadata_latency(start.elapsed());
-            return Err(vault_error_to_nfsstat(&e));
-        }
-
-        // Register in inode table
-        let child_path = parent_path.join(name);
-        let kind = InodeKind::File {
-            dir_id: dir_id.clone(),
-            name: name.to_string(),
-        };
-        let id = self.inodes.get_or_insert(&child_path, kind);
-
-        // Newly created file, use current time
-        let attr = self.file_attr(id, 0, None);
-        self.stats.record_metadata_latency(start.elapsed());
-        Ok((id, attr))
+        let _namespace = self.namespace.write().await;
+        let _mutation = self.flush_lock.lock().await;
+        self.create_unlocked(dirid, filename, attr).await
     }
 
     async fn create_exclusive(
@@ -673,6 +697,8 @@ impl NFSFileSystem for CryptomatorNFS {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
+        let _namespace = self.namespace.write().await;
+        let _mutation = self.flush_lock.lock().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
 
@@ -739,7 +765,10 @@ impl NFSFileSystem for CryptomatorNFS {
         }
 
         // Create using regular create (which has its own stats recording)
-        match self.create(dirid, filename, sattr3::default()).await {
+        match self
+            .create_unlocked(dirid, filename, sattr3::default())
+            .await
+        {
             Ok((id, _)) => {
                 self.stats.record_metadata_latency(start.elapsed());
                 Ok(id)
@@ -757,6 +786,7 @@ impl NFSFileSystem for CryptomatorNFS {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let _namespace = self.namespace.write().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
 
@@ -809,6 +839,8 @@ impl NFSFileSystem for CryptomatorNFS {
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        let _namespace = self.namespace.write().await;
+        let _mutation = self.flush_lock.lock().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
 
@@ -839,13 +871,7 @@ impl NFSFileSystem for CryptomatorNFS {
             }
         };
 
-        // Get file ID to discard any pending write buffer and read cache
         let child_path = parent_path.join(name);
-        if let Some(file_id) = self.inodes.get_id(&child_path) {
-            // Discard pending writes - file is being deleted
-            self.editors.remove(&file_id);
-            // Invalidate read cache for the deleted file
-        }
 
         // Try to remove as file first
         if let Ok(Some(_)) = self.ops.find_file(&dir_id, name).await {
@@ -882,7 +908,9 @@ impl NFSFileSystem for CryptomatorNFS {
         }
 
         // Remove from inode table
-        self.inodes.remove(&child_path);
+        for id in self.inodes.remove_subtree(&child_path) {
+            self.editors.remove(&id);
+        }
 
         self.stats.record_metadata_latency(start.elapsed());
         Ok(())
@@ -895,6 +923,7 @@ impl NFSFileSystem for CryptomatorNFS {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        let _namespace = self.namespace.write().await;
         let _mutation = self.flush_lock.lock().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
@@ -916,6 +945,9 @@ impl NFSFileSystem for CryptomatorNFS {
             }
         };
         debug!(from_dirid, from_name, to_dirid, to_name, "rename");
+        if from_dirid == to_dirid && from_name == to_name {
+            return Ok(());
+        }
 
         let from_parent_path = match self.get_parent_path(from_dirid) {
             Ok(p) => p,
@@ -962,21 +994,13 @@ impl NFSFileSystem for CryptomatorNFS {
             .await
             .map_err(|error| vault_error_to_nfsstat(&error))?;
 
-        // Update inode table
         let old_path = from_parent_path.join(from_name);
-        let to_parent_path = match self.get_parent_path(to_dirid) {
-            Ok(p) => p,
-            Err(e) => {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(e);
-            }
-        };
-        let new_path = to_parent_path.join(to_name);
-
-        if let Some(id) = self.inodes.get_id(&old_path) {
-            self.inodes.update_path(id, &old_path, &new_path);
+        let new_path = self.get_parent_path(to_dirid)?.join(to_name);
+        for overwritten in self.inodes.remove_subtree(&new_path) {
+            self.editors.remove(&overwritten);
         }
+        self.inodes
+            .rename_subtree(&old_path, &new_path, &to_dir_id, to_name);
 
         self.stats.record_metadata_latency(start.elapsed());
         Ok(())
@@ -988,6 +1012,7 @@ impl NFSFileSystem for CryptomatorNFS {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
+        let _namespace = self.namespace.read().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
         trace!(dirid, start_after, max_entries, "readdir");
@@ -1131,6 +1156,7 @@ impl NFSFileSystem for CryptomatorNFS {
         symlink_target: &nfspath3,
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let _namespace = self.namespace.write().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
 
@@ -1188,6 +1214,7 @@ impl NFSFileSystem for CryptomatorNFS {
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
+        let _namespace = self.namespace.read().await;
         let start = Instant::now();
         self.stats.record_metadata_op();
         trace!(id, "readlink");
