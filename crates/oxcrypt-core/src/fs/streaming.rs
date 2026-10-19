@@ -678,8 +678,13 @@ impl VaultFileReader {
         };
 
         // Calculate plaintext size
-        let plaintext_size =
-            encrypted_to_plaintext_size_or_zero_for_cipher(encrypted_size, cipher_combo);
+        let plaintext_size = encrypted_to_plaintext_size_for_cipher(encrypted_size, cipher_combo)
+            .ok_or_else(|| {
+            StreamingError::io_with_context(
+                io::Error::new(io::ErrorKind::InvalidData, "incomplete encrypted chunk"),
+                context.clone(),
+            )
+        })?;
 
         debug!(
             cipher_combo = ?cipher_combo,
@@ -1016,8 +1021,13 @@ impl VaultFileReaderSync {
         };
 
         // Calculate plaintext size
-        let plaintext_size =
-            encrypted_to_plaintext_size_or_zero_for_cipher(encrypted_size, cipher_combo);
+        let plaintext_size = encrypted_to_plaintext_size_for_cipher(encrypted_size, cipher_combo)
+            .ok_or_else(|| {
+            StreamingError::io_with_context(
+                io::Error::new(io::ErrorKind::InvalidData, "incomplete encrypted chunk"),
+                context.clone(),
+            )
+        })?;
 
         debug!(
             cipher_combo = ?cipher_combo,

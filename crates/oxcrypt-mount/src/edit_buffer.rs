@@ -72,6 +72,10 @@ impl EditBuffer {
     pub fn location(&self) -> (DirId, String) {
         self.location.read().clone()
     }
+    /// Refresh a backing inode after a validated namespace representation change.
+    pub fn follow_rename(&self, destination: &Path) -> io::Result<()> {
+        self.inner.lock().follow_rename(destination)
+    }
     /// Follow a rename while preserving all open handles and dirty chunks.
     pub fn relocate(&self, dir: DirId, name: String) {
         *self.location.write() = (dir, name);

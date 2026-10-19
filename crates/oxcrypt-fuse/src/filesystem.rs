@@ -4938,6 +4938,33 @@ impl Filesystem for CryptomatorFS {
 
         match result {
             Ok(Ok(())) => {
+                if let Some(source_inode) = self.inodes.get_inode(&src_parent_path.join(name_str))
+                    && let Some(editor) = self
+                        .handle_table
+                        .editors
+                        .get(&source_inode)
+                        .and_then(|entry| entry.value().upgrade())
+                {
+                    let ops = self.ops_clone();
+                    let directory = dest_dir_id.clone();
+                    let filename = newname_str.to_owned();
+                    let result =
+                        self.exec(async move { ops.find_file(&directory, &filename).await });
+                    match result {
+                        Ok(Ok(Some(info))) => {
+                            if let Err(error) = editor.follow_rename(&info.encrypted_path) {
+                                reply.error(fuser::Errno::from_i32(
+                                    error.raw_os_error().unwrap_or(libc::EIO),
+                                ));
+                                return;
+                            }
+                        }
+                        _ => {
+                            reply.error(fuser::Errno::from_i32(libc::EIO));
+                            return;
+                        }
+                    }
+                }
                 self.handle_table.detach_writers(&dest_dir_id, newname_str);
                 if let Some(inode) = overwritten_inode {
                     self.inodes.invalidate_path(&overwritten_path);
@@ -5174,13 +5201,16 @@ impl Filesystem for CryptomatorFS {
                         if data.is_empty() {
                             break;
                         }
-                        target.write(
+                        let written = target.write(
                             u64::try_from(offset_out)
                                 .unwrap_or(u64::MAX)
                                 .saturating_add(copied),
                             &data,
                         )?;
-                        copied += data.len() as u64;
+                        copied += written as u64;
+                        if written < data.len() {
+                            break;
+                        }
                     }
                     Ok::<_, std::io::Error>(copied)
                 })();

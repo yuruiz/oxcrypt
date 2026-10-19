@@ -145,3 +145,91 @@ fn corrupt_target_chunk_is_not_silently_replaced_by_partial_write() {
     assert!(!editor.is_dirty());
     assert_eq!(fs::read(&path).unwrap(), encrypted);
 }
+
+#[tokio::test]
+async fn malformed_tail_is_not_treated_as_an_empty_file() {
+    use oxcrypt_core::fs::streaming::{VaultFileReader, VaultFileReaderSync};
+    for cipher in [CipherCombo::SivGcm, CipherCombo::SivCtrMac] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("malformed");
+        let key = MasterKey::random().unwrap();
+        let mut data = cipher.encrypt_file(b"original", &key).unwrap();
+        data.truncate(if cipher == CipherCombo::SivGcm {
+            69
+        } else {
+            89
+        });
+        fs::write(&path, &data).unwrap();
+        assert!(VaultFileReaderSync::open_with_cipher(&path, &key, cipher).is_err());
+        assert!(
+            VaultFileReader::open_with_cipher(&path, &key, cipher)
+                .await
+                .is_err()
+        );
+        assert!(VaultFileEditor::open(&path, &key, cipher, directory.path()).is_err());
+        assert_eq!(fs::read(path).unwrap(), data);
+    }
+}
+
+#[test]
+fn unchanged_partial_write_does_not_stage_or_encrypt() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("file");
+    let key = MasterKey::random().unwrap();
+    fs::write(
+        &path,
+        CipherCombo::SivGcm
+            .encrypt_file(b"unchanged", &key)
+            .unwrap(),
+    )
+    .unwrap();
+    let mut editor =
+        VaultFileEditor::open(&path, &key, CipherCombo::SivGcm, directory.path()).unwrap();
+    assert_eq!(editor.write(2, b"changed").unwrap(), 7);
+    assert!(!editor.is_dirty());
+    assert_eq!(editor.stats().encrypted_chunks, 0);
+    assert_eq!(editor.stats().copied_ciphertext_bytes, 0);
+}
+
+#[test]
+fn write_reports_an_accepted_prefix_before_a_later_chunk_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("file");
+    let key = MasterKey::random().unwrap();
+    let mut encrypted = CipherCombo::SivGcm
+        .encrypt_file(&vec![3; 65536], &key)
+        .unwrap();
+    *encrypted.last_mut().unwrap() ^= 1;
+    fs::write(&path, encrypted).unwrap();
+    let mut editor =
+        VaultFileEditor::open(&path, &key, CipherCombo::SivGcm, directory.path()).unwrap();
+    assert_eq!(editor.write(0, &vec![9; 32769]).unwrap(), 32768);
+    assert!(editor.write(32768, b"x").is_err());
+    assert_eq!(editor.read(0, 32768).unwrap(), vec![9; 32768]);
+}
+
+#[test]
+fn overlapping_reads_reuse_authenticated_chunks_and_writes_invalidate_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("file");
+    let key = MasterKey::random().unwrap();
+    fs::write(
+        &path,
+        CipherCombo::SivGcm
+            .encrypt_file(&vec![3; 65536], &key)
+            .unwrap(),
+    )
+    .unwrap();
+    let mut editor =
+        VaultFileEditor::open(&path, &key, CipherCombo::SivGcm, directory.path()).unwrap();
+    for offset in 0..100 {
+        assert_eq!(editor.read(offset, 4).unwrap(), vec![3; 4]);
+    }
+    assert_eq!(editor.stats().decrypted_chunks, 1);
+    editor.write(0, b"edit").unwrap();
+    editor.commit(&path, directory.path()).unwrap();
+    assert_eq!(editor.read(0, 4).unwrap(), b"edit");
+    editor.resize(2).unwrap();
+    editor.resize(8).unwrap();
+    assert_eq!(editor.read(0, 8).unwrap(), b"ed\0\0\0\0\0\0");
+}

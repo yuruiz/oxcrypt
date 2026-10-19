@@ -23,7 +23,9 @@ pub struct EditStats {
 
 #[derive(Debug)]
 struct Stage {
-    _directory: tempfile::TempDir,
+    // Owns the encrypted stage until commit or drop.
+    #[allow(dead_code)]
+    directory: tempfile::TempDir,
     file: File,
 }
 
@@ -107,7 +109,7 @@ impl VaultFileEditor {
         let mut editor = Self::open(&path, key, cipher, staging_root)?;
         editor.stage = Some(Stage {
             file: OpenOptions::new().read(true).write(true).open(&path)?,
-            _directory: directory,
+            directory,
         });
         editor.expected = None;
         editor.dirty = true;
@@ -158,24 +160,24 @@ impl VaultFileEditor {
             let (file, copied) =
                 clone_ciphertext(&mut self.reader.file, &directory.path().join("content"))?;
             self.stats.copied_ciphertext_bytes += copied;
-            self.stage = Some(Stage {
-                _directory: directory,
-                file,
-            });
+            self.stage = Some(Stage { directory, file });
         }
         Ok(())
     }
     // Chunk offsets and lengths are bounded by the 32 KiB format limit.
     #[allow(clippy::cast_possible_truncation)]
-    fn load(&mut self, chunk: u64) -> io::Result<Zeroizing<Vec<u8>>> {
+    fn load(&mut self, chunk: u64) -> io::Result<std::sync::Arc<Zeroizing<Vec<u8>>>> {
         if let Some((number, data)) = &self.dirty_chunk
             && *number == chunk
         {
-            return Ok(data.clone());
+            return Ok(std::sync::Arc::new(data.clone()));
+        }
+        if let Some(data) = self.reader.chunk_cache.get(&chunk) {
+            return Ok(std::sync::Arc::clone(data));
         }
         let begin = chunk * CHUNK_PLAINTEXT_SIZE as u64;
         if begin >= self.size {
-            return Ok(Zeroizing::new(Vec::new()));
+            return Ok(std::sync::Arc::new(Zeroizing::new(Vec::new())));
         }
         let length =
             (self.size - begin).min(CHUNK_PLAINTEXT_SIZE as u64) as usize + self.overhead();
@@ -193,7 +195,11 @@ impl VaultFileEditor {
             .decrypt_chunk(chunk, &bytes)
             .map_err(io::Error::other)?;
         self.stats.decrypted_chunks += 1;
-        Ok(Zeroizing::new(data))
+        let data = std::sync::Arc::new(Zeroizing::new(data));
+        self.reader
+            .chunk_cache
+            .put(chunk, std::sync::Arc::clone(&data));
+        Ok(data)
     }
     fn flush_chunk(&mut self) -> io::Result<()> {
         if let Some((chunk, plaintext)) = &self.dirty_chunk {
@@ -206,6 +212,9 @@ impl VaultFileEditor {
             stage.file.seek(SeekFrom::Start(offset))?;
             stage.file.write_all(&encrypted)?;
             self.stats.encrypted_chunks += 1;
+            self.reader
+                .chunk_cache
+                .put(*chunk, std::sync::Arc::new(plaintext.clone()));
             self.dirty_chunk = None;
         }
         Ok(())
@@ -244,31 +253,45 @@ impl VaultFileEditor {
         if offset > self.size {
             self.resize(offset)?;
         }
-        self.ensure_stage()?;
         let mut position = offset;
         let mut written = 0;
         while written < data.len() {
             let chunk = position / CHUNK_PLAINTEXT_SIZE as u64;
             let within = (position % CHUNK_PLAINTEXT_SIZE as u64) as usize;
             let count = (CHUNK_PLAINTEXT_SIZE - within).min(data.len() - written);
-            if self
-                .dirty_chunk
-                .as_ref()
-                .is_none_or(|(number, _)| *number != chunk)
-            {
-                self.flush_chunk()?;
+            let step = (|| {
+                if self
+                    .dirty_chunk
+                    .as_ref()
+                    .is_none_or(|(number, _)| *number != chunk)
+                {
+                    self.flush_chunk()?;
+                }
+                let mut bytes = if within == 0 && count == CHUNK_PLAINTEXT_SIZE {
+                    Zeroizing::new(Vec::new())
+                } else {
+                    (*self.load(chunk)?).clone()
+                };
+                if bytes.get(within..within + count) == Some(&data[written..written + count]) {
+                    return Ok::<(), io::Error>(());
+                }
+                self.ensure_stage()?;
+                let length = bytes.len().max(within + count);
+                bytes.resize(length, 0);
+                bytes[within..within + count].copy_from_slice(&data[written..written + count]);
+                self.reader.chunk_cache.pop(&chunk);
+                self.dirty_chunk = Some((chunk, bytes));
+                self.size = self.size.max(position + count as u64);
+                self.dirty = true;
+                Ok(())
+            })();
+            if let Err(error) = step {
+                return if written == 0 {
+                    Err(error)
+                } else {
+                    Ok(written)
+                };
             }
-            let mut bytes = if within == 0 && count == CHUNK_PLAINTEXT_SIZE {
-                Zeroizing::new(Vec::new())
-            } else {
-                self.load(chunk)?
-            };
-            let length = bytes.len().max(within + count);
-            bytes.resize(length, 0);
-            bytes[within..within + count].copy_from_slice(&data[written..written + count]);
-            self.dirty_chunk = Some((chunk, bytes));
-            self.size = self.size.max(position + count as u64);
-            self.dirty = true;
             written += count;
             position += count as u64;
         }
@@ -308,7 +331,7 @@ impl VaultFileEditor {
             self.dirty_chunk = None;
         }
         if within > 0 {
-            let mut bytes = self.load(tail)?;
+            let mut bytes = (*self.load(tail)?).clone();
             if self
                 .dirty_chunk
                 .as_ref()
@@ -318,11 +341,23 @@ impl VaultFileEditor {
             }
             self.flush_chunk()?;
             bytes.truncate(within);
+            self.reader.chunk_cache.pop(&tail);
             self.dirty_chunk = Some((tail, bytes));
         } else {
             self.flush_chunk()?;
         }
+        let obsolete: Vec<_> = self
+            .reader
+            .chunk_cache
+            .iter()
+            .filter(|(number, _)| **number >= tail)
+            .map(|(number, _)| *number)
+            .collect();
+        for number in obsolete {
+            self.reader.chunk_cache.pop(&number);
+        }
         self.size = size;
+        self.dirty = true;
         self.flush_chunk()?;
         let end = self.offset(tail)
             + if within == 0 {
@@ -336,6 +371,40 @@ impl VaultFileEditor {
             .file
             .set_len(end)?;
         self.dirty = true;
+        Ok(())
+    }
+
+    /// Adopt the backing inode produced by our own successful namespace move.
+    /// The authenticated header and original ciphertext length must be unchanged.
+    pub fn follow_rename(&mut self, destination: &Path) -> io::Result<()> {
+        let mut file = File::open(destination)?;
+        let identity = Identity::of(&file.metadata()?)?;
+        if self
+            .expected
+            .as_ref()
+            .is_none_or(|expected| expected.length != identity.length)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "renamed file length changed",
+            ));
+        }
+        let header_len = usize::try_from(self.offset(0)).map_err(io::Error::other)?;
+        let mut original = vec![0; header_len];
+        let mut renamed = vec![0; header_len];
+        self.reader.file.seek(SeekFrom::Start(0))?;
+        self.reader.file.read_exact(&mut original)?;
+        file.read_exact(&mut renamed)?;
+        if original != renamed {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "renamed file identity changed",
+            ));
+        }
+        self.reader.file = file;
+        self.reader.chunk_cache.clear();
+        self.expected = Some(identity);
+        destination.clone_into(&mut self.reader.decryptor.path);
         Ok(())
     }
 
@@ -373,14 +442,42 @@ impl VaultFileEditor {
 
     /// Copy the current ciphertext to an independent recovery location.
     pub fn copy_ciphertext(&mut self, destination: &Path) -> io::Result<()> {
-        self.flush_chunk()?;
+        // Recovery must work even when the vault stage can no longer be written.
+        // Copy its ciphertext first, then seal the remaining dirty chunk locally.
         let source = self
             .stage
             .as_mut()
             .map_or(&mut self.reader.file, |stage| &mut stage.file);
-        let (file, copied) = clone_ciphertext(source, destination)?;
+        let (mut file, copied) = clone_ciphertext(source, destination)?;
         self.stats.copied_ciphertext_bytes += copied;
+        if let Some((chunk, bytes)) = &self.dirty_chunk {
+            let encrypted = self.reader.decryptor.encrypt_chunk(*chunk, bytes)?;
+            file.seek(SeekFrom::Start(self.offset(*chunk)))?;
+            file.write_all(&encrypted)?;
+            self.stats.encrypted_chunks += 1;
+        }
+        Self::fix_length(&file, self.size, self.cipher())?;
         file.sync_all()
+    }
+
+    fn fix_length(file: &File, size: u64, cipher: CipherCombo) -> io::Result<()> {
+        if crate::fs::streaming::encrypted_to_plaintext_size_for_cipher(
+            file.metadata()?.len(),
+            cipher,
+        ) != Some(size)
+        {
+            let chunks = size / CHUNK_PLAINTEXT_SIZE as u64;
+            let tail = size % CHUNK_PLAINTEXT_SIZE as u64;
+            let overhead = if cipher == CipherCombo::SivGcm {
+                28
+            } else {
+                48
+            };
+            let length = chunk_to_encrypted_offset_for_cipher(chunks, cipher)
+                + if tail == 0 { 0 } else { tail + overhead };
+            file.set_len(length)?;
+        }
+        Ok(())
     }
 
     /// Commit with conflict detection; failed commits retain the complete stage.
@@ -400,10 +497,12 @@ impl VaultFileEditor {
             ));
         }
         self.flush_chunk()?;
+        let cipher = self.cipher();
         let stage = self
             .stage
             .as_mut()
             .ok_or_else(|| io::Error::other("missing edit stage"))?;
+        Self::fix_length(&stage.file, self.size, cipher)?;
         stage.file.sync_all()?;
         let parent = destination
             .parent()
@@ -418,7 +517,6 @@ impl VaultFileEditor {
         crate::fs::durability::sync_directory_chain(parent, vault_root)?;
         self.reader.file = published;
         self.reader.plaintext_size = self.size;
-        self.reader.chunk_cache.clear();
         destination.clone_into(&mut self.reader.decryptor.path);
         self.stage = None;
         self.dirty = false;
@@ -514,5 +612,35 @@ impl crate::fs::streaming::ChunkDecryptor {
                 Ok(encrypted)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use crate::fs::streaming::editor::*;
+    #[test]
+    fn recovery_can_seal_dirty_data_when_vault_stage_is_unwritable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("original");
+        let recovery = directory.path().join("recovered");
+        let key = MasterKey::random().unwrap();
+        let cipher = CipherCombo::SivGcm;
+        let original = cipher.encrypt_file(b"original", &key).unwrap();
+        fs::write(&path, &original).unwrap();
+        let mut editor = VaultFileEditor::open(&path, &key, cipher, directory.path()).unwrap();
+        editor.write(0, b"UPDATED!").unwrap();
+        let stage = editor.stage.as_mut().unwrap();
+        stage.file = File::open(stage.directory.path().join("content")).unwrap();
+        assert!(editor.commit(&path, directory.path()).is_err());
+        assert!(editor.is_dirty());
+        editor.copy_ciphertext(&recovery).unwrap();
+        assert_eq!(
+            cipher
+                .decrypt_file(&fs::read(recovery).unwrap(), &key)
+                .unwrap()
+                .content,
+            b"UPDATED!"
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 }
