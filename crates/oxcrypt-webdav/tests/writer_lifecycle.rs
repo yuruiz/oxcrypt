@@ -242,3 +242,56 @@ async fn directory_move_waits_for_upload_and_persists_abandoned_edits() {
         b"retained"
     );
 }
+
+#[test]
+fn cancelled_queued_write_remains_tracked_until_background_work_finishes() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (_temp, ops) = vault();
+        ops.write_file(&DirId::root(), "note", b"original")
+            .await
+            .unwrap();
+        let fs = CryptomatorWebDav::new(Arc::clone(&ops));
+        let path = DavPath::new("/note").unwrap();
+        let mut writer = fs
+            .open(
+                &path,
+                OpenOptions {
+                    write: true,
+                    ..OpenOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = blocked.recv();
+        });
+        ready.await.unwrap();
+        let mut write = writer.write_bytes(Bytes::from_static(b"queued!!"));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        drop(write);
+        drop(writer);
+        let mut read = fs.open(
+            &path,
+            OpenOptions {
+                read: true,
+                ..OpenOptions::default()
+            },
+        );
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        let mut reader = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.read_bytes(8).await.unwrap().as_ref(), b"queued!!");
+    });
+}
