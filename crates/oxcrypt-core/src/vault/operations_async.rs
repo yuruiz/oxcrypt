@@ -2312,7 +2312,7 @@ impl VaultOperationsAsync {
                 .await?;
         } else {
             let encrypted_dir_path = parent_storage_path.join(format!("{encrypted_name}.c9r"));
-            fs::create_dir_all(&encrypted_dir_path)
+            fs::create_dir(&encrypted_dir_path)
                 .await
                 .map_err(|e| VaultWriteError::Io {
                     source: e,
@@ -2357,7 +2357,7 @@ impl VaultOperationsAsync {
     ) -> Result<PathBuf, VaultWriteError> {
         let hash = create_c9s_filename(encrypted_name);
         let short_dir = parent_storage_path.join(format!("{hash}.c9s"));
-        fs::create_dir_all(&short_dir)
+        fs::create_dir(&short_dir)
             .await
             .map_err(|e| VaultWriteError::Io {
                 source: e,
