@@ -42,7 +42,7 @@ use futures::stream::{self, StreamExt};
 use crate::{
     crypto::keys::MasterKey,
     fs::file::DecryptedFile,
-    fs::file_async::decrypt_file_with_context_async,
+    fs::file_async::decrypt_file_with_context_and_cipher_async,
     fs::name::{create_c9s_filename, decrypt_filename, encrypt_filename},
     fs::streaming::{VaultFileReader, VaultFileWriter},
     fs::symlink::{decrypt_symlink_target, encrypt_symlink_target},
@@ -1517,11 +1517,12 @@ impl VaultOperationsAsync {
         debug!(encrypted_path = %file_info.encrypted_path.display(), "Found file, decrypting");
 
         // Decrypt the file using async file reading
-        let decrypted = decrypt_file_with_context_async(
+        let decrypted = decrypt_file_with_context_and_cipher_async(
             &file_info.encrypted_path,
             &self.master_key,
             Some(filename),
             Some(directory_id.as_str()),
+            self.cipher_combo(),
         )
         .await?;
 
@@ -1814,16 +1815,17 @@ impl VaultOperationsAsync {
         }
 
         // Create the streaming writer
-        let writer = VaultFileWriter::create(&dest_path, &self.master_key)
-            .await
-            .map_err(|e| VaultWriteError::Streaming {
-                source: Box::new(e),
-                context: VaultOpContext::new()
-                    .with_filename(filename)
-                    .with_dir_id(directory_id.as_str())
-                    .with_encrypted_path(&dest_path)
-                    .into_box(),
-            })?;
+        let writer =
+            VaultFileWriter::create_with_cipher(&dest_path, &self.master_key, self.cipher_combo())
+                .await
+                .map_err(|e| VaultWriteError::Streaming {
+                    source: Box::new(e),
+                    context: VaultOpContext::new()
+                        .with_filename(filename)
+                        .with_dir_id(directory_id.as_str())
+                        .with_encrypted_path(&dest_path)
+                        .into_box(),
+                })?;
 
         // Transfer the lock guards to the writer so they're held for its lifetime
         let writer = writer.with_locks(dir_guard, file_guard);
@@ -1879,9 +1881,9 @@ impl VaultOperationsAsync {
     ) -> Result<PathBuf, VaultWriteError> {
         info!("Writing file to vault");
 
-        // Bound additional ciphertext memory for large GCM writes. The streaming
+        // Bound additional ciphertext memory for large writes. The streaming
         // writer commits by rename and holds the same directory/file locks.
-        if content.len() >= 1024 * 1024 && self.core.cipher_combo() == CipherCombo::SivGcm {
+        if content.len() >= 1024 * 1024 {
             let mut writer = self.create_file(dir_id, filename).await?;
             let context = VaultOpContext::new()
                 .with_dir_id(dir_id.as_str())

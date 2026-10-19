@@ -13,6 +13,7 @@ use crate::fs::file::{
     DecryptedFile, FileContext, FileDecryptionError, FileError, decrypt_file_content_with_context,
     decrypt_file_header_with_context,
 };
+use crate::vault::config::CipherCombo;
 
 /// Async version of `decrypt_file`.
 ///
@@ -58,6 +59,24 @@ pub async fn decrypt_file_with_context_async(
     filename: Option<&str>,
     dir_id: Option<&str>,
 ) -> Result<DecryptedFile, FileError> {
+    decrypt_file_with_context_and_cipher_async(
+        path,
+        master_key,
+        filename,
+        dir_id,
+        CipherCombo::SivGcm,
+    )
+    .await
+}
+
+/// Read a complete encrypted file with context and its configured cipher.
+pub async fn decrypt_file_with_context_and_cipher_async(
+    path: impl AsRef<Path>,
+    master_key: &MasterKey,
+    filename: Option<&str>,
+    dir_id: Option<&str>,
+    cipher_combo: CipherCombo,
+) -> Result<DecryptedFile, FileError> {
     let path = path.as_ref();
     let mut context = FileContext::new().with_path(path);
     if let Some(name) = filename {
@@ -82,6 +101,12 @@ pub async fn decrypt_file_with_context_async(
         .await
         .map_err(|e| FileError::io_with_context(e, context.clone()))?;
     trace!(encrypted_size = encrypted.len(), "Read encrypted file");
+
+    if cipher_combo == CipherCombo::SivCtrMac {
+        return cipher_combo
+            .decrypt_file_with_context(&encrypted, master_key, context)
+            .map_err(Into::into);
+    }
 
     // Validate minimum file size
     if encrypted.len() < 68 {
@@ -116,7 +141,7 @@ pub async fn decrypt_file_with_context_async(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::fs::file_async::*;
 
     #[tokio::test]
     async fn test_decrypt_file_async_not_found() {
