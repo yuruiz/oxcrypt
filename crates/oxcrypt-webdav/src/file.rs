@@ -1,5 +1,8 @@
 //! Chunked WebDAV file handles with atomic encrypted write-back.
-use crate::{error::write_error_to_fs_error, metadata::CryptomatorMetaData};
+use crate::{
+    error::{io_error_to_fs_error, write_error_to_fs_error},
+    metadata::CryptomatorMetaData,
+};
 use bytes::Bytes;
 use dav_server::fs::{DavFile, DavMetaData, FsError, FsFuture};
 use oxcrypt_core::{fs::streaming::VaultFileReader, vault::VaultOperationsAsync};
@@ -118,7 +121,7 @@ impl DavFile for CryptomatorFile {
                     let data = tokio::task::spawn_blocking(move || editor.read(position, count))
                         .await
                         .map_err(|_| FsError::GeneralFailure)?
-                        .map_err(|_| FsError::GeneralFailure)?;
+                        .map_err(|error| io_error_to_fs_error(&error))?;
                     handle.position += data.len() as u64;
                     Ok(Bytes::from(data))
                 }
@@ -132,10 +135,23 @@ impl DavFile for CryptomatorFile {
             };
             let editor = Arc::clone(&handle.buffer);
             let position = handle.position;
-            let written = tokio::task::spawn_blocking(move || editor.write(position, &bytes))
-                .await
-                .map_err(|_| FsError::GeneralFailure)?
-                .map_err(|_| FsError::GeneralFailure)?;
+            let written = tokio::task::spawn_blocking(move || {
+                let mut written = 0;
+                while written < bytes.len() {
+                    let count = editor.write(position + written as u64, &bytes[written..])?;
+                    if count == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "short encrypted write",
+                        ));
+                    }
+                    written += count;
+                }
+                Ok::<usize, std::io::Error>(written)
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?
+            .map_err(|error| io_error_to_fs_error(&error))?;
             handle.position += written as u64;
             handle.stats.record_write(written as u64);
             Ok(())

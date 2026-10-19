@@ -163,10 +163,11 @@ fn open_writer_follows_rename_across_directories_and_remount() {
         .write(true)
         .open(root.join("before"))
         .unwrap();
-    fs::rename(root.join("before"), root.join("middle")).unwrap();
+    let long_name = "m".repeat(200);
+    fs::rename(root.join("before"), root.join(&long_name)).unwrap();
     file.write_all_at(b"FIRST!!!", 0).unwrap();
     file.sync_all().unwrap();
-    fs::rename(root.join("middle"), root.join("destination/after")).unwrap();
+    fs::rename(root.join(&long_name), root.join("destination/after")).unwrap();
     file.write_all_at(b"UPDATED!", 0).unwrap();
     file.sync_all().unwrap();
     drop(file);
@@ -181,7 +182,7 @@ fn open_writer_follows_rename_across_directories_and_remount() {
         .unwrap();
     let root = mount.mountpoint();
     let content = fs::read(root.join("destination/after")).unwrap();
-    let old_exists = root.join("before").exists() || root.join("middle").exists();
+    let old_exists = root.join("before").exists() || root.join(&long_name).exists();
     mount.unmount().unwrap();
     assert_eq!(content, b"UPDATED!");
     assert!(!old_exists);

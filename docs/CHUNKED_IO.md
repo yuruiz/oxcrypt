@@ -1,6 +1,6 @@
 # Chunked mount I/O
 
-FUSE, NFS and WebDAV file handles use authenticated 32 KiB chunks. Opening an existing file authenticates its header; content authentication happens when the affected chunks are accessed. Partial writes read only the intersecting old chunks; complete chunk overwrites skip old decryption. One dirty plaintext chunk is buffered per editor, separately from caller-owned read/write buffers.
+FUSE, NFS and WebDAV file handles use authenticated 32 KiB chunks. Opening an existing file authenticates its header; content authentication happens when the affected chunks are accessed. Partial writes read only the intersecting old chunks; complete chunk overwrites skip old decryption. Each editor buffers one dirty plaintext chunk and caches up to four authenticated clean chunks (at most 160 KiB total), separately from caller-owned read/write buffers. Overlapping reads reuse cached chunks. Per-call crypto work buffers are also limited to individual chunks.
 
 Edits keep the original content key and header. Every changed chunk receives a fresh random nonce. Both SIV_GCM and SIV_CTRMAC are supported. Unmodified ciphertext is preserved byte-for-byte.
 

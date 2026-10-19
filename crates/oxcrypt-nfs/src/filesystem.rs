@@ -485,7 +485,9 @@ impl NFSFileSystem for CryptomatorNFS {
 
                 let _mutation = self.flush_lock.lock().await;
                 let editor = self.editor(id, &dir_id, &name).await?;
-                editor.truncate(size).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                editor
+                    .truncate(size)
+                    .map_err(|error| vault_error_to_nfsstat(&error))?;
                 self.writeback().flush_unlocked(id).await?;
 
                 // Re-get entry for timestamp handling
@@ -592,9 +594,16 @@ impl NFSFileSystem for CryptomatorNFS {
 
         let _mutation = self.flush_lock.lock().await;
         let editor = self.editor(id, &dir_id, &name).await?;
-        editor
-            .write(offset, data)
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let mut written = 0;
+        while written < data.len() {
+            let count = editor
+                .write(offset + written as u64, &data[written..])
+                .map_err(|error| vault_error_to_nfsstat(&error))?;
+            if count == 0 {
+                return Err(nfsstat3::NFS3ERR_IO);
+            }
+            written += count;
+        }
         let new_size = editor.len();
         self.writeback().flush_unlocked(id).await?;
         self.stats.record_write(data.len() as u64);
