@@ -141,6 +141,17 @@ const DEFAULT_FILE_PERM: u16 = 0o644;
 /// Default directory permissions (rwxr-xr-x).
 const DEFAULT_DIR_PERM: u16 = 0o755;
 
+fn read_result<T>(
+    result: Result<
+        Result<T, oxcrypt_core::error::VaultOperationError>,
+        crate::async_bridge::BridgeError,
+    >,
+) -> Result<T, c_int> {
+    result
+        .map_err(|error| error.to_errno())?
+        .map_err(|error| crate::error::vault_error_to_errno(&error))
+}
+
 /// Keep the authoritative buffer available until persistence succeeds. A timeout
 /// can drop the future, so recovery must not depend on that future returning data.
 fn persist_write_buffer(
@@ -1103,6 +1114,16 @@ impl CryptomatorFS {
         fs.uid = uid;
         fs.gid = gid;
         Ok(fs)
+    }
+
+    /// Existing-file mutations require an authenticated read of the old data.
+    /// Creation is handled separately by `create`; even ENOENT is an error here.
+    fn read_for_modify(&self, dir_id: &DirId, filename: &str) -> Result<Vec<u8>, c_int> {
+        let ops = self.ops_clone();
+        let dir_id = dir_id.clone();
+        let filename = filename.to_owned();
+        read_result(self.exec(async move { ops.read_file(&dir_id, &filename).await }))
+            .map(|file| file.content)
     }
 
     /// Gets a clone of the vault operations Arc for use in async context.
@@ -2236,8 +2257,6 @@ impl Filesystem for CryptomatorFS {
         };
         drop(entry);
 
-        let ops = self.ops_clone();
-
         // Check if opening for write
         let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
         let is_trunc = (flags & libc::O_TRUNC) != 0;
@@ -2248,15 +2267,12 @@ impl Filesystem for CryptomatorFS {
                 // O_TRUNC: start with empty buffer
                 Vec::new()
             } else {
-                // Read existing content if file exists (with timeout)
-                let ops_clone = Arc::clone(&ops);
-                let dir_id_clone = dir_id.clone();
-                let name_clone = name.clone();
-                match self
-                    .exec(async move { ops_clone.read_file(&dir_id_clone, &name_clone).await })
-                {
-                    Ok(Ok(file)) => file.content,
-                    Ok(Err(_)) | Err(_) => Vec::new(), // File doesn't exist, start empty
+                match self.read_for_modify(&dir_id, &name) {
+                    Ok(content) => content,
+                    Err(errno) => {
+                        reply.error(fuser::Errno::from_i32(errno));
+                        return;
+                    }
                 }
             };
 
@@ -2964,20 +2980,16 @@ impl Filesystem for CryptomatorFS {
 
                     // No open handle - read file, truncate, write back
                     debug!(inode = ino, new_size = new_size, file = %file_name, "setattr: no open write buffer, using read-modify-write");
-                    let ops = self.ops_clone();
-                    let dir_id_read = dir_id.clone();
-                    let name_read = name.clone();
-
-                    // Read existing content (or empty if file doesn't exist)
-                    let read_result =
-                        self.exec(async move { ops.read_file(&dir_id_read, &name_read).await });
-                    let (mut content, old_size) = match read_result {
-                        Ok(Ok(file)) => {
-                            let size = file.content.len() as u64;
-                            (file.content, size)
+                    let mut content = match self.read_for_modify(&dir_id, &name) {
+                        Ok(content) => content,
+                        Err(errno) => {
+                            self.vault_stats.record_error();
+                            self.vault_stats.record_metadata_latency(start.elapsed());
+                            reply.error(fuser::Errno::from_i32(errno));
+                            return;
                         }
-                        Ok(Err(_)) | Err(_) => (Vec::new(), 0),
                     };
+                    let old_size = content.len() as u64;
 
                     // Track if we're extending (for TTL decision)
                     let is_extending = new_size > old_size;
@@ -5055,17 +5067,14 @@ impl Filesystem for CryptomatorFS {
             return;
         }
 
-        // No open handle - read file, extend if needed, write back
-        let ops = self.ops_clone();
-        let dir_id_read = dir_id.clone();
-        let name_read = name.clone();
-
-        // Read existing content
-        let mut content =
-            match self.exec(async move { ops.read_file(&dir_id_read, &name_read).await }) {
-                Ok(Ok(file)) => file.content,
-                Ok(Err(_)) | Err(_) => Vec::new(),
-            };
+        // A failed read must never turn an existing file into zero-filled data.
+        let mut content = match self.read_for_modify(&dir_id, &name) {
+            Ok(content) => content,
+            Err(errno) => {
+                reply.error(fuser::Errno::from_i32(errno));
+                return;
+            }
+        };
 
         // Extend if needed (don't shrink)
         // On 32-bit: file sizes beyond 4GB would fail earlier in allocation
@@ -5403,6 +5412,57 @@ impl Filesystem for CryptomatorFS {
 #[cfg(test)]
 mod tests {
     use crate::filesystem::*;
+
+    #[test]
+    fn modification_read_preserves_io_and_bridge_errors() {
+        use oxcrypt_core::vault::operations::{VaultOpContext, VaultOperationError};
+        for errno in [libc::EIO, libc::EACCES, libc::ENOENT] {
+            let result = read_result::<Vec<u8>>(Ok(Err(VaultOperationError::Io {
+                source: std::io::Error::from_raw_os_error(errno),
+                context: VaultOpContext::new(),
+            })));
+            assert_eq!(result, Err(errno));
+        }
+        assert_eq!(
+            read_result::<Vec<u8>>(Err(crate::async_bridge::BridgeError::Timeout(
+                Duration::from_millis(1)
+            ))),
+            Err(libc::ETIMEDOUT)
+        );
+        assert_eq!(
+            read_result::<Vec<u8>>(Err(crate::async_bridge::BridgeError::Cancelled)),
+            Err(libc::ECANCELED)
+        );
+    }
+
+    #[test]
+    fn modification_read_rejects_corruption_without_changing_ciphertext() {
+        use oxcrypt_mount::testing::TempVault;
+        let vault = TempVault::new();
+        let fs = CryptomatorFS::new(vault.path(), TempVault::password()).unwrap();
+        let ops = fs.ops_clone();
+        let path = fs
+            .exec(async move {
+                ops.write_file(&DirId::root(), "note.md", b"original note")
+                    .await
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs.read_for_modify(&DirId::root(), "note.md").unwrap(),
+            b"original note"
+        );
+        assert_eq!(
+            fs.read_for_modify(&DirId::root(), "missing.md"),
+            Err(libc::ENOENT)
+        );
+        let mut corrupted = std::fs::read(&path).unwrap();
+        *corrupted.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &corrupted).unwrap();
+        assert!(fs.read_for_modify(&DirId::root(), "note.md").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+        assert!(fs.handle_table.is_empty());
+    }
 
     fn dirty_handle() -> (FuseHandleTable, u64) {
         let handles = FuseHandleTable::new_auto_id();
