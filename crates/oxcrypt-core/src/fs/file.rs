@@ -524,13 +524,8 @@ pub fn encrypt_file_content_with_context(
     let mut encrypted_content = Vec::new();
     let chunk_size = 32 * 1024; // 32 KiB
 
-    // Always process at least one chunk, even for empty content
-    // This ensures proper authentication for empty files
-    let chunks: Vec<&[u8]> = if content.is_empty() {
-        vec![&[]] // One empty chunk
-    } else {
-        content.chunks(chunk_size).collect()
-    };
+    // Empty files contain only their authenticated header.
+    let chunks: Vec<&[u8]> = content.chunks(chunk_size).collect();
 
     for (chunk_number, chunk) in chunks.iter().enumerate() {
         let chunk_context = FileContext {

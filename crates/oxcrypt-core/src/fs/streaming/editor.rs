@@ -310,6 +310,25 @@ impl VaultFileEditor {
             ));
         }
         if size == self.size {
+            if size == 0 {
+                let length = self
+                    .stage
+                    .as_ref()
+                    .map_or(&self.reader.file, |stage| &stage.file)
+                    .metadata()?
+                    .len();
+                let header = self.offset(0);
+                if length > header {
+                    self.ensure_stage()?;
+                    self.stage
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("missing edit stage"))?
+                        .file
+                        .set_len(header)?;
+                    self.reader.chunk_cache.clear();
+                    self.dirty = true;
+                }
+            }
             return Ok(());
         }
         if size > self.size {
