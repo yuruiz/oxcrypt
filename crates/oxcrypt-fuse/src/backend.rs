@@ -56,6 +56,7 @@ fn platform_mount_options(_vault_id: &str) -> Vec<MountOption> {
 /// Wraps the fuser `BackgroundSession`. Dropping this handle triggers unmount.
 pub struct FuseMountHandle {
     session: Option<BackgroundSession>,
+    close_reports: Arc<parking_lot::Mutex<Vec<String>>>,
     mountpoint: PathBuf,
     /// Statistics for monitoring vault activity
     stats: Arc<VaultStats>,
@@ -140,6 +141,10 @@ impl MountHandle for FuseMountHandle {
                 .umount_and_join()
                 .map_err(|e| MountError::UnmountFailed(e.to_string()))?;
         }
+        let reports = self.close_reports.lock();
+        if !reports.is_empty() {
+            return Err(MountError::UnmountFailed(reports.join("; ")));
+        }
         tracing::info!(mountpoint = %self.mountpoint.display(), "FUSE unmount successful");
         Ok(())
     }
@@ -158,6 +163,10 @@ impl MountHandle for FuseMountHandle {
             if let Err(e) = session.umount_and_join() {
                 tracing::debug!(error = %e, "Session join after force unmount reported an error");
             }
+        }
+        let reports = self.close_reports.lock();
+        if !reports.is_empty() {
+            return Err(MountError::UnmountFailed(reports.join("; ")));
         }
         tracing::info!(mountpoint = %self.mountpoint.display(), "FUSE force unmount successful");
         Ok(())
@@ -431,6 +440,7 @@ impl MountBackend for FuseBackend {
         // Capture stats, lock metrics, and scheduler collector before spawning
         // (spawn_mount2 takes ownership of fs)
         let stats = fs.stats();
+        let close_reports = fs.close_reports();
         let lock_metrics = Arc::clone(fs.lock_metrics());
         let scheduler_collector = fs.scheduler_stats_collector();
         // Share the notifier cell so it stays reachable once `fs` has been moved
@@ -481,6 +491,7 @@ impl MountBackend for FuseBackend {
 
         Ok(Box::new(FuseMountHandle {
             session: Some(session),
+            close_reports,
             mountpoint: actual_mountpoint,
             stats,
             lock_metrics,
@@ -558,6 +569,7 @@ impl MountBackend for FuseBackend {
         // Capture stats, lock metrics, and scheduler collector before spawning
         // (spawn_mount2 takes ownership of fs)
         let stats = fs.stats();
+        let close_reports = fs.close_reports();
         let lock_metrics = Arc::clone(fs.lock_metrics());
         let scheduler_collector = fs.scheduler_stats_collector();
         // Share the notifier cell so it stays reachable once `fs` has been moved
@@ -604,6 +616,7 @@ impl MountBackend for FuseBackend {
 
         Ok(Box::new(FuseMountHandle {
             session: Some(session),
+            close_reports,
             mountpoint: actual_mountpoint,
             stats,
             lock_metrics,

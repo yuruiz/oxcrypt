@@ -35,8 +35,8 @@ use oxcrypt_mount::{
 };
 
 use crate::commands::{
-    cat, completions, cp, export, import, info, init, ls, mkdir, mounts, mv, rm, stats, touch,
-    tree, write,
+    cat, completions, cp, export, import, info, init, ls, mkdir, mounts, mv, recover, rm, stats,
+    touch, tree, write,
 };
 use crate::state::MountStateManager;
 
@@ -137,6 +137,9 @@ enum Commands {
 
     /// Write stdin to a file
     Write(VaultCommand<write::Args>),
+
+    /// Export an encrypted failed-write recovery copy to a new local file
+    Recover(VaultCommand<recover::Args>),
 
     /// Remove a file or directory
     Rm(VaultCommand<rm::Args>),
@@ -318,6 +321,7 @@ fn run() -> Result<()> {
         Commands::Tree(cmd) => execute_vault_command(&cmd, &password_opts, tree::execute),
         Commands::Mkdir(cmd) => execute_vault_command(&cmd, &password_opts, mkdir::execute),
         Commands::Touch(cmd) => execute_vault_command(&cmd, &password_opts, touch::execute),
+        Commands::Recover(cmd) => execute_vault_command(&cmd, &password_opts, recover::execute),
         Commands::Write(cmd) => execute_vault_command(&cmd, &password_opts, write::execute),
         Commands::Rm(cmd) => execute_vault_command(&cmd, &password_opts, rm::execute),
         Commands::Cp(cmd) => execute_vault_command(&cmd, &password_opts, cp::execute),

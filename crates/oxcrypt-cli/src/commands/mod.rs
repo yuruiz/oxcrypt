@@ -8,6 +8,7 @@ pub mod init;
 pub mod ls;
 pub mod mkdir;
 pub mod mv;
+pub mod recover;
 pub mod rm;
 pub mod stats;
 pub mod touch;

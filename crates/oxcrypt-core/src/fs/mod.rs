@@ -14,6 +14,9 @@ pub mod file_async;
 #[cfg(feature = "async")]
 pub mod streaming;
 
+#[cfg(feature = "async")]
+pub mod recovery;
+
 // Re-export commonly used types
 pub use directory::{DirectoryEntry, EntryKind, VaultExplorer, print_tree};
 pub use file::{
