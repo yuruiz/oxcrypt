@@ -118,3 +118,21 @@ cargo test -p oxcrypt-desktop
 ## License
 
 This project is licensed under the [Mozilla Public License 2.0](../../LICENSE).
+
+## macOS Keychain
+
+The unlock dialog can save a password in macOS Keychain after a successful mount.
+Saving is opt-in. Use **Use saved password** to retrieve it, or **Forget saved
+password** to remove it. A locked or unavailable keychain reports an error and
+manual password entry remains available. Passwords are stored under
+`org.oxcrypt.desktop.vault-password`, keyed by OxCrypt's vault ID, never in its JSON
+configuration. Cryptomator's existing keychain items are not imported or changed.
+Changing a vault password removes the old saved credential; the next successful
+unlock can save the replacement. Removing a vault also removes its saved password.
+
+To test the integration with an unlocked login keychain (uses a random test account):
+
+```sh
+cargo test -p oxcrypt-desktop --no-default-features --features fuse \
+  --bin oxcrypt-desktop keychain::tests::keychain_roundtrip_update_and_forget -- --ignored
+```

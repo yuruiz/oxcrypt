@@ -2,7 +2,13 @@
 
 use dioxus::prelude::*;
 
-/// Result of an unlock operation
+/// Password and explicit credential-storage preference for an unlock attempt.
+pub struct UnlockRequest {
+    pub password: zeroize::Zeroizing<String>,
+    pub remember: bool,
+}
+
+/// Result of an unlock operation.
 pub type UnlockResult = Result<(), String>;
 
 /// Props for the unlock dialog
@@ -10,9 +16,10 @@ pub type UnlockResult = Result<(), String>;
 pub struct UnlockDialogProps {
     /// Vault name to display
     pub vault_name: String,
+    pub vault_id: String,
     /// Called when unlock is attempted with the password
     /// The dialog will manage its own visual state while waiting
-    pub on_unlock: EventHandler<String>,
+    pub on_unlock: EventHandler<UnlockRequest>,
     /// Called when dialog is cancelled
     pub on_cancel: EventHandler<()>,
     /// Called when unlock completes (success or failure)
@@ -37,6 +44,9 @@ pub enum DialogState {
 #[component]
 pub fn UnlockDialog(props: UnlockDialogProps) -> Element {
     let mut password = use_signal(String::new);
+    let mut remember = use_signal(|| false);
+    let mut keychain_busy = use_signal(|| false);
+    let mut keychain_message = use_signal(|| None::<String>);
     let mut show_password = use_signal(|| false);
     let mut dialog_state = use_signal(|| DialogState::Idle);
 
@@ -64,7 +74,7 @@ pub fn UnlockDialog(props: UnlockDialogProps) -> Element {
         }
     }
 
-    let is_unlocking = matches!(dialog_state(), DialogState::Unlocking);
+    let is_unlocking = matches!(dialog_state(), DialogState::Unlocking) || keychain_busy();
     let error_message = match dialog_state() {
         DialogState::Error(msg) => Some(msg),
         _ => None,
@@ -77,7 +87,11 @@ pub fn UnlockDialog(props: UnlockDialogProps) -> Element {
             if !pw.is_empty() {
                 // Set internal state to unlocking BEFORE calling parent
                 dialog_state.set(DialogState::Unlocking);
-                on_unlock.call(pw);
+                password.set(String::new());
+                on_unlock.call(UnlockRequest {
+                    password: zeroize::Zeroizing::new(pw),
+                    remember: remember(),
+                });
             }
         }
     };
@@ -89,7 +103,11 @@ pub fn UnlockDialog(props: UnlockDialogProps) -> Element {
                 let pw = password();
                 if !pw.is_empty() && !matches!(dialog_state(), DialogState::Unlocking) {
                     dialog_state.set(DialogState::Unlocking);
-                    on_unlock.call(pw);
+                    password.set(String::new());
+                    on_unlock.call(UnlockRequest {
+                        password: zeroize::Zeroizing::new(pw),
+                        remember: remember(),
+                    });
                 }
             }
         }
@@ -97,6 +115,41 @@ pub fn UnlockDialog(props: UnlockDialogProps) -> Element {
 
     // Determine button text/content based on state - rendered as separate variables
     // to avoid conditional rendering issues in the button element
+    let load_account = props.vault_id.clone();
+    let load_saved = move |_| {
+        let account = load_account.clone();
+        keychain_busy.set(true);
+        keychain_message.set(None);
+        spawn(async move {
+            match tokio::task::spawn_blocking(move || crate::keychain::load(&account)).await {
+                Ok(Ok(Some(saved))) => password.set(saved.to_string()),
+                Ok(Ok(None)) => {
+                    keychain_message.set(Some("No saved password for this vault.".into()))
+                }
+                Ok(Err(error)) => keychain_message.set(Some(error)),
+                Err(_) => keychain_message.set(Some("Keychain request failed.".into())),
+            }
+            keychain_busy.set(false);
+        });
+    };
+    let forget_account = props.vault_id.clone();
+    let forget_saved = move |_| {
+        let account = forget_account.clone();
+        keychain_busy.set(true);
+        spawn(async move {
+            match tokio::task::spawn_blocking(move || crate::keychain::forget(&account)).await {
+                Ok(Ok(())) => {
+                    password.set(String::new());
+                    remember.set(false);
+                    keychain_message.set(Some("Saved password removed.".into()));
+                }
+                Ok(Err(error)) => keychain_message.set(Some(error)),
+                Err(_) => keychain_message.set(Some("Keychain request failed.".into())),
+            }
+            keychain_busy.set(false);
+        });
+    };
+
     let button_disabled = is_unlocking || password().is_empty();
     let cancel_disabled = is_unlocking;
 
@@ -159,6 +212,31 @@ pub fn UnlockDialog(props: UnlockDialogProps) -> Element {
                                 class: "input-icon bg-transparent border-none cursor-pointer text-base p-1",
                                 onclick: move |_| show_password.set(!show_password()),
                                 if show_password() { "🙈" } else { "👁️" }
+                            }
+                        }
+                    }
+
+                    if cfg!(target_os = "macos") {
+                        div {
+                            class: "mb-4",
+                            label {
+                                input {
+                                    r#type: "checkbox",
+                                    checked: remember(),
+                                    disabled: is_unlocking,
+                                    oninput: move |event| remember.set(event.checked()),
+                                }
+                                " Save password in macOS Keychain after unlocking"
+                            }
+                            div {
+                                class: "flex gap-3 mt-2",
+                                button { r#type: "button", class: "btn-secondary", disabled: is_unlocking,
+                                    onclick: load_saved, "Use saved password" }
+                                button { r#type: "button", class: "btn-secondary", disabled: is_unlocking,
+                                    onclick: forget_saved, "Forget saved password" }
+                            }
+                            if let Some(message) = keychain_message() {
+                                p { role: "status", "{message}" }
                             }
                         }
                     }

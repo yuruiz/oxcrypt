@@ -12,6 +12,7 @@ mod components;
 mod dialogs;
 mod error;
 mod icons;
+mod keychain;
 mod menu;
 mod platform;
 mod state;
