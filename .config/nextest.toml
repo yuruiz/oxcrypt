@@ -105,7 +105,7 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 
 [profile.default.junit]
 # JUnit XML output for CI integration
-path = "target/nextest/default/junit.xml"
+path = "junit.xml"
 
 # =============================================================================
 # UNIT PROFILE - Fast unit tests only
@@ -130,7 +130,7 @@ platform = 'cfg(unix)'
 setup = 'kdf-setup'
 
 [profile.unit.junit]
-path = "target/nextest/unit/junit.xml"
+path = "junit.xml"
 
 # =============================================================================
 # INTEGRATION PROFILE - All integration tests
@@ -164,7 +164,7 @@ filter = 'test(~unlink_with.*open_handles)'
 slow-timeout = { period = "120s", terminate-after = 2 }
 
 [profile.integration.junit]
-path = "target/nextest/integration/junit.xml"
+path = "junit.xml"
 
 # =============================================================================
 # MOUNTS PROFILE - Just mount backends
@@ -197,7 +197,7 @@ filter = 'test(~unlink_with.*open_handles)'
 slow-timeout = { period = "120s", terminate-after = 2 }
 
 [profile.mounts.junit]
-path = "target/nextest/mounts/junit.xml"
+path = "junit.xml"
 
 # =============================================================================
 # STRESS PROFILE - Slow stress/concurrency tests
@@ -226,7 +226,7 @@ filter = 'all()'
 test-group = 'stress-tests'
 
 [profile.stress.junit]
-path = "target/nextest/stress/junit.xml"
+path = "junit.xml"
 
 # =============================================================================
 # CI PROFILE - Full test suite with production settings
@@ -259,7 +259,7 @@ filter = 'test(/stress/) | test(/concurrency/) | test(/pjdfstest/) | test(/fsx/)
 test-group = 'stress-tests'
 
 [profile.ci.junit]
-path = "target/nextest/ci/junit.xml"
+path = "junit.xml"
 
 # =============================================================================
 # QUICK PROFILE - Development iteration
@@ -282,4 +282,15 @@ platform = 'cfg(unix)'
 setup = 'kdf-setup'
 
 [profile.quick.junit]
-path = "target/nextest/quick/junit.xml"
+path = "junit.xml"
+
+# Real macFUSE tests use only disposable vaults. A missing driver or failed mount
+# must fail; scripts/test-macos-fuse.sh also enables strict legacy harness checks.
+[profile.macos-fuse]
+default-filter = 'binary(macos_mount) | binary(macos_xattr)'
+retries = 0
+test-threads = 1
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[profile.macos-fuse.junit]
+path = "junit.xml"

@@ -300,3 +300,28 @@ When implementing a new backend:
 5. Add backend-specific tests (e.g., WebDAV HTTP codes)
 
 The test logic remains the same; only the harness changes.
+
+## Strict macOS FUSE validation
+
+On a Mac with the macFUSE kernel extension installed and approved, run:
+
+```sh
+scripts/test-macos-fuse.sh
+```
+
+This requires cargo-nextest and runs only `macos_mount` and `macos_xattr`, using
+fresh temporary vaults and production KDF settings. It checks large partial edits,
+fsync, temporary-file replacement saves, directory renames, Unicode/shortened
+names, Finder tags/Info, nonempty-directory failure, and persistence across
+unmount/remount. Each test has a 60-second timeout and no retries. Missing FUSE,
+failed mounting, and an empty selection fail the run. The existing optional mount
+harness can also be made strict with `OXCRYPT_REQUIRE_FUSE=1`.
+
+The existing hosted macOS CI job explicitly runs FUSE and write-buffer library
+regressions, which do not require mounting. Hosted runners cannot approve the
+macFUSE kernel extension: run the script locally on an approved Mac and record the
+JUnit result at `target/nextest/macos-fuse/junit.xml`. A green hosted CI run does
+not certify that mounted tests ran.
+
+For the core library's nightly-only unit tests, use the nightly toolchain. The
+mount tests themselves can run on the supported stable compiler.

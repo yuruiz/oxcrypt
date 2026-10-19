@@ -424,6 +424,10 @@ pub fn fuse_available() -> bool {
 macro_rules! skip_if_no_fuse {
     () => {
         if !$crate::common::harness::fuse_available() {
+            assert!(
+                std::env::var_os("OXCRYPT_REQUIRE_FUSE").is_none(),
+                "FUSE is required but unavailable"
+            );
             eprintln!("Skipping test: FUSE not available on this system");
             return;
         }
@@ -437,6 +441,10 @@ macro_rules! require_mount {
         match $mount_result {
             Ok(m) => m,
             Err(e) => {
+                assert!(
+                    std::env::var_os("OXCRYPT_REQUIRE_FUSE").is_none(),
+                    "Required FUSE mount failed: {e}"
+                );
                 eprintln!("Skipping test: {}", e);
                 return;
             }
