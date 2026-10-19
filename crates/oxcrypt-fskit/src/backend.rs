@@ -12,6 +12,12 @@ use secrecy::SecretString;
 
 use crate::xpc::{FskitClient, FskitError, MountInfo};
 
+const EXPERIMENTAL_SETTING: &str = "OXCRYPT_EXPERIMENTAL_FSKIT";
+
+fn experimental_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 /// Thread-safe wrapper for FskitClient.
 ///
 /// # Safety
@@ -73,10 +79,16 @@ impl MountBackend for FskitBackend {
     }
 
     fn is_available(&self) -> bool {
-        FskitClient::is_available()
+        experimental_enabled(std::env::var_os(EXPERIMENTAL_SETTING).as_deref())
+            && FskitClient::is_available()
     }
 
     fn unavailable_reason(&self) -> Option<String> {
+        if !experimental_enabled(std::env::var_os(EXPERIMENTAL_SETTING).as_deref()) {
+            return Some(format!(
+                "Native FSKit mounting is experimental and disabled. For development, set {EXPERIMENTAL_SETTING}=1; a signed, enabled extension and running host service are also required."
+            ));
+        }
         if self.is_available() {
             return None;
         }
@@ -110,6 +122,12 @@ impl MountBackend for FskitBackend {
         password: &str,
         _mountpoint: &Path,
     ) -> Result<Box<dyn MountHandle>, MountError> {
+        if !self.is_available() {
+            return Err(MountError::BackendUnavailable(
+                self.unavailable_reason()
+                    .unwrap_or_else(|| "FSKit backend unavailable".into()),
+            ));
+        }
         // We need a mutable reference to ensure client
         // This is a bit awkward - ideally we'd use interior mutability
         // For now, create a new client for each mount
@@ -213,4 +231,16 @@ fn check_macos_version() -> bool {
     let minor: i64 = parts[1].parse().unwrap_or(0);
 
     major > 15 || (major == 15 && minor >= 4)
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use crate::backend::experimental_enabled;
+    use std::ffi::OsStr;
+    #[test]
+    fn experimental_backend_requires_explicit_opt_in() {
+        assert!(!experimental_enabled(None));
+        assert!(!experimental_enabled(Some(OsStr::new("0"))));
+        assert!(experimental_enabled(Some(OsStr::new("1"))));
+    }
 }

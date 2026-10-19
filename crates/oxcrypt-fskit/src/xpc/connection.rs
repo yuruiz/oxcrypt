@@ -306,14 +306,42 @@ fn check_extension_registered() -> bool {
         .output();
 
     match output {
-        Ok(output) => output.status.success(),
+        Ok(output) => {
+            output.status.success()
+                && registration_is_enabled(&String::from_utf8_lossy(&output.stdout))
+        }
         Err(_) => false,
     }
 }
 
+fn registration_is_enabled(output: &str) -> bool {
+    output.lines().any(|line| {
+        let line = line.trim();
+        if line.starts_with('-') || line.starts_with('!') {
+            return false;
+        }
+        let line = line.strip_prefix('+').unwrap_or(line).trim();
+        line.split('(').next().is_some_and(|identifier| {
+            identifier.trim() == "com.agucova.oxcrypt.desktop.fsextension"
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::xpc::connection::*;
+
+    #[test]
+    fn registration_requires_a_matching_enabled_entry() {
+        assert!(!registration_is_enabled(""));
+        assert!(!registration_is_enabled("other.extension(1.0)"));
+        assert!(!registration_is_enabled(
+            "- com.agucova.oxcrypt.desktop.fsextension(1.0)"
+        ));
+        assert!(registration_is_enabled(
+            "+ com.agucova.oxcrypt.desktop.fsextension(1.0)"
+        ));
+    }
 
     #[test]
     fn test_service_name() {
