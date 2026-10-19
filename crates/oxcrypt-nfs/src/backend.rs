@@ -3,7 +3,7 @@
 //! This module implements the `MountBackend` trait for NFS-based mounting
 //! of Cryptomator vaults.
 
-use crate::filesystem::CryptomatorNFS;
+use crate::filesystem::{CryptomatorNFS, NfsWriteback};
 use nfsserve::tcp::NFSTcp;
 use oxcrypt_core::vault::operations_async::VaultOperationsAsync;
 use oxcrypt_mount::{BackendType, MountBackend, MountError, MountHandle, VaultStats};
@@ -27,6 +27,7 @@ const DEFAULT_MOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct NfsMountHandle {
     /// Tokio task running the NFS server.
     server_handle: Option<JoinHandle<()>>,
+    writeback: NfsWriteback,
     /// Runtime for async operations (kept alive for the server task).
     #[allow(dead_code)]
     runtime: Arc<Runtime>,
@@ -57,63 +58,80 @@ impl MountHandle for NfsMountHandle {
     }
 
     fn unmount(mut self: Box<Self>) -> Result<(), MountError> {
-        self.do_unmount()
+        self.do_unmount(false)
     }
 
     fn force_unmount(mut self: Box<Self>) -> Result<(), MountError> {
-        // NFS already uses force unmount commands in do_unmount
-        self.do_unmount()
+        self.do_unmount(true)
     }
 }
 
 impl NfsMountHandle {
-    fn do_unmount(&mut self) -> Result<(), MountError> {
-        if self.unmounted.swap(true, Ordering::SeqCst) {
+    fn do_unmount(&mut self, force: bool) -> Result<(), MountError> {
+        if self.unmounted.load(Ordering::SeqCst) {
             // Already unmounted
             return Ok(());
         }
 
         info!(mountpoint = ?self.mountpoint, port = self.port, "Unmounting NFS filesystem");
 
-        // TODO: Flush dirty buffers before unmount
-        // (requires refactoring to share filesystem reference)
-
-        // STEP 1: Unmount the filesystem
-        let unmount_result = self.run_unmount_command();
-
-        // STEP 2: Abort the server task
+        self.flush_pending()?;
+        self.run_unmount_command(force)?;
+        self.flush_pending()?;
+        self.unmounted.store(true, Ordering::SeqCst);
         if let Some(handle) = self.server_handle.take() {
             handle.abort();
         }
-
-        unmount_result
+        Ok(())
     }
 
-    #[cfg(target_os = "macos")]
-    fn run_unmount_command(&self) -> Result<(), MountError> {
-        // Use shared force_unmount utility (has built-in timeouts)
-        oxcrypt_mount::force_unmount(&self.mountpoint)
-            .map_err(|e| MountError::UnmountFailed(e.to_string()))
+    fn flush_pending(&self) -> Result<(), MountError> {
+        self.runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), self.writeback.flush_all()).await
+            })
+            .map_err(|_| MountError::UnmountFailed("NFS writeback timed out".into()))?
+            .map_err(|error| MountError::UnmountFailed(format!("NFS writeback failed: {error:?}")))
     }
 
-    #[cfg(target_os = "linux")]
-    fn run_unmount_command(&self) -> Result<(), MountError> {
-        // Use shared lazy_unmount utility (has built-in timeouts and fallbacks)
-        oxcrypt_mount::lazy_unmount(&self.mountpoint)
-            .map_err(|e| MountError::UnmountFailed(e.to_string()))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    fn run_unmount_command(&self) -> Result<(), MountError> {
-        Err(MountError::UnmountFailed(
-            "Unmount not implemented for this platform".to_string(),
-        ))
+    fn run_unmount_command(&self, force: bool) -> Result<(), MountError> {
+        let mut command = Command::new("umount");
+        if force {
+            command.arg("-f");
+        }
+        let mut child = command
+            .arg(&self.mountpoint)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| MountError::UnmountFailed(error.to_string()))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| MountError::UnmountFailed(error.to_string()))?
+            {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(MountError::UnmountFailed(format!(
+                        "umount exited with {status}"
+                    )))
+                };
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MountError::UnmountFailed("umount timed out".into()));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
 impl Drop for NfsMountHandle {
     fn drop(&mut self) {
-        if let Err(e) = self.do_unmount() {
+        if let Err(e) = self.do_unmount(false) {
             error!(error = %e, "Failed to unmount NFS filesystem on drop");
         }
     }
@@ -390,6 +408,7 @@ impl MountBackend for NfsBackend {
 
         // Capture stats before filesystem is moved
         let stats = fs.stats();
+        let writeback = fs.writeback();
 
         // Find available port
         let port = self.find_available_port()?;
@@ -454,6 +473,7 @@ impl MountBackend for NfsBackend {
 
         Ok(Box::new(NfsMountHandle {
             server_handle: Some(server_handle),
+            writeback,
             runtime,
             mountpoint: mountpoint.to_path_buf(),
             port,
@@ -465,7 +485,7 @@ impl MountBackend for NfsBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::backend::*;
 
     #[test]
     fn test_backend_info() {

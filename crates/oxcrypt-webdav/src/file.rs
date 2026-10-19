@@ -275,7 +275,7 @@ impl DavFile for CryptomatorFile {
                     if buffer.is_dirty() {
                         let dir_id = buffer.dir_id().clone();
                         let filename = buffer.filename().to_string();
-                        let content = buffer.content().to_vec();
+                        let content = buffer.snapshot();
                         let content_len = content.len() as u64;
 
                         debug!(
@@ -295,7 +295,11 @@ impl DavFile for CryptomatorFile {
                         h.stats.finish_write();
                         h.stats.record_write_latency(elapsed);
 
-                        result?;
+                        let path = result?;
+                        h.ops
+                            .sync_encrypted_file(&path, false)
+                            .await
+                            .map_err(write_error_to_fs_error)?;
 
                         // Record encrypted bytes written to vault
                         h.stats.record_encrypted(content_len);
