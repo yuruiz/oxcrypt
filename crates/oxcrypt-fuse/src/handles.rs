@@ -111,6 +111,9 @@ pub struct FuseHandleTable {
     inner: HandleTable<u64, FuseHandle>,
     /// Serializes namespace mutations with opening and committing write handles.
     pub(crate) namespace: parking_lot::Mutex<()>,
+    pub(crate) recovery_root: parking_lot::Mutex<Option<std::path::PathBuf>>,
+    pub(crate) close_reports: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    pub(crate) pending_releases: parking_lot::Mutex<std::collections::BTreeMap<u64, u64>>,
     ready: tokio::sync::Notify,
     wait_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -120,6 +123,11 @@ impl FuseHandleTable {
         Self {
             inner: HandleTable::new_auto_id(),
             namespace: parking_lot::Mutex::new(()),
+            recovery_root: parking_lot::Mutex::new(
+                oxcrypt_core::fs::recovery::default_directory().ok(),
+            ),
+            close_reports: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            pending_releases: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             ready: tokio::sync::Notify::new(),
             wait_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
         }

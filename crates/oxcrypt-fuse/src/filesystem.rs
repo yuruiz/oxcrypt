@@ -465,59 +465,57 @@ impl HazardousHandler {
     }
 
     fn op_release(&self, ino: u64, fh: u64) -> Result<(), i32> {
+        self.wait_pending_writes(ino)?;
         let _namespace = self.handle_table.namespace.lock();
-        let Some(handle) = self.handle_table.remove(&fh) else {
+        if !self.handle_table.contains(&fh) {
             return Ok(());
-        };
-
-        match handle {
-            FuseHandle::Reader(_) | FuseHandle::ReaderLoaned | FuseHandle::ReadBuffer(_) => {
-                self.vault_stats.record_file_close();
-            }
-            FuseHandle::WriteBuffer(buffer) => {
-                if buffer.is_dirty() && !buffer.is_detached() {
-                    let ops = Arc::clone(&self.ops);
-                    let dir_id = buffer.dir_id().clone();
-                    let filename = buffer.filename().to_string();
-                    let content = buffer.into_content();
-                    let content_len = content.len();
-
-                    self.vault_stats.start_write();
-                    let start = Instant::now();
-                    match self.exec_with_timeout(
-                        async move { ops.write_file(&dir_id, &filename, &content).await },
-                        self.write_timeout,
-                    ) {
-                        Ok(Ok(_)) => {
-                            let elapsed = start.elapsed();
-                            self.vault_stats.finish_write();
-                            self.vault_stats.record_write(content_len as u64);
-                            self.vault_stats.record_write_latency(elapsed);
-                            self.vault_stats.record_encrypted(content_len as u64);
-                            self.attr_cache.invalidate(ino);
-                            if let Some(ref shared) = self.scheduler_shared {
-                                shared.invalidate_read_cache_inode(ino);
-                            }
-                            self.vault_stats.record_file_close();
-                        }
-                        Ok(Err(e)) => {
-                            self.vault_stats.finish_write();
-                            self.vault_stats.record_write_latency(start.elapsed());
-                            self.vault_stats.record_file_close();
-                            return Err(crate::error::write_error_to_errno(&e));
-                        }
-                        Err(exec_err) => {
-                            self.vault_stats.finish_write();
-                            self.vault_stats.record_write_latency(start.elapsed());
-                            self.vault_stats.record_file_close();
-                            return Err(exec_err.to_errno());
-                        }
+        }
+        let mut release_error = None;
+        if let Err(errno) = self.flush_handle_unlocked(ino, fh) {
+            let pending = self.handle_table.get_mut(&fh).and_then(|mut handle| {
+                handle.as_write_buffer_mut().map(|buffer| {
+                    (
+                        buffer.dir_id().clone(),
+                        buffer.filename().to_owned(),
+                        buffer.snapshot(),
+                    )
+                })
+            });
+            if let Some((dir, name, content)) = pending {
+                let key = Arc::clone(self.ops.master_key());
+                let recovery_root = self.handle_table.recovery_root.lock().clone();
+                match self.exec_with_timeout(
+                    async move {
+                        let root = recovery_root.ok_or_else(|| {
+                            std::io::Error::other("recovery directory unavailable")
+                        })?;
+                        oxcrypt_core::fs::recovery::save(&root, &key, &dir, &name, &content).await
+                    },
+                    self.write_timeout,
+                ) {
+                    Ok(Ok(path)) => {
+                        let message = format!(
+                            "Write-back failed (errno {errno}); encrypted recovery copy: {}",
+                            path.display()
+                        );
+                        error!("{message}");
+                        self.handle_table.close_reports.lock().push(message);
                     }
-                } else {
-                    self.vault_stats.record_file_close();
+                    failure => {
+                        error!(
+                            ?failure,
+                            fh, "Cannot save recovery copy; retaining pending write handle"
+                        );
+                        self.handle_table.pending_releases.lock().insert(fh, ino);
+                        return Err(errno);
+                    }
                 }
             }
+            release_error = Some(errno);
         }
+        self.handle_table.remove(&fh);
+        self.handle_table.pending_releases.lock().remove(&fh);
+        self.vault_stats.record_file_close();
 
         let deferred = self.open_handle_tracker.remove_handle(ino);
         if !self.open_handle_tracker.has_open_handles(ino) {
@@ -536,7 +534,7 @@ impl HazardousHandler {
             }
         }
 
-        Ok(())
+        release_error.map_or(Ok(()), Err)
     }
 
     fn op_flush(&self, ino: u64, fh: u64) -> Result<(), i32> {
@@ -1180,6 +1178,10 @@ impl CryptomatorFS {
     /// Returns a clone of the vault stats Arc for external access.
     ///
     /// This allows the mount handle to expose stats to the GUI.
+    pub(crate) fn close_reports(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
+        Arc::clone(&self.handle_table.close_reports)
+    }
+
     pub fn stats(&self) -> Arc<VaultStats> {
         Arc::clone(&self.vault_stats)
     }
@@ -2012,6 +2014,36 @@ impl Filesystem for CryptomatorFS {
     ///
     /// # Compliance: ✓ COMPLIANT
     fn destroy(&mut self) {
+        let pending: Vec<_> = self
+            .handle_table
+            .pending_releases
+            .lock()
+            .iter()
+            .map(|(fh, ino)| (*fh, *ino))
+            .collect();
+        if let Some(handler) = &self.hazardous_handler {
+            for (fh, ino) in pending {
+                if let HazardousResult::Empty {
+                    result: Err(errno), ..
+                } = handler.execute(
+                    RequestId(0),
+                    HazardousOp::Release {
+                        ino,
+                        fh,
+                        flags: 0,
+                        lock_owner: None,
+                        flush: false,
+                    },
+                ) && self.handle_table.contains(&fh)
+                {
+                    let message = format!(
+                        "Unmount with unresolved write handle {fh} (errno {errno}); vault and recovery storage both failed"
+                    );
+                    error!("{message}");
+                    self.handle_table.close_reports.lock().push(message);
+                }
+            }
+        }
         info!("FUSE filesystem destroyed");
     }
 
@@ -5403,6 +5435,62 @@ mod tests {
         assert!(fs.read_for_modify(&DirId::root(), "note.md").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), corrupted);
         assert!(fs.handle_table.is_empty());
+    }
+
+    #[test]
+    fn failed_release_preserves_an_authenticated_recovery_copy() {
+        use oxcrypt_mount::testing::TempVault;
+        let vault = TempVault::new();
+        let fs = CryptomatorFS::new(vault.path(), TempVault::password()).unwrap();
+        let recovery_root = tempfile::tempdir().unwrap();
+        *fs.handle_table.recovery_root.lock() = Some(recovery_root.path().to_path_buf());
+        let ops = fs.ops_clone();
+        let write_ops = Arc::clone(&ops);
+        let path = fs
+            .exec(async move { write_ops.write_file(&DirId::root(), "note", b"old").await })
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut buffer = WriteBuffer::new_for_create(DirId::root(), "note".into());
+        buffer.write(0, b"pending data must survive close");
+        let fh = fs.handle_table.insert_auto(FuseHandle::WriteBuffer(buffer));
+        fs.open_handle_tracker.add_handle(42);
+        let handler = fs.hazardous_handler.as_ref().unwrap();
+        assert!(matches!(
+            handler.execute(
+                RequestId(0),
+                HazardousOp::Release {
+                    ino: 42,
+                    fh,
+                    flags: 0,
+                    lock_owner: None,
+                    flush: false
+                }
+            ),
+            HazardousResult::Empty { result: Err(_), .. }
+        ));
+        assert!(!fs.handle_table.contains(&fh));
+        let reports = fs.handle_table.close_reports.lock();
+        let recovery = PathBuf::from(
+            reports[0]
+                .split("encrypted recovery copy: ")
+                .nth(1)
+                .unwrap(),
+        );
+        let output = tempfile::tempdir().unwrap();
+        let dest = output.path().join("recovered");
+        let metadata =
+            oxcrypt_core::fs::recovery::export(&recovery, ops.master_key(), &dest).unwrap();
+        assert_eq!(metadata.filename, "note");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"pending data must survive close"
+        );
+        assert!(oxcrypt_core::fs::recovery::export(&recovery, ops.master_key(), &dest).is_err());
+        let wrong_key = oxcrypt_core::crypto::keys::MasterKey::random().unwrap();
+        assert!(oxcrypt_core::fs::recovery::metadata(&recovery, &wrong_key).is_err());
+        std::fs::remove_dir_all(recovery).unwrap();
     }
 
     fn dirty_handle() -> (FuseHandleTable, u64) {
