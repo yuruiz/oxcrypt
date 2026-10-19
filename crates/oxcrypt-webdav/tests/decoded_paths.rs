@@ -14,8 +14,9 @@ async fn http_and_native_vault_operations_share_unicode_and_literal_percent_name
     let path = temp.path().join("vault");
     VaultCreator::new(&path, "test-password").create().unwrap();
     let ops = Arc::new(VaultOperationsAsync::open(&path, "test-password").unwrap());
-    let server = WebDavServer::start(
-        CryptomatorWebDav::new(Arc::clone(&ops)),
+    let mut server = WebDavServer::start(
+        CryptomatorWebDav::new(Arc::clone(&ops))
+            .with_recovery_directory(temp.path().join("recovery")),
         ServerConfig::default(),
     )
     .await
@@ -72,5 +73,5 @@ async fn http_and_native_vault_operations_share_unicode_and_literal_percent_name
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.bytes().await.unwrap().as_ref(), b"nested");
-    server.stop().await;
+    server.stop().await.unwrap();
 }

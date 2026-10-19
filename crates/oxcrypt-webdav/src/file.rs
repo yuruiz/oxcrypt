@@ -7,10 +7,45 @@ use bytes::Bytes;
 use dav_server::fs::{DavFile, DavMetaData, FsError, FsFuture};
 use oxcrypt_core::{fs::streaming::VaultFileReader, vault::VaultOperationsAsync};
 use oxcrypt_mount::{EditBuffer, HandleTable, VaultStats, moka_cache::SyncTtlCache};
-use std::{io::SeekFrom, sync::Arc};
+use std::{
+    io::SeekFrom,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 type MetadataCache = SyncTtlCache<String, CryptomatorMetaData>;
-pub(crate) type WriteBufferTable = HandleTable<String, Arc<EditBuffer>>;
+pub(crate) type WriteBufferTable = HandleTable<String, Arc<PendingWrite>>;
+
+/// Tracks whether the caller reached its final flush, as well as retained bytes.
+#[derive(Debug)]
+pub(crate) struct PendingWrite {
+    buffer: EditBuffer,
+    commit_requested: AtomicBool,
+}
+
+impl PendingWrite {
+    pub(crate) fn new(buffer: EditBuffer) -> Self {
+        Self {
+            buffer,
+            commit_requested: AtomicBool::new(false),
+        }
+    }
+    pub(crate) fn request_commit(&self) {
+        self.commit_requested.store(true, Ordering::Release);
+    }
+    pub(crate) fn ready_to_commit(&self) -> bool {
+        self.commit_requested.load(Ordering::Acquire)
+    }
+}
+
+impl std::ops::Deref for PendingWrite {
+    type Target = EditBuffer;
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
 
 #[derive(Debug)]
 pub enum CryptomatorFile {
@@ -24,7 +59,7 @@ pub enum CryptomatorFile {
 }
 
 pub struct WriterHandle {
-    buffer: Arc<EditBuffer>,
+    buffer: Arc<PendingWrite>,
     ops: Arc<VaultOperationsAsync>,
     position: u64,
     filename: String,
@@ -56,7 +91,7 @@ impl CryptomatorFile {
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn writer(
-        buffer: Arc<EditBuffer>,
+        buffer: Arc<PendingWrite>,
         filename: String,
         ops: Arc<VaultOperationsAsync>,
         vault_path: String,
@@ -140,6 +175,10 @@ impl DavFile for CryptomatorFile {
             let Self::Writer(handle) = self else {
                 return Err(FsError::Forbidden);
             };
+            handle
+                .buffer
+                .commit_requested
+                .store(false, Ordering::Release);
             let editor = Arc::clone(&handle.buffer);
             let paths = Arc::clone(&handle.path_guards);
             let position = handle.position;
@@ -195,6 +234,7 @@ impl DavFile for CryptomatorFile {
     fn flush(&mut self) -> FsFuture<'_, ()> {
         Box::pin(async move {
             if let Self::Writer(handle) = self {
+                handle.buffer.request_commit();
                 let _guard = handle.flush_lock.lock().await;
                 handle
                     .buffer
