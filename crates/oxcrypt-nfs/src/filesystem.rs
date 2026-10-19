@@ -739,7 +739,7 @@ impl NFSFileSystem for CryptomatorNFS {
             .map_err(|error| vault_error_to_nfsstat(&error))?;
         let size = reader.plaintext_size();
         let data = reader
-            .read_range(offset, count as usize)
+            .read_range(offset, count.min(nfsserve::vfs::MAX_TRANSFER_SIZE) as usize)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         let eof = offset.saturating_add(data.len() as u64) >= size;

@@ -6,14 +6,14 @@ use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{io, net::IpAddr};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tokio::sync::{mpsc, Semaphore};
+use tracing::{debug, info};
 
 /// A NFS Tcp Connection Handler
 pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     listener: TcpListener,
+    request_slots: Arc<Semaphore>,
     port: u16,
     arcfs: Arc<T>,
     mount_signal: Option<mpsc::Sender<bool>>,
@@ -27,62 +27,47 @@ pub fn generate_host_ip(hostnum: u16) -> String {
     )
 }
 
-/// processes an established socket
+/// Cancels socket pumps on disconnect or when the listener shuts down. Already
+/// dispatched filesystem requests retain their budget until they finish.
+struct SocketPumps(Vec<tokio::task::AbortHandle>);
+impl Drop for SocketPumps {
+    fn drop(&mut self) {
+        for task in &self.0 { task.abort(); }
+    }
+}
+
 async fn process_socket(
-    mut socket: tokio::net::TcpStream,
+    socket: tokio::net::TcpStream,
     context: RPCContext,
 ) -> Result<(), anyhow::Error> {
-    let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
-    let _ = socket.set_nodelay(true);
-
-    tokio::spawn(async move {
+    let (mut handler, mut input, mut replies) = SocketMessageHandler::new(&context);
+    socket.set_nodelay(true)?;
+    let (mut reader, mut writer) = socket.into_split();
+    let receiver = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut reader, &mut input).await;
+    });
+    let dispatcher = tokio::spawn(async move {
         loop {
-            if let Err(e) = message_handler.read().await {
-                debug!("Message loop broken due to {:?}", e);
+            if let Err(error) = handler.read().await {
+                debug!("Message loop closed: {:?}", error);
                 break;
             }
         }
     });
-    loop {
-        tokio::select! {
-            _ = socket.readable() => {
-                let mut buf = [0; 128000];
-
-                match socket.try_read(&mut buf) {
-                    Ok(0) => {
-                        return Ok(());
-                    }
-                    Ok(n) => {
-                        let _ = socksend.write_all(&buf[..n]).await;
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!("Message handling closed : {:?}", e);
-                        return Err(e.into());
-                    }
-                }
-
-            },
-            reply = msgrecvchan.recv() => {
-                match reply {
-                    Some(Err(e)) => {
-                        debug!("Message handling closed : {:?}", e);
-                        return Err(e);
-                    }
-                    Some(Ok(msg)) => {
-                        if let Err(e) = write_fragment(&mut socket, &msg).await {
-                            error!("Write error {:?}", e);
-                        }
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!("Unexpected socket context termination"));
-                    }
-                }
-            }
+    let _pumps = SocketPumps(vec![receiver.abort_handle(), dispatcher.abort_handle()]);
+    while let Some((reply, _budget)) = replies.recv().await {
+        let reply = reply?;
+        if reply.len() > crate::limits::MAX_RPC_BYTES {
+            return Err(anyhow::anyhow!("RPC reply exceeds byte budget"));
         }
+        // The request permit stays held through the socket write, bounding
+        // queued replies even when a client stops reading.
+        use tokio::io::AsyncWriteExt;
+        let length = u32::try_from(reply.len())?;
+        writer.write_u32(length | (1 << 31)).await?;
+        writer.write_all(&reply).await?;
     }
+    Ok(())
 }
 
 #[async_trait]
@@ -161,6 +146,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
         };
         Ok(NFSTcpListener {
             listener,
+            request_slots: Arc::new(Semaphore::new(crate::limits::MAX_REQUESTS)),
             port,
             arcfs,
             mount_signal: None,
@@ -189,9 +175,14 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 
     /// Loops forever and never returns handling all incoming connections.
     async fn handle_forever(&self) -> io::Result<()> {
+        let connections = Arc::new(Semaphore::new(crate::limits::MAX_CONNECTIONS));
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
+            let connection = Arc::clone(&connections).acquire_owned().await
+                .map_err(io::Error::other)?;
             let (socket, _) = self.listener.accept().await?;
             let context = RPCContext {
+                request_slots: Arc::clone(&self.request_slots),
                 local_port: self.port,
                 client_addr: socket.peer_addr().unwrap().to_string(),
                 auth: crate::rpc::auth_unix::default(),
@@ -200,9 +191,11 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
             };
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);
-            tokio::spawn(async move {
+            tasks.spawn(async move {
+                let _connection = connection;
                 let _ = process_socket(socket, context).await;
             });
+            while tasks.try_join_next().is_some() {}
         }
     }
 }

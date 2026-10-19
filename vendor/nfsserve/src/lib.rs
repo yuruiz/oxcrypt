@@ -1,6 +1,7 @@
 #![cfg_attr(feature = "strict", deny(warnings))]
 
 mod context;
+mod limits;
 mod rpc;
 mod rpcwire;
 mod write_counter;

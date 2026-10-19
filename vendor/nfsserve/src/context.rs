@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 #[derive(Clone)]
 pub struct RPCContext {
+    pub request_slots: Arc<tokio::sync::Semaphore>,
     pub local_port: u16,
     pub client_addr: String,
     pub auth: crate::rpc::auth_unix,

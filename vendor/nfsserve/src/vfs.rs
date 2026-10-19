@@ -65,6 +65,9 @@ pub enum VFSCapabilities {
     ReadWrite,
 }
 
+/// Maximum advertised data transfer per READ or WRITE.
+pub const MAX_TRANSFER_SIZE: u32 = 1024 * 1024;
+
 /// The basic API to implement to provide an NFS file system
 ///
 /// Opaque FH
@@ -248,10 +251,10 @@ pub trait NFSFileSystem: Sync {
 
         let res = fsinfo3 {
             obj_attributes: dir_attr,
-            rtmax: 1024 * 1024,
+            rtmax: MAX_TRANSFER_SIZE,
             rtpref: 1024 * 124,
             rtmult: 1024 * 1024,
-            wtmax: 1024 * 1024,
+            wtmax: MAX_TRANSFER_SIZE,
             wtpref: 1024 * 1024,
             wtmult: 1024 * 1024,
             dtpref: 1024 * 1024,
