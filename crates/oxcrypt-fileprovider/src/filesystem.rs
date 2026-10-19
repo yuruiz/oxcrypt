@@ -77,7 +77,10 @@ impl FpError {
     /// Get the errno-like error code for this error.
     pub fn error_code(&self) -> i32 {
         match self {
+            #[cfg(unix)]
             FpError::SyncAnchorExpired => libc::ESTALE,
+            #[cfg(not(unix))]
+            FpError::SyncAnchorExpired => libc::EINVAL,
             FpError::NotFound(_) => libc::ENOENT,
             FpError::AlreadyExists(_) => libc::EEXIST,
             FpError::PermissionDenied(_) | FpError::NotAuthenticated => libc::EACCES,
@@ -1600,7 +1603,14 @@ mod tests {
             Err(FpError::SyncAnchorExpired)
         ));
         assert!(fs.changes_since("malformed").result.is_err());
+        #[cfg(unix)]
         assert_eq!(FpError::SyncAnchorExpired.error_code(), libc::ESTALE);
+        #[cfg(not(unix))]
+        assert_eq!(FpError::SyncAnchorExpired.error_code(), libc::EINVAL);
+        assert_eq!(
+            FpError::SyncAnchorExpired.error_domain(),
+            "NSFileProviderErrorSyncAnchorExpired"
+        );
     }
 
     #[test]
