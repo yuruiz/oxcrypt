@@ -3,6 +3,42 @@
 use std::io;
 use std::path::Path;
 
+#[derive(Clone, Copy)]
+pub(crate) enum AtomicWriteMode {
+    CreateNew,
+    #[cfg(feature = "async")]
+    Replace,
+}
+
+/// Publish a fully synced metadata file using an exclusively created temporary
+/// file. Initialization uses no-clobber publication; updates replace atomically.
+pub(crate) fn write_atomic(
+    path: &Path,
+    data: &[u8],
+    root: &Path,
+    mode: AtomicWriteMode,
+) -> io::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing metadata parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(data)?;
+    temporary.as_file().sync_all()?;
+    match mode {
+        #[cfg(feature = "async")]
+        AtomicWriteMode::Replace => {
+            temporary.persist(path).map_err(|error| error.error)?;
+        }
+        AtomicWriteMode::CreateNew => {
+            temporary
+                .persist_noclobber(path)
+                .map_err(|error| error.error)?;
+        }
+    }
+    sync_directory_chain(parent, root)
+}
+
 /// Validate directory components before destructive cleanup. Missing storage is
 /// allowed for lazily allocated empty directories; symlinks are not directories.
 pub(crate) fn directory_exists_checked(directory: &Path, root: &Path) -> io::Result<bool> {
