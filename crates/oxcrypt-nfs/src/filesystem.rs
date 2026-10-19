@@ -494,23 +494,35 @@ impl CryptomatorNFS {
             }
         };
 
-        // Create empty file
-        if let Err(e) = self.ops.write_file(&dir_id, name, &[]).await {
-            self.stats.record_error();
-            self.stats.record_metadata_latency(start.elapsed());
-            return Err(vault_error_to_nfsstat(&e));
+        // UNCHECKED CREATE can address an existing file. Only an explicitly
+        // supplied size may truncate it; omitted attributes preserve contents.
+        let created = self
+            .ops
+            .find_file(&dir_id, name)
+            .await
+            .map_err(|error| vault_error_to_nfsstat(&error))?
+            .is_none();
+        if created {
+            self.ops
+                .write_file(&dir_id, name, &[])
+                .await
+                .map_err(|error| vault_error_to_nfsstat(&error))?;
         }
 
         // Register in inode table
         let child_path = parent_path.join(name);
+        if created && self.inodes.get_id(&child_path).is_some() {
+            for stale in self.inodes.remove_subtree(&child_path) {
+                self.editors.remove(&stale);
+            }
+        }
         let kind = InodeKind::File {
             dir_id: dir_id.clone(),
             name: name.to_string(),
         };
         let id = self.inodes.get_or_insert(&child_path, kind);
-        self.editors.remove(&id);
 
-        // Newly created file, use current time
+        // Apply the requested attributes to the new or existing identity.
         let attr = self.setattr_unlocked(id, attr).await?;
         self.stats.record_metadata_latency(start.elapsed());
         Ok((id, attr))
