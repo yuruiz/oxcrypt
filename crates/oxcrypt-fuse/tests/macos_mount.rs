@@ -131,3 +131,49 @@ fn concurrent_reads_on_one_handle_complete_without_eagain() {
     drop(file);
     mount.unmount().unwrap();
 }
+
+#[test]
+fn open_writer_follows_rename_across_directories_and_remount() {
+    use std::os::unix::fs::FileExt;
+    let vault = TempVault::new();
+    let mount_dir = tempfile::tempdir().unwrap();
+    let backend = FuseBackend::new();
+    let mount = backend
+        .mount(
+            "oxcrypt-rename-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    let root = mount.mountpoint();
+    fs::create_dir(root.join("destination")).unwrap();
+    fs::write(root.join("before"), b"original").unwrap();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("before"))
+        .unwrap();
+    fs::rename(root.join("before"), root.join("middle")).unwrap();
+    file.write_all_at(b"FIRST!!!", 0).unwrap();
+    file.sync_all().unwrap();
+    fs::rename(root.join("middle"), root.join("destination/after")).unwrap();
+    file.write_all_at(b"UPDATED!", 0).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    mount.unmount().unwrap();
+    let mount = backend
+        .mount(
+            "oxcrypt-rename-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    let root = mount.mountpoint();
+    let content = fs::read(root.join("destination/after")).unwrap();
+    let old_exists = root.join("before").exists() || root.join("middle").exists();
+    mount.unmount().unwrap();
+    assert_eq!(content, b"UPDATED!");
+    assert!(!old_exists);
+}

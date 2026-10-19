@@ -367,6 +367,11 @@ impl HazardousHandler {
     }
 
     fn flush_handle(&self, ino: u64, fh: u64) -> Result<Option<PathBuf>, c_int> {
+        let _namespace = self.handle_table.namespace.lock();
+        self.flush_handle_unlocked(ino, fh)
+    }
+
+    fn flush_handle_unlocked(&self, ino: u64, fh: u64) -> Result<Option<PathBuf>, c_int> {
         let ops = Arc::clone(&self.ops);
         let result = persist_write_buffer(&self.handle_table, fh, |dir_id, filename, content| {
             self.exec_with_timeout(
@@ -454,6 +459,7 @@ impl HazardousHandler {
     }
 
     fn op_release(&self, ino: u64, fh: u64) -> Result<(), i32> {
+        let _namespace = self.handle_table.namespace.lock();
         let Some(handle) = self.handle_table.remove(&fh) else {
             return Ok(());
         };
@@ -1376,6 +1382,11 @@ impl CryptomatorFS {
     /// - `Err(errno)` on write failure
     #[allow(dead_code)]
     fn flush_handle(&self, ino: u64, fh: u64) -> Result<Option<PathBuf>, c_int> {
+        let _namespace = self.handle_table.namespace.lock();
+        self.flush_handle_unlocked(ino, fh)
+    }
+
+    fn flush_handle_unlocked(&self, ino: u64, fh: u64) -> Result<Option<PathBuf>, c_int> {
         let ops = self.ops_clone();
         let result = persist_write_buffer(&self.handle_table, fh, |dir_id, filename, content| {
             self.exec_with_timeout(
@@ -2355,6 +2366,7 @@ impl Filesystem for CryptomatorFS {
         let ino = ino.0;
         let flags = flags.0;
         trace!(inode = ino, flags = flags, "open");
+        let _namespace = self.handle_table.namespace.lock();
 
         let Some(entry) = self.inodes.get(ino) else {
             reply.error(fuser::Errno::from_i32(libc::ENOENT));
@@ -3468,6 +3480,7 @@ impl Filesystem for CryptomatorFS {
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
+        let _namespace = self.handle_table.namespace.lock();
         let parent = parent.0;
         let start = Instant::now();
         self.vault_stats.record_metadata_op();
@@ -4301,6 +4314,7 @@ impl Filesystem for CryptomatorFS {
         _flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let _namespace = self.handle_table.namespace.lock();
         let parent = parent.0;
         let newparent = newparent.0;
         let start = Instant::now();
@@ -4361,6 +4375,23 @@ impl Filesystem for CryptomatorFS {
         };
         let dest_parent_path = newparent_entry.path.clone();
         drop(newparent_entry);
+
+        if parent == newparent && name_str == newname_str {
+            reply.ok();
+            return;
+        }
+        // Persist newly created files before moving their backing entry. The
+        // namespace guard prevents a concurrent commit from using the old name.
+        let src_inode = self
+            .inodes
+            .get_inode(&src_parent_path.join(name_str))
+            .unwrap_or(0);
+        for fh in self.handle_table.writer_handles(&src_dir_id, name_str) {
+            if let Err(errno) = self.flush_handle_unlocked(src_inode, fh) {
+                reply.error(fuser::Errno::from_i32(errno));
+                return;
+            }
+        }
 
         // Handle rename flags
         #[cfg(target_os = "linux")]
@@ -4468,6 +4499,12 @@ impl Filesystem for CryptomatorFS {
 
                 match result {
                     Ok(Ok(())) => {
+                        self.handle_table.exchange_writers(
+                            &src_dir_id,
+                            name_str,
+                            &dest_dir_id,
+                            newname_str,
+                        );
                         // Update inode mappings - swap the paths
                         self.inodes
                             .swap_paths(src_inode, dest_inode, &src_path, &dest_path);
@@ -5007,6 +5044,12 @@ impl Filesystem for CryptomatorFS {
 
         match result {
             Ok(Ok(())) => {
+                self.handle_table.relocate_writers(
+                    &src_dir_id,
+                    name_str,
+                    &dest_dir_id,
+                    newname_str,
+                );
                 // Update inode mapping
                 let old_path = src_parent_path.join(name_str);
                 let new_path = dest_parent_path.join(newname_str);

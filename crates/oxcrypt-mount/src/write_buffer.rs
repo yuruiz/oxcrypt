@@ -204,6 +204,12 @@ impl WriteBuffer {
         true
     }
 
+    /// Update the namespace location without changing the buffered file contents.
+    pub fn relocate(&mut self, dir_id: DirId, filename: String) {
+        self.dir_id = dir_id;
+        self.filename = filename;
+    }
+
     /// Get the directory ID.
     #[inline]
     pub fn dir_id(&self) -> &DirId {

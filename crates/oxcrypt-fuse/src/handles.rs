@@ -109,6 +109,8 @@ impl FuseHandle {
 #[derive(Debug)]
 pub struct FuseHandleTable {
     inner: HandleTable<u64, FuseHandle>,
+    /// Serializes namespace mutations with opening and committing write handles.
+    pub(crate) namespace: parking_lot::Mutex<()>,
     ready: tokio::sync::Notify,
     wait_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -117,6 +119,7 @@ impl FuseHandleTable {
     pub fn new_auto_id() -> Self {
         Self {
             inner: HandleTable::new_auto_id(),
+            namespace: parking_lot::Mutex::new(()),
             ready: tokio::sync::Notify::new(),
             wait_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
         }
@@ -129,6 +132,58 @@ impl FuseHandleTable {
     ) -> Self {
         self.inner = self.inner.with_metrics(metrics);
         self
+    }
+
+    pub(crate) fn writer_handles(&self, dir: &DirId, name: &str) -> Vec<u64> {
+        let mut ids = Vec::new();
+        self.inner.retain(|id, handle| {
+            if let Some(buffer) = handle.as_write_buffer_mut()
+                && buffer.dir_id() == dir
+                && buffer.filename() == name
+            {
+                ids.push(*id);
+            }
+            true
+        });
+        ids
+    }
+
+    pub(crate) fn relocate_writers(
+        &self,
+        from_dir: &DirId,
+        from_name: &str,
+        to_dir: &DirId,
+        to_name: &str,
+    ) {
+        self.inner.retain(|_, handle| {
+            if let Some(buffer) = handle.as_write_buffer_mut()
+                && buffer.dir_id() == from_dir
+                && buffer.filename() == from_name
+            {
+                buffer.relocate(to_dir.clone(), to_name.to_owned());
+            }
+            true
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn exchange_writers(
+        &self,
+        a_dir: &DirId,
+        a_name: &str,
+        b_dir: &DirId,
+        b_name: &str,
+    ) {
+        self.inner.retain(|_, handle| {
+            if let Some(buffer) = handle.as_write_buffer_mut() {
+                if buffer.dir_id() == a_dir && buffer.filename() == a_name {
+                    buffer.relocate(b_dir.clone(), b_name.to_owned());
+                } else if buffer.dir_id() == b_dir && buffer.filename() == b_name {
+                    buffer.relocate(a_dir.clone(), a_name.to_owned());
+                }
+            }
+            true
+        });
     }
 
     pub(crate) fn reader_wait_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
