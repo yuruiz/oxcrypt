@@ -32,8 +32,7 @@ fn macfuse_backend_option() -> Option<MountOption> {
 }
 
 /// Mount options that only apply on macOS: the volume name Finder displays,
-/// suppression of the AppleDouble sidecar files macOS writes for extended
-/// attributes (which would otherwise land inside the encrypted vault), a bound on
+/// AppleDouble fallback for extended attributes, a bound on
 /// how long the kernel waits on the daemon before ejecting the volume (which keeps
 /// an unresponsive mount from wedging into a ghost mount), and any macFUSE backend
 /// override. Empty on every other platform.
@@ -41,7 +40,7 @@ fn macfuse_backend_option() -> Option<MountOption> {
 fn platform_mount_options(vault_id: &str) -> Vec<MountOption> {
     let mut options = vec![
         MountOption::CUSTOM(format!("volname={vault_id}")),
-        MountOption::CUSTOM("noappledouble".to_string()),
+        MountOption::CUSTOM("auto_xattr".to_string()),
         MountOption::CUSTOM("daemon_timeout=30".to_string()),
     ];
     options.extend(macfuse_backend_option());
@@ -616,7 +615,17 @@ impl MountBackend for FuseBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::backend::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn finder_metadata_is_not_blocked() {
+        let options = platform_mount_options("test");
+        assert!(options.iter().any(|option| matches!(option,
+            MountOption::CUSTOM(value) if value == "auto_xattr")));
+        assert!(!options.iter().any(|option| matches!(option,
+            MountOption::CUSTOM(value) if value == "noappledouble" || value == "noapplexattr")));
+    }
 
     #[test]
     fn fuse_backend_id() {

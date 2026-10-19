@@ -272,14 +272,13 @@ fn mount_and_wait(cli: &Cli, fs: CryptomatorFS) -> Result<()> {
     // crash is recoverable with `fusermount -u`, leaked plaintext is not.
     // macFUSE's libfuse3 rejects `auto_unmount` outright in any case.
 
-    // On macOS, set the volume name shown in Finder, suppress the AppleDouble
-    // sidecar files the OS would otherwise write into the encrypted vault, and
-    // bound how long the kernel waits on this process so that losing it leaves a
+    // On macOS, set the Finder volume name and allow encrypted AppleDouble
+    // sidecars for Finder metadata. Bound kernel waits so that losing the process leaves a
     // mountpoint that reports errors rather than one that hangs.
     #[cfg(target_os = "macos")]
     {
         options.push(fuser::MountOption::CUSTOM(format!("volname={vault_name}")));
-        options.push(fuser::MountOption::CUSTOM("noappledouble".to_string()));
+        options.push(fuser::MountOption::CUSTOM("auto_xattr".to_string()));
         options.push(fuser::MountOption::CUSTOM(format!(
             "daemon_timeout={}",
             cli.daemon_timeout

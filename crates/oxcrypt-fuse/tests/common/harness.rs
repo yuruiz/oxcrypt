@@ -101,11 +101,8 @@ impl TestMount {
             .map_err(|e| format!("Failed to create CryptomatorFS: {e}"))?;
 
         let mut options = vec![MountOption::FSName("cryptomator-test".to_string())];
-
-        // On macOS, prevent AppleDouble files (._*) from being created.
-        // macOS creates these when xattr operations fail with ENOTSUP.
         #[cfg(target_os = "macos")]
-        options.push(MountOption::CUSTOM("noappledouble".to_string()));
+        options.push(MountOption::CUSTOM("auto_xattr".to_string()));
 
         let mut config = fuser::Config::default();
         config.mount_options = options;
