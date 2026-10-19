@@ -8,7 +8,7 @@ spec.loader.exec_module(timing)
 
 class TimingResultsTests(unittest.TestCase):
     def report(self, first="+1.20", second="-2.3"):
-        return f"bench timing_hmac_verify ... : max t = {first}, max tau = 0.1\nbench timing_key_unwrap ... : max t = {second}, max tau = 0.1\n"
+        return f"bench timing_hmac_verify ... : n == +0.100M, max t = {first}, max tau = 0.1\nbench timing_key_unwrap ... : n == +0.100M, max t = {second}, max tau = 0.1\n"
 
     def test_valid_results(self):
         self.assertEqual(timing.check(self.report()), [])
@@ -17,6 +17,9 @@ class TimingResultsTests(unittest.TestCase):
         seeds = "bench timing_hmac_verify seeded with 0x1234\nbench timing_key_unwrap seeded with 0xabcd\n"
         self.assertEqual(timing.check(seeds + self.report()), [])
         self.assertTrue(timing.check(seeds))
+
+    def test_cropped_population_is_not_total_sample_count(self):
+        self.assertEqual(timing.check(self.report().replace("+0.100M", "+0.001M")), [])
 
     def test_missing_result(self):
         self.assertTrue(timing.check(self.report().splitlines()[0]))
