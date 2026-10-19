@@ -4076,12 +4076,14 @@ impl VaultOperationsAsync {
 
         // If shortened, write the name.c9s file
         if is_shortened {
-            fs::write(symlink_dir.join("name.c9s"), &encrypted_name).await?;
+            self.safe_write(&symlink_dir.join("name.c9s"), encrypted_name.as_bytes())
+                .await?;
         }
 
         // Encrypt and write the symlink target
         let encrypted_target = encrypt_symlink_target(target, &self.master_key)?;
-        fs::write(symlink_dir.join("symlink.c9r"), &encrypted_target).await?;
+        self.safe_write(&symlink_dir.join("symlink.c9r"), &encrypted_target)
+            .await?;
 
         info!("Symlink created successfully");
         Ok(())
@@ -4133,6 +4135,7 @@ impl VaultOperationsAsync {
                 .unwrap_or(false)
         {
             fs::remove_dir_all(&symlink_dir).await?;
+            crate::fs::durability::sync_directory_chain_async(&dir_path, self.vault_path()).await?;
             info!("Symlink deleted successfully");
             return Ok(());
         }
@@ -4147,6 +4150,7 @@ impl VaultOperationsAsync {
                 .unwrap_or(false)
         {
             fs::remove_dir_all(&shortened_dir).await?;
+            crate::fs::durability::sync_directory_chain_async(&dir_path, self.vault_path()).await?;
             info!("Shortened symlink deleted successfully");
             return Ok(());
         }
@@ -4254,7 +4258,8 @@ impl VaultOperationsAsync {
             let shortened_hash = create_c9s_filename(&new_encrypted_name);
             let new_dir = dir_path.join(format!("{shortened_hash}.c9s"));
             fs::create_dir(&new_dir).await?;
-            fs::write(new_dir.join("name.c9s"), &new_encrypted_name).await?;
+            self.safe_write(&new_dir.join("name.c9s"), new_encrypted_name.as_bytes())
+                .await?;
             new_dir
         } else {
             let new_dir = dir_path.join(format!("{new_encrypted_name}.c9r"));
@@ -4263,7 +4268,8 @@ impl VaultOperationsAsync {
         };
 
         // Write symlink target
-        fs::write(new_symlink_dir.join("symlink.c9r"), &symlink_data).await?;
+        self.safe_write(&new_symlink_dir.join("symlink.c9r"), &symlink_data)
+            .await?;
 
         // Delete source
         fs::remove_dir_all(&source_info.encrypted_path)
@@ -4276,6 +4282,9 @@ impl VaultOperationsAsync {
             })?;
 
         info!("Symlink renamed successfully");
+        if let Some(parent) = source_info.encrypted_path.parent() {
+            crate::fs::durability::sync_directory_chain_async(parent, self.vault_path()).await?;
+        }
         Ok(())
     }
 
@@ -4393,7 +4402,8 @@ impl VaultOperationsAsync {
             let shortened_hash = create_c9s_filename(&new_encrypted_name);
             let new_dir = dest_storage_path.join(format!("{shortened_hash}.c9s"));
             fs::create_dir(&new_dir).await?;
-            fs::write(new_dir.join("name.c9s"), &new_encrypted_name).await?;
+            self.safe_write(&new_dir.join("name.c9s"), new_encrypted_name.as_bytes())
+                .await?;
             new_dir
         } else {
             let new_dir = dest_storage_path.join(format!("{new_encrypted_name}.c9r"));
@@ -4402,7 +4412,8 @@ impl VaultOperationsAsync {
         };
 
         // Write symlink target
-        fs::write(new_symlink_dir.join("symlink.c9r"), &symlink_data).await?;
+        self.safe_write(&new_symlink_dir.join("symlink.c9r"), &symlink_data)
+            .await?;
 
         // Delete source
         fs::remove_dir_all(&source_info.encrypted_path)
@@ -4415,6 +4426,9 @@ impl VaultOperationsAsync {
             })?;
 
         info!("Symlink moved and renamed successfully");
+        if let Some(parent) = source_info.encrypted_path.parent() {
+            crate::fs::durability::sync_directory_chain_async(parent, self.vault_path()).await?;
+        }
         Ok(())
     }
 
