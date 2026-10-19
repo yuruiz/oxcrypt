@@ -578,10 +578,12 @@ impl NFSFileSystem for CryptomatorNFS {
                             return Err(vault_error_to_nfsstat(&e));
                         }
                     };
-                    // Safe cast: size from NFS protocol is u64, converted to usize for take()
-                    #[allow(clippy::cast_possible_truncation)]
-                    let truncated: Vec<u8> =
-                        decrypted.content.into_iter().take(size as usize).collect();
+                    let size = usize::try_from(size).map_err(|_| nfsstat3::NFS3ERR_FBIG)?;
+                    let mut truncated = decrypted.content;
+                    truncated
+                        .try_reserve(size.saturating_sub(truncated.len()))
+                        .map_err(|_| nfsstat3::NFS3ERR_FBIG)?;
+                    truncated.resize(size, 0);
                     if let Err(e) = self.ops.write_file(&dir_id, &name, &truncated).await {
                         self.stats.record_metadata_latency(start.elapsed());
                         self.stats.record_error();
@@ -1553,6 +1555,39 @@ impl NFSFileSystem for ArcNfs {
 mod writeback_tests {
     use crate::filesystem::*;
     use oxcrypt_mount::testing::TempVault;
+
+    #[tokio::test]
+    async fn resize_preserves_prefix_and_zero_fills_extension() {
+        let vault = TempVault::new();
+        let ops =
+            Arc::new(VaultOperationsAsync::open(vault.path(), TempVault::password()).unwrap());
+        let filesystem = CryptomatorNFS::new(Arc::clone(&ops));
+        let (id, _) = filesystem
+            .create(ROOT_FILEID, &b"note"[..].into(), sattr3::default())
+            .await
+            .unwrap();
+        filesystem.write(id, 0, b"abc").await.unwrap();
+        for size in [4096, 2, 64, 0] {
+            let attr = filesystem
+                .setattr(
+                    id,
+                    sattr3 {
+                        size: set_size3::size(size),
+                        ..sattr3::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let data = ops.read_file(&DirId::root(), "note").await.unwrap().content;
+            assert_eq!(attr.size, size);
+            assert_eq!(data.len() as u64, size);
+            if size > 0 {
+                assert_eq!(&data[..2], b"ab");
+                let prefix = if size == 4096 { 3 } else { 2 };
+                assert!(data[prefix..].iter().all(|byte| *byte == 0));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_flush_keeps_the_buffer() {
