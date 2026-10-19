@@ -59,6 +59,8 @@ jobs:
   security_audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
@@ -69,12 +71,19 @@ jobs:
           tool: cargo-deny
       - name: Run cargo-deny
         run: cargo deny check
-      - name: Run cargo-audit
-        uses: rustsec/audit-check@v2
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # Triaged advisories - justifications live in deny.toml [advisories.ignore]
-          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0194,RUSTSEC-2026-0195
+          tool: cargo-audit
+      - name: Run cargo-audit
+        # The job's exit status reports the result without creating another check
+        # via the GitHub API, so read-only push/fork tokens work too.
+        # Triaged advisories - justifications live in deny.toml [advisories.ignore]
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195
 
   # =============================================================================
   # MSRV Check - Verify minimum supported Rust version
