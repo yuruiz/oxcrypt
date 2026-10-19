@@ -34,7 +34,7 @@ mod crypto_tests {
         }
 
         #[test]
-        fn test_content_integrity(content in prop::collection::vec(any::<u8>(), 0..100_000)) {
+        fn test_content_integrity(content in prop::collection::vec(any::<u8>(), 1..100_000)) {
             let content_key = generate_content_key();
             let mut header_nonce = [0u8; 12];
             rand::rng().fill_bytes(&mut header_nonce);
@@ -67,7 +67,7 @@ mod crypto_tests {
 
 
         #[test]
-        fn test_different_keys(content in prop::collection::vec(any::<u8>(), 0..100_000)) {
+        fn test_different_keys(content in prop::collection::vec(any::<u8>(), 1..100_000)) {
             let content_key1 = generate_content_key();
             let content_key2 = generate_content_key();
             let mut header_nonce = [0u8; 12];
@@ -78,7 +78,7 @@ mod crypto_tests {
         }
 
         #[test]
-        fn test_different_nonces(content in prop::collection::vec(any::<u8>(), 0..100_000)) {
+        fn test_different_nonces(content in prop::collection::vec(any::<u8>(), 1..100_000)) {
             let content_key = generate_content_key();
             let mut header_nonce1 = [0u8; 12];
             rand::rng().fill_bytes(&mut header_nonce1);
@@ -96,6 +96,7 @@ mod crypto_tests {
         let mut header_nonce = [0u8; 12];
         rand::rng().fill_bytes(&mut header_nonce);
         let encrypted_content = encrypt_file_content(&[], &content_key, &header_nonce).unwrap();
+        assert!(encrypted_content.is_empty());
         let decrypted_content =
             decrypt_file_content(&encrypted_content, &content_key, &header_nonce).unwrap();
         assert_eq!(decrypted_content, Vec::<u8>::new());
@@ -396,6 +397,7 @@ mod ctrmac_tests {
         let mac_key = generate_mac_key();
 
         let encrypted = encrypt_content(&[], &content_key, &header_nonce, &mac_key).unwrap();
+        assert!(encrypted.is_empty());
         let decrypted = decrypt_content(
             &encrypted,
             &content_key,

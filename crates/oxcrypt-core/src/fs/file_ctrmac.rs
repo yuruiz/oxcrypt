@@ -384,12 +384,8 @@ pub fn encrypt_content(
 
     let mut encrypted_content = Vec::new();
 
-    // Always process at least one chunk (even for empty content)
-    let chunks: Vec<&[u8]> = if content.is_empty() {
-        vec![&[]]
-    } else {
-        content.chunks(PAYLOAD_SIZE).collect()
-    };
+    // Empty files contain only their authenticated header.
+    let chunks: Vec<&[u8]> = content.chunks(PAYLOAD_SIZE).collect();
 
     for (chunk_number, chunk) in chunks.iter().enumerate() {
         // Generate random nonce for this chunk

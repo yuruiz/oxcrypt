@@ -1457,8 +1457,8 @@ impl VaultFileWriter {
 
     /// Finish writing and atomically rename to the destination.
     ///
-    /// Flushes any remaining buffered data, writes a final chunk (even if
-    /// empty for authentication), and renames the temp file to the destination.
+    /// Flushes remaining plaintext chunks and renames the temporary file.
+    /// An empty file consists only of its authenticated header.
     #[instrument(level = "debug", skip(self), fields(dest = %self.dest_path.display()))]
     pub async fn finish(mut self) -> Result<PathBuf, StreamingError> {
         let context = StreamingContext::new()
@@ -1472,9 +1472,8 @@ impl VaultFileWriter {
             });
         }
 
-        // Flush remaining buffer (may be empty)
-        if !self.buffer.is_empty() || self.chunks_written == 0 {
-            // Always write at least one chunk for authentication
+        // No content chunk is emitted for an empty plaintext file.
+        if !self.buffer.is_empty() {
             let remaining: Vec<u8> = self.buffer.drain(..).collect();
             self.write_chunk(&remaining).await?;
         }

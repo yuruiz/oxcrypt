@@ -35,7 +35,7 @@ VaultStructure {
         FileInfo {
             path: "empty.txt",
             name: "empty.txt",
-            size: 96,
+            size: 68,
             content_hash: "d41d8cd98f00b204e9800998ecf8427e",
         },
         FileInfo {
