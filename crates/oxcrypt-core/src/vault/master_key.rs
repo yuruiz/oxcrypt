@@ -28,6 +28,26 @@ const DEFAULT_SCRYPT_COST_PARAM_LOG2: u8 = 15; // 2^15 = 32768
 const DEFAULT_SCRYPT_BLOCK_SIZE: u32 = 8;
 const DEFAULT_SCRYPT_PARALLELIZATION: u32 = 1;
 
+/// Resource policy applied before allocating scrypt's working buffers.
+///
+/// The default permits up to 256 MiB per derivation, including the ROMix,
+/// input and scratch buffers. Standard Cryptomator parameters use about 32 MiB.
+/// Applications can explicitly raise this budget for trusted high-cost vaults;
+/// the stored cryptographic parameters are never reduced to fit the budget.
+#[derive(Debug, Clone, Copy)]
+pub struct ScryptLimits {
+    /// Maximum combined bytes for the scrypt working buffers (p = 1).
+    pub max_memory_bytes: u64,
+}
+
+impl Default for ScryptLimits {
+    fn default() -> Self {
+        Self {
+            max_memory_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 /// Fast scrypt cost parameter for testing (N = 2^10 = 1024).
 ///
 /// This is ~32x faster than the default and should ONLY be used for testing.
@@ -174,23 +194,19 @@ impl MasterKeyFile {
         passphrase: &str,
         pepper: &[u8],
     ) -> Result<SecretBox<[u8; 32]>, CryptoError> {
-        // We use NFC normalization on the passphrase (matching Java implementation)
+        self.derive_key_with_pepper_and_limits(passphrase, pepper, ScryptLimits::default())
+    }
+
+    /// Derive a KEK with an explicit resource budget for trusted vault metadata.
+    /// Invalid or over-budget parameters fail before any scrypt allocation.
+    pub fn derive_key_with_pepper_and_limits(
+        &self,
+        passphrase: &str,
+        pepper: &[u8],
+        limits: ScryptLimits,
+    ) -> Result<SecretBox<[u8; 32]>, CryptoError> {
+        let scrypt_params = self.checked_scrypt_params(limits)?;
         let normalized_passphrase = Zeroizing::new(passphrase.nfc().collect::<String>());
-
-        // Define the scrypt parameters
-        // log_2() returns u32, but scrypt needs u8. For i32 values, log2 result is always < 32 (fits in u8)
-        #[allow(clippy::cast_possible_truncation)]
-        let log2_n: u8 = log_2(self.scrypt_cost_param) as u8;
-        // Safe cast: scrypt_block_size is always positive (at least 8), fits comfortably in u32
-        #[allow(clippy::cast_sign_loss)]
-        let r: u32 = self.scrypt_block_size as u32;
-        let p: u32 = DEFAULT_SCRYPT_PARALLELIZATION;
-
-        let scrypt_params = scrypt::Params::new(log2_n, r, p, 32).map_err(|e| {
-            CryptoError::InvalidScryptParams(format!(
-                "Invalid scrypt parameters (N=2^{log2_n}, r={r}, p={p}): {e}"
-            ))
-        })?;
 
         // Combine salt and pepper as in Java: saltAndPepper = salt || pepper
         let mut salt_and_pepper =
@@ -211,6 +227,36 @@ impl MasterKeyFile {
         .map_err(|e| CryptoError::KeyDerivationFailed(format!("Scrypt derivation failed: {e}")))?;
 
         Ok(SecretBox::new(Box::new(*kek)))
+    }
+
+    fn checked_scrypt_params(&self, limits: ScryptLimits) -> Result<scrypt::Params, CryptoError> {
+        let invalid = |reason: &str| CryptoError::InvalidScryptParams(reason.to_owned());
+        let n = u32::try_from(self.scrypt_cost_param)
+            .map_err(|_| invalid("N must be a positive power of two greater than one"))?;
+        if n < 2 || !n.is_power_of_two() {
+            return Err(invalid(
+                "N must be a positive power of two greater than one",
+            ));
+        }
+        let r = u32::try_from(self.scrypt_block_size).map_err(|_| invalid("r must be positive"))?;
+        if r == 0 {
+            return Err(invalid("r must be positive"));
+        }
+        // RustCrypto scrypt allocates V = 128*r*N, B = 128*r*p and T = 128*r.
+        // Cryptomator fixes p=1, so this also bounds N*r computational work.
+        let memory = u64::from(r)
+            .checked_mul(128)
+            .and_then(|bytes| bytes.checked_mul(u64::from(n) + 2))
+            .ok_or_else(|| invalid("scrypt memory requirement overflow"))?;
+        if memory > limits.max_memory_bytes {
+            return Err(CryptoError::InvalidScryptParams(format!(
+                "scrypt requires {memory} working bytes, exceeding the {} byte budget",
+                limits.max_memory_bytes
+            )));
+        }
+        let log_n = u8::try_from(n.ilog2()).map_err(|_| invalid("N exponent is out of range"))?;
+        scrypt::Params::new(log_n, r, DEFAULT_SCRYPT_PARALLELIZATION, 32)
+            .map_err(|error| CryptoError::InvalidScryptParams(error.to_string()))
     }
 
     /// Unlock the vault with a passphrase, deriving the KEK and unwrapping the master keys.
@@ -249,7 +295,18 @@ impl MasterKeyFile {
         passphrase: &str,
         pepper: &[u8],
     ) -> Result<MasterKey, CryptoError> {
-        let kek = self.derive_key_with_pepper(passphrase, pepper)?;
+        self.unlock_with_pepper_and_limits(passphrase, pepper, ScryptLimits::default())
+    }
+
+    /// Unlock with an explicit resource budget. Raise the default only after
+    /// deciding that the vault's requested scrypt cost is appropriate.
+    pub fn unlock_with_pepper_and_limits(
+        &self,
+        passphrase: &str,
+        pepper: &[u8],
+        limits: ScryptLimits,
+    ) -> Result<MasterKey, CryptoError> {
+        let kek = self.derive_key_with_pepper_and_limits(passphrase, pepper, limits)?;
         self.unlock_with_kek(&kek)
     }
 
@@ -297,20 +354,6 @@ impl MasterKeyFile {
         // Java uses big-endian encoding for the version integer
         hmac::verify(&key, &self.version.to_be_bytes(), &self.version_mac)
             .map_err(|_| CryptoError::HmacVerificationFailed)
-    }
-}
-
-// From: https://users.rust-lang.org/t/logarithm-of-integers/8506/5
-const fn num_bits<T>() -> usize {
-    size_of::<T>() * 8
-}
-
-fn log_2(x: i32) -> u32 {
-    assert!(x > 0);
-    // Safe cast: num_bits::<i32>() is always 32 at compile time, fits in u32
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        num_bits::<i32>() as u32 - x.leading_zeros() - 1
     }
 }
 
