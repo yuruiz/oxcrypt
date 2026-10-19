@@ -959,8 +959,8 @@ fn test_encrypted_to_plaintext_size_invalid_cases() {
     // Size less than header is invalid
     assert_eq!(encrypted_to_plaintext_size((HEADER_SIZE - 1) as u64), None);
 
-    // Exactly header size (no content) is invalid
-    assert_eq!(encrypted_to_plaintext_size(HEADER_SIZE as u64), None);
+    // An authenticated header alone is a canonical empty file
+    assert_eq!(encrypted_to_plaintext_size(HEADER_SIZE as u64), Some(0));
 
     // Header + partial overhead (less than minimum chunk) is invalid
     assert_eq!(

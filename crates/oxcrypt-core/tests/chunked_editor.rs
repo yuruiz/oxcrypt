@@ -233,3 +233,47 @@ fn overlapping_reads_reuse_authenticated_chunks_and_writes_invalidate_them() {
     editor.resize(8).unwrap();
     assert_eq!(editor.read(0, 8).unwrap(), b"ed\0\0\0\0\0\0");
 }
+
+#[tokio::test]
+async fn canonical_header_only_empty_files_remain_readable() {
+    use oxcrypt_core::fs::streaming::{VaultFileReader, VaultFileReaderSync};
+    for cipher in [CipherCombo::SivGcm, CipherCombo::SivCtrMac] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty");
+        let key = MasterKey::random().unwrap();
+        fs::write(&path, cipher.encrypt_file(b"original", &key).unwrap()).unwrap();
+        let mut editor = VaultFileEditor::open(&path, &key, cipher, directory.path()).unwrap();
+        editor.resize(0).unwrap();
+        editor.commit(&path, directory.path()).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            if cipher == CipherCombo::SivGcm {
+                68
+            } else {
+                88
+            }
+        );
+        assert_eq!(
+            VaultFileReaderSync::open_with_cipher(&path, &key, cipher)
+                .unwrap()
+                .plaintext_size(),
+            0
+        );
+        assert_eq!(
+            VaultFileReader::open_with_cipher(&path, &key, cipher)
+                .await
+                .unwrap()
+                .plaintext_size(),
+            0
+        );
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&path, bytes).unwrap();
+        assert!(VaultFileReaderSync::open_with_cipher(&path, &key, cipher).is_err());
+        assert!(
+            VaultFileReader::open_with_cipher(&path, &key, cipher)
+                .await
+                .is_err()
+        );
+    }
+}
