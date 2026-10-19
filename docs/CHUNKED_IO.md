@@ -9,3 +9,5 @@ Ciphertext stages use APFS cloning or Linux reflinks where available, with bound
 NFS acknowledges each successful WRITE only after commit, matching nfsserve's FILE_SYNC reply. WebDAV streams GET ranges and keeps PUT stages until flush succeeds. WebDAV COPY clones/copies ciphertext without re-encryption; copied content is authenticated when read. Failed FUSE closes can archive staged ciphertext using the recovery workflow.
 
 The fixed authentication chunk size imposes a minimum amplification for small edits. Extending a file across a gap must create authenticated zero chunks. A filesystem without clone support still copies untouched ciphertext for atomic publication. Cloud providers may upload whole files even when local I/O uses COW. File Provider/FSKit and CLI import/export paths have separate I/O lifecycles; this change does not certify those native backends for production use.
+
+Native macOS attribute operations use AppleDouble sidecars capped at 64 MiB and have a separate metadata I/O path. The one-chunk plaintext bound above applies to ordinary mounted file handles, not to an entire attribute request.
