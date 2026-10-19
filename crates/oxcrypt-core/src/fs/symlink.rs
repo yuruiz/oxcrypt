@@ -91,8 +91,8 @@ impl fmt::Display for SymlinkContext {
         if let Some(ref name) = self.name {
             parts.push(format!("symlink '{name}'"));
         } else if let Some(ref enc_name) = self.encrypted_name {
-            let display_name = if enc_name.len() > 40 {
-                format!("{}...", &enc_name[..37])
+            let display_name = if enc_name.chars().nth(40).is_some() {
+                format!("{enc_name:.37}...")
             } else {
                 enc_name.clone()
             };
@@ -102,8 +102,8 @@ impl fmt::Display for SymlinkContext {
         if let Some(ref dir_id) = self.dir_id {
             let display_id = if dir_id.is_empty() {
                 "<root>".to_string()
-            } else if dir_id.len() > 12 {
-                format!("{}...", &dir_id[..12])
+            } else if dir_id.chars().nth(12).is_some() {
+                format!("{dir_id:.12}...")
             } else {
                 dir_id.clone()
             };
@@ -111,8 +111,8 @@ impl fmt::Display for SymlinkContext {
         }
 
         if let Some(ref target) = self.target {
-            let display_target = if target.len() > 40 {
-                format!("{}...", &target[..37])
+            let display_target = if target.chars().nth(40).is_some() {
+                format!("{target:.37}...")
             } else {
                 target.clone()
             };
