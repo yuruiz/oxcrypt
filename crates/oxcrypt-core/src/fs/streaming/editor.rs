@@ -606,65 +606,6 @@ pub(crate) fn clone_ciphertext(source: &mut File, destination: &Path) -> io::Res
     Ok((target, copied))
 }
 
-impl crate::fs::streaming::ChunkDecryptor {
-    fn encrypt_chunk(&self, chunk: u64, plaintext: &[u8]) -> io::Result<Vec<u8>> {
-        use aes_gcm::{
-            Aes256Gcm, KeyInit,
-            aead::{Aead, Payload},
-        };
-        use rand::RngCore;
-        match self.cipher_combo {
-            CipherCombo::SivGcm => {
-                let mut nonce = [0u8; 12];
-                rand::rng().fill_bytes(&mut nonce);
-                let mut aad = Vec::with_capacity(20);
-                aad.extend_from_slice(&chunk.to_be_bytes());
-                aad.extend_from_slice(&self.header_nonce);
-                let cipher = Aes256Gcm::new_from_slice(&*self.content_key)
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                let data = cipher
-                    .encrypt(
-                        aes_gcm::Nonce::from_slice(&nonce),
-                        Payload {
-                            msg: plaintext,
-                            aad: &aad,
-                        },
-                    )
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                let mut encrypted = nonce.to_vec();
-                encrypted.extend_from_slice(&data);
-                Ok(encrypted)
-            }
-            CipherCombo::SivCtrMac => {
-                use aes::cipher::{KeyIvInit, StreamCipher};
-                let mut nonce = [0u8; 16];
-                rand::rng().fill_bytes(&mut nonce);
-                let mut data = plaintext.to_vec();
-                let mut cipher = crate::fs::streaming::Aes256Ctr::new(
-                    (&*self.content_key).into(),
-                    (&nonce).into(),
-                );
-                cipher.apply_keystream(&mut data);
-                let mac = self
-                    .mac_key
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("missing MAC key"))?;
-                let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, mac);
-                let mut context = ring::hmac::Context::with_key(&key);
-                context.update(&self.header_nonce);
-                context.update(&chunk.to_be_bytes());
-                context.update(&nonce);
-                context.update(&data);
-                let tag = context.sign();
-                let mut encrypted = nonce.to_vec();
-                encrypted.extend_from_slice(&data);
-                encrypted.extend_from_slice(tag.as_ref());
-                Ok(encrypted)
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod recovery_tests {
     use crate::fs::streaming::editor::*;

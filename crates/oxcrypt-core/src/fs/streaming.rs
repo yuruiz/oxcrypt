@@ -349,9 +349,9 @@ impl StreamingError {
 // Chunk Decryption Logic (Shared)
 // ============================================================================
 
-/// Handles decryption of individual file chunks.
+/// Handles authenticated cryptography for individual file chunks.
 ///
-/// Shared logic for both synchronous and asynchronous readers.
+/// Shared logic for readers, streaming writers, and random-access editors.
 #[derive(Debug)]
 struct ChunkDecryptor {
     content_key: Zeroizing<[u8; 32]>,
@@ -499,6 +499,62 @@ impl ChunkDecryptor {
         );
 
         Ok(plaintext)
+    }
+}
+
+impl ChunkDecryptor {
+    fn encrypt_chunk(&self, chunk: u64, plaintext: &[u8]) -> io::Result<Vec<u8>> {
+        use aes_gcm::{
+            Aes256Gcm, KeyInit,
+            aead::{Aead, Payload},
+        };
+        use rand::RngCore;
+        match self.cipher_combo {
+            CipherCombo::SivGcm => {
+                let mut nonce = [0u8; 12];
+                rand::rng().fill_bytes(&mut nonce);
+                let mut aad = Vec::with_capacity(20);
+                aad.extend_from_slice(&chunk.to_be_bytes());
+                aad.extend_from_slice(&self.header_nonce);
+                let cipher = Aes256Gcm::new_from_slice(&*self.content_key)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let data = cipher
+                    .encrypt(
+                        Nonce::from_slice(&nonce),
+                        Payload {
+                            msg: plaintext,
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let mut encrypted = nonce.to_vec();
+                encrypted.extend_from_slice(&data);
+                Ok(encrypted)
+            }
+            CipherCombo::SivCtrMac => {
+                use aes::cipher::{KeyIvInit, StreamCipher};
+                let mut nonce = [0u8; 16];
+                rand::rng().fill_bytes(&mut nonce);
+                let mut data = plaintext.to_vec();
+                let mut cipher = Aes256Ctr::new((&*self.content_key).into(), (&nonce).into());
+                cipher.apply_keystream(&mut data);
+                let mac = self
+                    .mac_key
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("missing MAC key"))?;
+                let key = hmac::Key::new(hmac::HMAC_SHA256, mac);
+                let mut context = hmac::Context::with_key(&key);
+                context.update(&self.header_nonce);
+                context.update(&chunk.to_be_bytes());
+                context.update(&nonce);
+                context.update(&data);
+                let tag = context.sign();
+                let mut encrypted = nonce.to_vec();
+                encrypted.extend_from_slice(&data);
+                encrypted.extend_from_slice(tag.as_ref());
+                Ok(encrypted)
+            }
+        }
     }
 }
 
@@ -1227,10 +1283,8 @@ pub struct VaultFileWriter {
     temp_path: PathBuf,
     /// Final destination path
     dest_path: PathBuf,
-    /// Content encryption key for this file
-    content_key: Zeroizing<[u8; 32]>,
-    /// Header nonce, used as part of chunk AAD
-    header_nonce: [u8; HEADER_NONCE_SIZE],
+    /// Chunk cryptography configured by the file header and vault cipher.
+    crypto: ChunkDecryptor,
     /// Buffer for accumulating data before chunk encryption
     buffer: Zeroizing<Vec<u8>>,
     /// Number of chunks written so far
@@ -1263,14 +1317,23 @@ impl std::fmt::Debug for VaultFileWriter {
 }
 
 impl VaultFileWriter {
-    /// Create a new encrypted file for streaming writes.
+    /// Create a new GCM-encrypted file for streaming writes.
     ///
-    /// Generates a random content key and header nonce. The file header is
-    /// written on the first `write()` call.
+    /// Generates a random content key and writes its authenticated header immediately.
+    /// Use `create_with_cipher` when the vault specifies another cipher combination.
     #[instrument(level = "debug", skip(master_key), fields(dest = %dest.as_ref().display()))]
     pub async fn create(
         dest: impl AsRef<Path>,
         master_key: &MasterKey,
+    ) -> Result<Self, StreamingError> {
+        Self::create_with_cipher(dest, master_key, CipherCombo::SivGcm).await
+    }
+
+    /// Create a streaming writer using the vault's configured cipher combination.
+    pub async fn create_with_cipher(
+        dest: impl AsRef<Path>,
+        master_key: &MasterKey,
+        cipher_combo: CipherCombo,
     ) -> Result<Self, StreamingError> {
         let dest = dest.as_ref();
         let context = StreamingContext::new()
@@ -1281,9 +1344,7 @@ impl VaultFileWriter {
 
         // Generate random content key and header nonce
         let mut content_key = Zeroizing::new([0u8; 32]);
-        let mut header_nonce = [0u8; HEADER_NONCE_SIZE];
         rand::rng().fill_bytes(&mut *content_key);
-        rand::rng().fill_bytes(&mut header_nonce);
 
         // Create temp file in same directory for atomic rename
         let parent = dest.parent().ok_or_else(|| StreamingError::InvalidPath {
@@ -1296,25 +1357,52 @@ impl VaultFileWriter {
         let temp_name = format!(".tmp_{}", hex::encode(temp_suffix));
         let temp_path = parent.join(&temp_name);
 
-        let temp_file = File::create(&temp_path)
-            .await
-            .map_err(|e| StreamingError::io_with_context(e, context.clone()))?;
-
-        // Encrypt and write header
         let file_context = FileContext::new().with_path(dest);
-        let encrypted_header =
-            super::file::encrypt_file_header_with_context(&content_key, master_key, &file_context)?;
-
-        // Update header_nonce from the actual encrypted header
-        let mut actual_header_nonce = [0u8; HEADER_NONCE_SIZE];
-        actual_header_nonce.copy_from_slice(&encrypted_header[..HEADER_NONCE_SIZE]);
+        let (encrypted_header, nonce_size, mac_key) = match cipher_combo {
+            CipherCombo::SivGcm => (
+                crate::fs::file::encrypt_file_header_with_context(
+                    &content_key,
+                    master_key,
+                    &file_context,
+                )?,
+                HEADER_NONCE_SIZE,
+                None,
+            ),
+            CipherCombo::SivCtrMac => (
+                file_ctrmac::encrypt_header(&content_key, master_key).map_err(|error| {
+                    FileEncryptionError::HeaderEncryption {
+                        reason: error.to_string(),
+                        context: file_context.clone(),
+                    }
+                })?,
+                CTRMAC_HEADER_NONCE_SIZE,
+                Some(
+                    master_key
+                        .with_mac_key(|key| Zeroizing::new(key.to_vec()))
+                        .map_err(FileEncryptionError::from)?,
+                ),
+            ),
+        };
+        let crypto = ChunkDecryptor::new(
+            content_key,
+            encrypted_header[..nonce_size].to_vec(),
+            mac_key,
+            cipher_combo,
+            dest.to_owned(),
+        );
+        // Never truncate an existing temporary name if a collision occurs.
+        let temp_file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await
+            .map_err(|error| StreamingError::io_with_context(error, context.clone()))?;
 
         let mut writer = Self {
             temp_file,
             temp_path,
             dest_path: dest.to_path_buf(),
-            content_key,
-            header_nonce: actual_header_nonce,
+            crypto,
             buffer: Zeroizing::new(Vec::with_capacity(CHUNK_PLAINTEXT_SIZE)),
             chunks_written: 0,
             header_written: false,
@@ -1409,41 +1497,18 @@ impl VaultFileWriter {
             .with_chunk(chunk_num)
             .with_operation("write_chunk");
 
-        // Generate random chunk nonce
-        let mut chunk_nonce = [0u8; CHUNK_NONCE_SIZE];
-        rand::rng().fill_bytes(&mut chunk_nonce);
-
-        // Build AAD: chunk_number (8 bytes BE) || header_nonce (12 bytes)
-        // Use stack array to avoid heap allocation per chunk
-        let mut aad = [0u8; 8 + HEADER_NONCE_SIZE];
-        aad[..8].copy_from_slice(&chunk_num.to_be_bytes());
-        aad[8..].copy_from_slice(&self.header_nonce);
-
-        let key = Key::<Aes256Gcm>::from_slice(&*self.content_key);
-        let cipher = Aes256Gcm::new(key);
-
-        let payload = Payload {
-            msg: plaintext,
-            aad: &aad,
-        };
-
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&chunk_nonce), payload)
-            .map_err(|e| StreamingError::ChunkEncryptionFailed {
+        let ciphertext = self
+            .crypto
+            .encrypt_chunk(chunk_num, plaintext)
+            .map_err(|error| StreamingError::ChunkEncryptionFailed {
                 chunk_number: chunk_num,
-                reason: e.to_string(),
+                reason: error.to_string(),
                 context: context.clone(),
             })?;
-
-        // Write nonce + ciphertext (ciphertext includes tag)
-        self.temp_file
-            .write_all(&chunk_nonce)
-            .await
-            .map_err(|e| StreamingError::io_with_context(e, context.clone()))?;
         self.temp_file
             .write_all(&ciphertext)
             .await
-            .map_err(|e| StreamingError::io_with_context(e, context))?;
+            .map_err(|error| StreamingError::io_with_context(error, context))?;
 
         self.chunks_written += 1;
         trace!(
