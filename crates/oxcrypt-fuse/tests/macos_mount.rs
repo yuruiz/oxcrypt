@@ -9,6 +9,45 @@ use std::{
 };
 
 #[test]
+fn explicit_mtime_after_writes_survives_fsync_and_remount() {
+    let vault = TempVault::new();
+    let mount_dir = tempfile::tempdir().unwrap();
+    let backend = FuseBackend::new();
+    let mount = backend
+        .mount(
+            "oxcrypt-time-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    let requested = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946684800);
+    let names = ["short".to_owned(), "x".repeat(200)];
+    for name in &names {
+        let mut file = fs::File::create(mount.mountpoint().join(name)).unwrap();
+        file.write_all(b"preserved data").unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(requested))
+            .unwrap();
+        file.sync_all().unwrap();
+    }
+    mount.unmount().unwrap();
+    let mount = backend
+        .mount(
+            "oxcrypt-time-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    for name in &names {
+        let path = mount.mountpoint().join(name);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), requested);
+        assert_eq!(fs::read(path).unwrap(), b"preserved data");
+    }
+    mount.unmount().unwrap();
+}
+
+#[test]
 fn edits_atomic_save_and_long_names_survive_remount() {
     let vault = TempVault::new();
     let mount_dir = tempfile::tempdir().unwrap();
