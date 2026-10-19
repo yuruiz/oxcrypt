@@ -223,10 +223,8 @@ impl MountHandle for WebDavMountHandle {
         }
 
         // Stop the server
-        if let (Some(server), Some(runtime)) = (self.server.take(), self.runtime.take()) {
-            runtime.block_on(async {
-                server.stop().await;
-            });
+        if let (Some(mut server), Some(runtime)) = (self.server.take(), self.runtime.take()) {
+            runtime.block_on(server.stop()).map_err(MountError::Mount)?;
         }
 
         info!("WebDAV unmounted successfully");
@@ -244,10 +242,8 @@ impl MountHandle for WebDavMountHandle {
         }
 
         // Stop the server
-        if let (Some(server), Some(runtime)) = (self.server.take(), self.runtime.take()) {
-            runtime.block_on(async {
-                server.stop().await;
-            });
+        if let (Some(mut server), Some(runtime)) = (self.server.take(), self.runtime.take()) {
+            runtime.block_on(server.stop()).map_err(MountError::Mount)?;
         }
 
         info!("WebDAV force unmounted successfully");

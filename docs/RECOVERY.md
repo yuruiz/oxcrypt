@@ -1,6 +1,8 @@
-# Recovering a failed FUSE close
+# Recovering failed write-back
 
 If a final write-back fails, OxCrypt retains the write handle until either the vault commit succeeds or an encrypted emergency copy is saved. Recovery copies use the vault master key; neither their contents nor their intended filename is stored in plaintext.
+
+WebDAV shutdown stops accepting connections and waits for active requests. It retries completed uploads whose write-back failed. Uploads interrupted before their final flush are archived without replacing the original file. Shutdown reports recovery locations and unresolved errors; API callers can retry `server.stop().await` while retaining the server. Await explicit shutdown before dropping its Tokio runtime, since asynchronous cleanup requested by `Drop` requires that runtime to remain alive.
 
 Copies live in persistent per-user storage: `~/Library/Application Support/oxcrypt/recovery` on macOS, `$XDG_STATE_HOME/oxcrypt/recovery` (default `~/.local/state/oxcrypt/recovery`) on Linux, or `%LOCALAPPDATA%/oxcrypt/recovery` on Windows. The mount log and unmount error include the exact recovery directory.
 

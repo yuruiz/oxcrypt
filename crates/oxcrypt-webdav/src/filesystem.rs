@@ -5,7 +5,7 @@
 
 use crate::dir_entry::CryptomatorDirEntry;
 use crate::error::{WebDavError, vault_error_to_fs_error, write_error_to_fs_error};
-use crate::file::{CryptomatorFile, WriteBufferTable};
+use crate::file::{CryptomatorFile, PendingWrite, WriteBufferTable};
 use crate::metadata::CryptomatorMetaData;
 use dav_server::davpath::DavPath;
 use dav_server::fs::{
@@ -17,7 +17,7 @@ use oxcrypt_core::vault::DirId;
 use oxcrypt_core::vault::operations_async::VaultOperationsAsync;
 use oxcrypt_mount::moka_cache::SyncTtlCache;
 use oxcrypt_mount::{EditBuffer, HandleTable, VaultStats};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace};
@@ -51,6 +51,7 @@ pub struct CryptomatorWebDav {
     write_buffers: Arc<WriteBufferTable>,
     flush_lock: Arc<tokio::sync::Mutex<()>>,
     path_locks: Arc<crate::path_locks::PathLocks>,
+    recovery_root: Option<PathBuf>,
     /// Metadata cache to reduce vault operations.
     metadata_cache: Arc<MetadataCache>,
     /// Path resolution cache (vault_path -> DirId).
@@ -78,9 +79,93 @@ impl CryptomatorWebDav {
             write_buffers: Arc::new(HandleTable::new()),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             path_locks: Arc::new(crate::path_locks::PathLocks::default()),
+            recovery_root: None,
             metadata_cache: Arc::new(metadata_cache),
             path_cache: Arc::new(path_cache),
             stats,
+        }
+    }
+
+    /// Select persistent storage for encrypted copies of writes that cannot be committed.
+    #[must_use]
+    pub fn with_recovery_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.recovery_root = Some(directory.into());
+        self
+    }
+
+    /// Drain retained edits after request workers have stopped. Interrupted uploads
+    /// are archived without replacing their original files. Failed archives remain
+    /// in the table so an explicit shutdown can be retried.
+    pub(crate) async fn finish_writeback(&self, interrupted: bool) -> std::io::Result<()> {
+        let _paths = self
+            .path_locks
+            .acquire(&[("", true)])
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let _flush = self.flush_lock.lock().await;
+        let mut pending = Vec::new();
+        self.write_buffers.retain(|path, editor| {
+            pending.push((path.clone(), Arc::clone(editor)));
+            true
+        });
+        let mut errors = Vec::new();
+        for (path, editor) in pending {
+            let commit = if !editor.is_dirty() {
+                Ok(())
+            } else if interrupted || !editor.ready_to_commit() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "upload did not complete before shutdown",
+                ))
+            } else {
+                editor
+                    .commit(&self.ops)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            };
+            let mut safe_to_release = commit.is_ok();
+            if let Err(failure) = commit {
+                let root = self
+                    .recovery_root
+                    .clone()
+                    .map_or_else(oxcrypt_core::fs::recovery::default_directory, Ok);
+                let recovery = match root {
+                    Ok(root) => {
+                        let buffer = Arc::clone(&editor);
+                        let ops = Arc::clone(&self.ops);
+                        tokio::task::spawn_blocking(move || buffer.recover(&ops, &root))
+                            .await
+                            .map_err(std::io::Error::other)
+                            .and_then(|result| result)
+                    }
+                    Err(error) => Err(error),
+                };
+                match recovery {
+                    Ok(saved) => {
+                        safe_to_release = true;
+                        errors.push(format!(
+                            "{path}: {failure}; encrypted recovery: {}",
+                            saved.display()
+                        ));
+                    }
+                    Err(error) => errors.push(format!(
+                        "{path}: {failure}; recovery failed: {error}; edits retained for retry"
+                    )),
+                }
+            }
+            if safe_to_release {
+                self.write_buffers
+                    .retain(|key, current| key != &path || !Arc::ptr_eq(current, &editor));
+                self.metadata_cache.invalidate(&path);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let report = errors.join("; ");
+            tracing::error!(%report, "WebDAV writeback requires recovery or retry");
+            Err(std::io::Error::other(report))
         }
     }
 
@@ -269,6 +354,7 @@ impl CryptomatorWebDav {
         else {
             return Ok(());
         };
+        buffer.request_commit();
         buffer
             .commit(&self.ops)
             .await
@@ -535,7 +621,7 @@ impl DavFileSystem for CryptomatorWebDav {
                 // A previous request may have dropped after a failed flush.
                 // Persist that data before opening a replacement writer.
                 self.flush_write_buffer_unlocked(&vault_path).await?;
-                let editor = Arc::new(
+                let editor = Arc::new(PendingWrite::new(
                     EditBuffer::open(
                         &self.ops,
                         dir_id,
@@ -545,7 +631,7 @@ impl DavFileSystem for CryptomatorWebDav {
                     )
                     .await
                     .map_err(write_error_to_fs_error)?,
-                );
+                ));
                 self.write_buffers
                     .insert(vault_path.clone(), Arc::clone(&editor));
                 let mut file = CryptomatorFile::writer(
@@ -1012,11 +1098,11 @@ mod tests {
             .write_file(&DirId::root(), "note", b"old")
             .await
             .unwrap();
-        let buffer = Arc::new(
+        let buffer = Arc::new(PendingWrite::new(
             EditBuffer::open(&ops, DirId::root(), "note".into(), false, true)
                 .await
                 .unwrap(),
-        );
+        ));
         buffer.write(0, b"pending").unwrap();
         let backup = path.with_extension("fault-backup");
         std::fs::rename(&path, &backup).unwrap();

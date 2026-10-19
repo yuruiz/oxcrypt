@@ -83,7 +83,8 @@ impl TestServer {
 
         // Open as WebDAV filesystem
         let fs = CryptomatorWebDav::open(&vault_path, TEST_PASSWORD)
-            .expect("Failed to open vault for WebDAV");
+            .expect("Failed to open vault for WebDAV")
+            .with_recovery_directory(temp_dir.path().join("recovery"));
 
         // Start server on random port
         let config = ServerConfig::default();
@@ -351,8 +352,8 @@ impl TestServer {
     }
 
     /// Stop the server explicitly (otherwise happens on drop).
-    pub async fn stop(self) {
-        self.server.stop().await;
+    pub async fn stop(mut self) {
+        self.server.stop().await.unwrap();
     }
 }
 

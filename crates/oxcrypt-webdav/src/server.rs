@@ -12,9 +12,14 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the WebDAV server.
@@ -24,6 +29,8 @@ pub struct ServerConfig {
     pub port: u16,
     /// Bind address.
     pub bind_address: std::net::IpAddr,
+    /// Time allowed for active requests and pending writeback during shutdown.
+    pub shutdown_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -31,6 +38,7 @@ impl Default for ServerConfig {
         Self {
             port: 0, // Auto-assign
             bind_address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            shutdown_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -42,7 +50,10 @@ pub struct WebDavServer {
     /// Shutdown signal sender.
     shutdown_tx: Option<oneshot::Sender<()>>,
     /// Server task handle.
-    server_handle: Option<tokio::task::JoinHandle<()>>,
+    server_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    filesystem: CryptomatorWebDav,
+    shutdown_timeout: Duration,
+    interrupted: Arc<AtomicBool>,
 }
 
 impl WebDavServer {
@@ -59,7 +70,7 @@ impl WebDavServer {
 
         // Build the DAV handler with FakeLs (minimal lock support for macOS/Windows)
         let dav_handler = DavHandler::builder()
-            .filesystem(Box::new(fs))
+            .filesystem(Box::new(fs.clone()))
             .locksystem(FakeLs::new())
             .build_handler();
 
@@ -68,15 +79,33 @@ impl WebDavServer {
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-        // Spawn the server task
+        let writeback = fs.clone();
+        let shutdown_timeout = config.shutdown_timeout;
+        let interrupted = Arc::new(AtomicBool::new(true));
+        let interruption = Arc::clone(&interrupted);
         let server_handle = tokio::spawn(async move {
-            tokio::select! {
-                () = run_server(listener, dav_handler) => {
-                    debug!("Server loop ended");
-                }
-                _ = shutdown_rx => {
-                    info!("Received shutdown signal");
-                }
+            let interrupted =
+                run_server(listener, dav_handler, shutdown_rx, shutdown_timeout).await;
+            interruption.store(interrupted, Ordering::Release);
+            let result =
+                tokio::time::timeout(shutdown_timeout, writeback.finish_writeback(interrupted))
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "pending WebDAV writes did not drain; retry shutdown",
+                        )
+                    })?;
+            if interrupted {
+                let detail = result
+                    .err()
+                    .map_or_else(String::new, |error| format!(": {error}"));
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    format!("WebDAV requests were interrupted{detail}"),
+                ))
+            } else {
+                result
             }
         });
 
@@ -84,6 +113,9 @@ impl WebDavServer {
             addr: actual_addr,
             shutdown_tx: Some(shutdown_tx),
             server_handle: Some(server_handle),
+            filesystem: fs,
+            shutdown_timeout,
+            interrupted,
         })
     }
 
@@ -92,25 +124,44 @@ impl WebDavServer {
         format!("http://{}", self.addr)
     }
 
-    /// Stop the server.
-    pub async fn stop(mut self) {
+    /// Stop accepting requests, drain active requests, then persist or recover edits.
+    /// On failure the server retains unarchived buffers and this method can be retried.
+    pub async fn stop(&mut self) -> std::io::Result<()> {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        if let Some(handle) = self.server_handle.take() {
-            let _ = handle.await;
+        let result = if let Some(handle) = self.server_handle.as_mut() {
+            let completion = handle.await;
+            self.server_handle.take();
+            completion.map_err(std::io::Error::other)?
+        } else {
+            tokio::time::timeout(
+                self.shutdown_timeout,
+                self.filesystem
+                    .finish_writeback(self.interrupted.load(Ordering::Acquire)),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "pending WebDAV writes did not drain; retry shutdown",
+                )
+            })?
+        };
+        if result.is_ok() {
+            info!("WebDAV server stopped");
         }
-        info!("WebDAV server stopped");
+        result
     }
 
-    /// Stop the server synchronously (for use in Drop).
+    /// Request graceful cleanup on drop while the owning runtime remains alive.
+    /// Call stop().await to observe durability failures before dropping the runtime.
     fn stop_sync(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        if let Some(handle) = self.server_handle.take() {
-            handle.abort();
-        }
+        // Dropping a JoinHandle detaches the cleanup task instead of aborting it.
+        self.server_handle.take();
     }
 }
 
@@ -158,42 +209,72 @@ fn validate_copy_move_paths<B>(request: &Request<B>) -> Result<(), hyper::Status
     Ok(())
 }
 
-async fn run_server(listener: TcpListener, handler: Arc<DavHandler>) {
+async fn run_server(
+    listener: TcpListener,
+    handler: Arc<DavHandler>,
+    mut shutdown: oneshot::Receiver<()>,
+    timeout: Duration,
+) -> bool {
+    let mut connections = JoinSet::new();
+    let (drain, drain_rx) = watch::channel(false);
+    let mut interrupted = false;
     loop {
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                let handler = handler.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
+        tokio::select! {
+            _ = &mut shutdown => break,
+            result = connections.join_next(), if !connections.is_empty() => {
+                if result.is_some_and(|result| result.is_err()) { interrupted = true; }
+            },
+            accepted = listener.accept() => {
+                let (stream, peer_addr) = match accepted {
+                    Ok(connection) => connection,
+                    Err(error) => { error!(%error, "Failed to accept connection"); continue; }
+                };
+                let handler = Arc::clone(&handler);
+                let mut drain_rx = drain_rx.clone();
+                connections.spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
-                        let handler = handler.clone();
+                        let handler = Arc::clone(&handler);
                         async move {
                             if let Err(status) = validate_copy_move_paths(&req) {
-                                let mut response =
-                                    hyper::Response::new(dav_server::body::Body::empty());
+                                let mut response = hyper::Response::new(dav_server::body::Body::empty());
                                 *response.status_mut() = status;
                                 return Ok::<_, Infallible>(response);
                             }
-                            let resp = handler.handle(req).await;
-                            Ok::<_, Infallible>(resp)
+                            Ok::<_, Infallible>(handler.handle(req).await)
                         }
                     });
-
-                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection(io, service)
-                        .await
-                    {
-                        // Note: With auto protocol negotiation, we can't easily detect
-                        // incomplete messages. Log all connection errors at warn level.
-                        warn!(peer = %peer_addr, error = %e, "HTTP connection error");
-                    }
+                    let builder = auto::Builder::new(TokioExecutor::new());
+                    let connection = builder.serve_connection(TokioIo::new(stream), service);
+                    tokio::pin!(connection);
+                    let result = tokio::select! {
+                        result = &mut connection => result,
+                        _ = drain_rx.changed() => {
+                            connection.as_mut().graceful_shutdown();
+                            connection.await
+                        }
+                    };
+                    if let Err(error) = result { warn!(peer = %peer_addr, %error, "HTTP connection ended"); }
                 });
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to accept connection");
             }
         }
     }
+    drop(listener);
+    let _ = drain.send(true);
+    if tokio::time::timeout(timeout, async {
+        while let Some(result) = connections.join_next().await {
+            if result.is_err() {
+                interrupted = true;
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        interrupted = true;
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
+    interrupted
 }
 
 /// Timeout for auto-mount operations (15 seconds).
