@@ -1356,12 +1356,26 @@ impl VaultFileWriter {
             });
         }
 
-        self.buffer.extend_from_slice(data);
-
-        // Flush complete chunks
-        while self.buffer.len() >= CHUNK_PLAINTEXT_SIZE {
-            let chunk_data: Vec<u8> = self.buffer.drain(..CHUNK_PLAINTEXT_SIZE).collect();
-            self.write_chunk(&chunk_data).await?;
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            if self.buffer.is_empty() && remaining.len() >= CHUNK_PLAINTEXT_SIZE {
+                // Encrypt full chunks directly from the caller's slice.
+                self.write_chunk(&remaining[..CHUNK_PLAINTEXT_SIZE]).await?;
+                remaining = &remaining[CHUNK_PLAINTEXT_SIZE..];
+            } else {
+                let count = remaining
+                    .len()
+                    .min(CHUNK_PLAINTEXT_SIZE - self.buffer.len());
+                self.buffer.extend_from_slice(&remaining[..count]);
+                remaining = &remaining[count..];
+                if self.buffer.len() == CHUNK_PLAINTEXT_SIZE {
+                    let chunk = std::mem::replace(
+                        &mut self.buffer,
+                        Zeroizing::new(Vec::with_capacity(CHUNK_PLAINTEXT_SIZE)),
+                    );
+                    self.write_chunk(&chunk).await?;
+                }
+            }
         }
 
         Ok(data.len())
@@ -1438,8 +1452,6 @@ impl VaultFileWriter {
             });
         }
 
-        self.finished = true;
-
         // Flush remaining buffer (may be empty)
         if !self.buffer.is_empty() || self.chunks_written == 0 {
             // Always write at least one chunk for authentication
@@ -1468,6 +1480,7 @@ impl VaultFileWriter {
             "File finished and renamed"
         );
 
+        self.finished = true;
         Ok(self.dest_path.clone())
     }
 
@@ -1513,7 +1526,21 @@ impl Drop for VaultFileWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::fs::streaming::*;
+
+    #[tokio::test]
+    async fn writer_buffer_stays_bounded_for_large_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = MasterKey::new([3; 32], [4; 32]).unwrap();
+        let mut writer = VaultFileWriter::create(dir.path().join("large.c9r"), &key)
+            .await
+            .unwrap();
+        writer.write(&[1; 17]).await.unwrap();
+        writer.write(&vec![2; 4 * 1024 * 1024 + 7]).await.unwrap();
+        assert!(writer.buffer.capacity() <= CHUNK_PLAINTEXT_SIZE);
+        assert!(writer.buffer.len() < CHUNK_PLAINTEXT_SIZE);
+        writer.finish().await.unwrap();
+    }
 
     #[test]
     fn test_plaintext_to_chunk_number() {
