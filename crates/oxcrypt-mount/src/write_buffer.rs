@@ -39,6 +39,8 @@ pub struct WriteBuffer {
     content: Vec<u8>,
     /// Whether the buffer has been modified since creation.
     dirty: bool,
+    /// Changes whenever buffered data changes.
+    revision: u64,
     /// Directory ID containing the file (for write-back).
     dir_id: DirId,
     /// Filename (for write-back).
@@ -57,6 +59,7 @@ impl WriteBuffer {
         Self {
             content: existing_content,
             dirty: false,
+            revision: 0,
             dir_id,
             filename,
         }
@@ -80,6 +83,7 @@ impl WriteBuffer {
     pub fn with_capacity(dir_id: DirId, filename: String, capacity: usize) -> Self {
         Self {
             content: Vec::with_capacity(capacity),
+            revision: 0,
             dirty: true, // New file needs to be written
             dir_id,
             filename,
@@ -93,6 +97,7 @@ impl WriteBuffer {
     pub fn new_for_create(dir_id: DirId, filename: String) -> Self {
         Self {
             content: Vec::new(),
+            revision: 0,
             dirty: true, // Must write to create the file
             dir_id,
             filename,
@@ -130,6 +135,7 @@ impl WriteBuffer {
         // Copy data into buffer
         self.content[offset..end].copy_from_slice(data);
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
 
         data.len()
     }
@@ -160,6 +166,7 @@ impl WriteBuffer {
         if size != self.content.len() {
             self.content.resize(size, 0);
             self.dirty = true;
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -179,6 +186,20 @@ impl WriteBuffer {
     #[inline]
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Identify the data captured by a flush without clearing pending writes.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// A completed flush must not mark a newer write as persisted.
+    pub fn mark_clean_if_revision(&mut self, revision: u64) -> bool {
+        if self.revision != revision {
+            return false;
+        }
+        self.mark_clean();
+        true
     }
 
     /// Get the directory ID.
@@ -216,6 +237,7 @@ impl WriteBuffer {
     #[inline]
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Take the content for flushing, leaving the buffer temporarily empty.
@@ -236,6 +258,7 @@ impl WriteBuffer {
     #[inline]
     pub fn restore_content(&mut self, content: Vec<u8>) {
         self.content = content;
+        self.revision = self.revision.wrapping_add(1);
         self.dirty = false;
     }
 }
