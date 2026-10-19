@@ -35,8 +35,7 @@ pub enum FuseHandle {
     /// is temporarily moved out of the handle. This variant marks that the
     /// reader is being used and will be returned after the read completes.
     ///
-    /// If a second read arrives while the first is in flight, it should
-    /// return EAGAIN to indicate the resource is temporarily busy.
+    /// Additional reads wait asynchronously for the same reader to be returned.
     ReaderLoaned,
 
     /// Read-only handle with in-memory buffer (legacy).
@@ -105,9 +104,83 @@ impl FuseHandle {
 
 /// Thread-safe table for FUSE file handles.
 ///
-/// This is a type alias for [`HandleTable`] with auto-incrementing u64 keys.
+/// Wraps [`HandleTable`] with auto-incrementing keys and reader readiness notifications.
 /// Maps 64-bit handle IDs to their underlying file operations.
-pub type FuseHandleTable = HandleTable<u64, FuseHandle>;
+#[derive(Debug)]
+pub struct FuseHandleTable {
+    inner: HandleTable<u64, FuseHandle>,
+    ready: tokio::sync::Notify,
+    wait_slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl FuseHandleTable {
+    pub fn new_auto_id() -> Self {
+        Self {
+            inner: HandleTable::new_auto_id(),
+            ready: tokio::sync::Notify::new(),
+            wait_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
+        }
+    }
+
+    #[must_use]
+    pub fn with_metrics(
+        mut self,
+        metrics: std::sync::Arc<oxcrypt_core::vault::lock_metrics::LockMetrics>,
+    ) -> Self {
+        self.inner = self.inner.with_metrics(metrics);
+        self
+    }
+
+    pub(crate) fn reader_wait_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        std::sync::Arc::clone(&self.wait_slots)
+            .try_acquire_owned()
+            .ok()
+    }
+
+    pub(crate) fn wake_readers(&self) {
+        self.ready.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_reader(
+        &self,
+        fh: u64,
+    ) -> Result<Box<oxcrypt_core::fs::streaming::VaultFileReaderSync>, i32> {
+        loop {
+            let notified = self.ready.notified();
+            tokio::pin!(notified);
+            // Register before inspecting the state to avoid a missed completion.
+            notified.as_mut().enable();
+            {
+                let mut handle = self.inner.get_mut(&fh).ok_or(libc::EBADF)?;
+                match &*handle {
+                    FuseHandle::Reader(_) => {
+                        if let FuseHandle::Reader(reader) =
+                            std::mem::replace(&mut *handle, FuseHandle::ReaderLoaned)
+                        {
+                            return Ok(reader);
+                        }
+                    }
+                    FuseHandle::ReaderLoaned => {}
+                    _ => return Err(libc::EBADF),
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Default for FuseHandleTable {
+    fn default() -> Self {
+        Self::new_auto_id()
+    }
+}
+
+impl std::ops::Deref for FuseHandleTable {
+    type Target = HandleTable<u64, FuseHandle>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 /// Information about a file marked for deletion.
 #[derive(Debug, Clone)]
@@ -204,13 +277,13 @@ pub trait FuseHandleTableExt {
 
 impl FuseHandleTableExt for FuseHandleTable {
     fn new_fuse() -> Self {
-        HandleTable::new_auto_id()
+        Self::new_auto_id()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::handles::*;
     use oxcrypt_core::vault::DirId;
 
     fn test_dir_id() -> DirId {
@@ -219,6 +292,45 @@ mod tests {
 
     // Note: WriteBuffer tests are in oxcrypt-mount.
     // These tests focus on FUSE-specific handle behavior.
+
+    #[tokio::test]
+    async fn deferred_read_wakes_when_reader_is_returned() {
+        let vault = oxcrypt_mount::testing::TempVault::new();
+        let ops = oxcrypt_core::vault::VaultOperations::open(
+            vault.path(),
+            oxcrypt_mount::testing::TempVault::password(),
+        )
+        .unwrap();
+        ops.write_file(&DirId::root(), "note", b"contents").unwrap();
+        let reader = ops.open_file_reader_sync(&DirId::root(), "note").unwrap();
+        let table = FuseHandleTable::new_auto_id();
+        let fh = table.insert_auto(FuseHandle::ReaderLoaned);
+        let future = table.wait_for_reader(fh);
+        tokio::pin!(future);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), future.as_mut())
+                .await
+                .is_err()
+        );
+        *table.get_mut(&fh).unwrap() = FuseHandle::Reader(Box::new(reader));
+        table.wake_readers();
+        let mut reader = tokio::time::timeout(std::time::Duration::from_secs(1), future)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.read_range(0, 8).unwrap(), b"contents");
+    }
+
+    #[tokio::test]
+    async fn deferred_read_rejects_missing_or_nonreader_handles() {
+        let table = FuseHandleTable::new_auto_id();
+        assert!(matches!(table.wait_for_reader(999).await, Err(libc::EBADF)));
+        let fh = table.insert_auto(FuseHandle::WriteBuffer(WriteBuffer::new_for_create(
+            DirId::root(),
+            "note".into(),
+        )));
+        assert!(matches!(table.wait_for_reader(fh).await, Err(libc::EBADF)));
+    }
 
     #[test]
     fn test_fuse_handle_type_checks() {

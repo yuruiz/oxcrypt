@@ -842,7 +842,7 @@ pub struct CryptomatorFS {
     ///
     /// Created during construction but started in `init()`. Handles reads
     /// asynchronously to prevent blocking FUSE callback threads on slow I/O.
-    scheduler: Option<FuseScheduler>,
+    scheduler: Option<Arc<FuseScheduler>>,
     /// Shared scheduler state for hazardous operations.
     #[allow(dead_code)]
     scheduler_shared: Option<SchedulerShared>,
@@ -1159,7 +1159,7 @@ impl CryptomatorFS {
             notifier: Arc::new(OnceLock::new()),
             buffer_sizes,
             sync_ops_cache: std::sync::Mutex::new(None),
-            scheduler: Some(scheduler),
+            scheduler: Some(Arc::new(scheduler)),
             scheduler_shared,
             hazardous_handler,
         })
@@ -1212,7 +1212,9 @@ impl CryptomatorFS {
     /// snapshots even after the filesystem is moved into a FUSE session.
     /// Returns `None` if the scheduler hasn't been initialized.
     pub fn scheduler_stats_collector(&self) -> Option<crate::scheduler::SchedulerStatsCollector> {
-        self.scheduler.as_ref().map(FuseScheduler::stats_collector)
+        self.scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.stats_collector())
     }
 
     /// Creates a new CryptomatorFS with custom UID/GID.
@@ -1948,6 +1950,9 @@ impl Filesystem for CryptomatorFS {
 
         // Start the scheduler for async request handling
         if let Some(ref mut scheduler) = self.scheduler {
+            let scheduler = Arc::get_mut(scheduler).ok_or_else(|| {
+                std::io::Error::other("scheduler shared before filesystem initialization")
+            })?;
             scheduler.start();
             info!("FUSE scheduler started");
         }
@@ -2484,18 +2489,49 @@ impl Filesystem for CryptomatorFS {
                     }
                     Err(e) => {
                         // Enqueue failed - scheduler already replied with error.
-                        // The reader is consumed, handle remains in ReaderLoaned state.
-                        // Subsequent reads will get EAGAIN until file is closed/reopened.
+                        // Rejected work restores its reader where available; late
+                        // completions wake any deferred reads.
                         self.vault_stats.finish_read();
                         warn!(error = %e, fh, "Failed to enqueue read request (scheduler replied with error)");
                     }
                 }
             }
             FuseHandle::ReaderLoaned => {
-                // Reader is currently being used by the scheduler for a previous read
-                // Return EAGAIN to tell the kernel to retry
-                trace!(fh, "Read while reader is loaned, returning EAGAIN");
-                reply.error(fuser::Errno::from_i32(libc::EAGAIN));
+                drop(handle);
+                let Some(permit) = self.handle_table.reader_wait_slot() else {
+                    reply.error(fuser::Errno::from_i32(libc::EAGAIN));
+                    return;
+                };
+                let Some(scheduler) = self.scheduler.as_ref().map(Arc::clone) else {
+                    reply.error(fuser::Errno::from_i32(libc::EIO));
+                    return;
+                };
+                let handles = Arc::clone(&self.handle_table);
+                let stats = Arc::clone(&self.vault_stats);
+                let timeout = self.default_timeout;
+                self.handle.spawn(async move {
+                    let _permit = permit;
+                    match tokio::time::timeout(timeout, handles.wait_for_reader(fh)).await {
+                        Ok(Ok(reader)) => {
+                            stats.start_read();
+                            if scheduler
+                                .try_enqueue_read(
+                                    ino,
+                                    fh,
+                                    reader,
+                                    u64::try_from(offset).unwrap_or(0),
+                                    size as usize,
+                                    reply,
+                                )
+                                .is_err()
+                            {
+                                stats.finish_read();
+                            }
+                        }
+                        Ok(Err(error)) => reply.error(fuser::Errno::from_i32(error)),
+                        Err(_) => reply.error(fuser::Errno::from_i32(libc::ETIMEDOUT)),
+                    }
+                });
             }
             FuseHandle::ReadBuffer(content) => {
                 // Read from in-memory buffer (preferred path, no locks held)
