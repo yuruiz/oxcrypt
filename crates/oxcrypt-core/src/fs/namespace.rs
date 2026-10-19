@@ -1,0 +1,133 @@
+//! Atomic publication of a complete encrypted directory entry.
+use std::{fs, io, path::Path};
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Kind {
+    File,
+    Directory,
+    Symlink,
+}
+
+pub(crate) fn inspect(path: &Path) -> io::Result<Kind> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_file() {
+        return Ok(Kind::File);
+    }
+    if metadata.is_dir() {
+        for (name, kind) in [
+            ("contents.c9r", Kind::File),
+            ("dir.c9r", Kind::Directory),
+            ("symlink.c9r", Kind::Symlink),
+        ] {
+            if path.join(name).try_exists()? {
+                return Ok(kind);
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid encrypted entry",
+    ))
+}
+
+fn payload(path: &Path, kind: Kind) -> std::path::PathBuf {
+    if path.is_file() {
+        path.to_path_buf()
+    } else {
+        path.join(match kind {
+            Kind::File => "contents.c9r",
+            Kind::Directory => "dir.c9r",
+            Kind::Symlink => "symlink.c9r",
+        })
+    }
+}
+
+fn remove_entry(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// Never remove the destination before publishing its replacement. Where the
+/// physical representation changes, stage a complete entry and exchange it.
+/// A crash after publication can leave a duplicate source, never a missing target.
+pub(crate) fn replace(
+    source: &Path,
+    target: &Path,
+    shortened_name: Option<&str>,
+    root: &Path,
+) -> io::Result<()> {
+    let kind = inspect(source)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::other("missing target parent"))?;
+    fs::create_dir_all(parent)?;
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| io::Error::other("missing source parent"))?;
+    if kind == Kind::File
+        && source.is_file()
+        && shortened_name.is_none()
+        && (!target.try_exists()? || target.is_file())
+    {
+        fs::File::open(source)?.sync_all()?;
+        fs::rename(source, target)?;
+        crate::fs::durability::sync_directory_chain(parent, root)?;
+        crate::fs::durability::sync_directory_chain(source_parent, root)?;
+        return Ok(());
+    }
+    let stage = tempfile::tempdir_in(parent)?;
+    let entry = stage.path().join("entry");
+    if kind != Kind::File || shortened_name.is_some() {
+        fs::create_dir(&entry)?;
+    }
+    let content = if entry.is_dir() {
+        entry.join(match kind {
+            Kind::File => "contents.c9r",
+            Kind::Directory => "dir.c9r",
+            Kind::Symlink => "symlink.c9r",
+        })
+    } else {
+        entry.clone()
+    };
+    // Ciphertext and directory pointers are immutable under atomic write-back.
+    // A hard link stages the data without copying or decrypting the file.
+    let source_payload = payload(source, kind);
+    if fs::hard_link(&source_payload, &content).is_err() {
+        fs::copy(&source_payload, &content)?;
+    }
+    fs::File::open(&content)?.sync_all()?;
+    if let Some(name) = shortened_name {
+        let name_path = entry.join("name.c9s");
+        fs::write(&name_path, name)?;
+        fs::File::open(name_path)?.sync_all()?;
+    }
+    if entry.is_dir() {
+        crate::fs::durability::sync_directory_chain(&entry, root)?;
+    }
+    if target.try_exists()? {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &entry,
+            rustix::fs::CWD,
+            target,
+            rustix::fs::RenameFlags::EXCHANGE,
+        )?;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic entry exchange is unavailable",
+        ));
+    } else {
+        fs::rename(&entry, target)?;
+    }
+    crate::fs::durability::sync_directory_chain(parent, root)?;
+    if let Err(error) = remove_entry(source) {
+        tracing::warn!(?source, %error, "Replacement committed; source cleanup must be retried");
+    }
+    crate::fs::durability::sync_directory_chain(source_parent, root)?;
+    Ok(())
+}

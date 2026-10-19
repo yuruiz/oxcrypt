@@ -39,6 +39,7 @@ pub struct WriteBuffer {
     content: Arc<Vec<u8>>,
     /// Whether the buffer has been modified since creation.
     dirty: bool,
+    detached: bool,
     /// Changes whenever buffered data changes.
     revision: u64,
     /// Directory ID containing the file (for write-back).
@@ -60,6 +61,7 @@ impl WriteBuffer {
             content: Arc::new(existing_content),
             dirty: false,
             revision: 0,
+            detached: false,
             dir_id,
             filename,
         }
@@ -84,6 +86,7 @@ impl WriteBuffer {
         Self {
             content: Arc::new(Vec::with_capacity(capacity)),
             revision: 0,
+            detached: false,
             dirty: true, // New file needs to be written
             dir_id,
             filename,
@@ -98,6 +101,7 @@ impl WriteBuffer {
         Self {
             content: Arc::new(Vec::new()),
             revision: 0,
+            detached: false,
             dirty: true, // Must write to create the file
             dir_id,
             filename,
@@ -202,6 +206,16 @@ impl WriteBuffer {
         }
         self.mark_clean();
         true
+    }
+
+    /// A replaced open file has no directory entry to write back to.
+    pub fn detach(&mut self) {
+        self.detached = true;
+    }
+
+    /// Whether this open file has been replaced and no longer owns its pathname.
+    pub fn is_detached(&self) -> bool {
+        self.detached
     }
 
     /// Update the namespace location without changing the buffered file contents.

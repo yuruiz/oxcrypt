@@ -5,6 +5,7 @@ pub(crate) mod durability;
 pub mod file;
 pub mod file_ctrmac;
 pub mod name;
+pub(crate) mod namespace;
 pub mod symlink;
 
 #[cfg(feature = "async")]

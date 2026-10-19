@@ -138,6 +138,7 @@ impl FuseHandleTable {
         let mut ids = Vec::new();
         self.inner.retain(|id, handle| {
             if let Some(buffer) = handle.as_write_buffer_mut()
+                && !buffer.is_detached()
                 && buffer.dir_id() == dir
                 && buffer.filename() == name
             {
@@ -146,6 +147,19 @@ impl FuseHandleTable {
             true
         });
         ids
+    }
+
+    pub(crate) fn detach_writers(&self, dir: &DirId, name: &str) {
+        self.inner.retain(|_, handle| {
+            if let Some(buffer) = handle.as_write_buffer_mut()
+                && !buffer.is_detached()
+                && buffer.dir_id() == dir
+                && buffer.filename() == name
+            {
+                buffer.detach();
+            }
+            true
+        });
     }
 
     pub(crate) fn relocate_writers(
@@ -157,6 +171,7 @@ impl FuseHandleTable {
     ) {
         self.inner.retain(|_, handle| {
             if let Some(buffer) = handle.as_write_buffer_mut()
+                && !buffer.is_detached()
                 && buffer.dir_id() == from_dir
                 && buffer.filename() == from_name
             {

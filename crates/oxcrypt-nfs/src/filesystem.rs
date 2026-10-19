@@ -1117,54 +1117,10 @@ impl NFSFileSystem for CryptomatorNFS {
             }
         }
 
-        // Determine entry type and perform appropriate rename/move
-        if let Ok(Some(_)) = self.ops.find_file(&from_dir_id, from_name).await {
-            // It's a file
-            if from_dir_id == to_dir_id && from_name != to_name {
-                // Same directory, just rename
-                if let Err(e) = self.ops.rename_file(&from_dir_id, from_name, to_name).await {
-                    self.stats.record_error();
-                    self.stats.record_metadata_latency(start.elapsed());
-                    return Err(vault_error_to_nfsstat(&e));
-                }
-            } else {
-                // Cross-directory move (and optionally rename)
-                if let Err(e) = self
-                    .ops
-                    .move_and_rename_file(&from_dir_id, from_name, &to_dir_id, to_name)
-                    .await
-                {
-                    self.stats.record_error();
-                    self.stats.record_metadata_latency(start.elapsed());
-                    return Err(vault_error_to_nfsstat(&e));
-                }
-            }
-        } else if let Ok(Some(_)) = self.ops.find_directory(&from_dir_id, from_name).await {
-            // It's a directory - only same-directory rename is supported
-            if from_dir_id == to_dir_id {
-                if let Err(e) = self
-                    .ops
-                    .rename_directory(&from_dir_id, from_name, to_name)
-                    .await
-                {
-                    self.stats.record_error();
-                    self.stats.record_metadata_latency(start.elapsed());
-                    return Err(vault_error_to_nfsstat(&e));
-                }
-            } else if let Err(e) = self
-                .ops
-                .move_and_rename_directory(&from_dir_id, from_name, &to_dir_id, to_name)
-                .await
-            {
-                self.stats.record_error();
-                self.stats.record_metadata_latency(start.elapsed());
-                return Err(vault_error_to_nfsstat(&e));
-            }
-        } else {
-            self.stats.record_error();
-            self.stats.record_metadata_latency(start.elapsed());
-            return Err(nfsstat3::NFS3ERR_NOENT);
-        }
+        self.ops
+            .rename_entry_atomic(&from_dir_id, from_name, &to_dir_id, to_name)
+            .await
+            .map_err(|error| vault_error_to_nfsstat(&error))?;
 
         // Update inode table
         let old_path = from_parent_path.join(from_name);
