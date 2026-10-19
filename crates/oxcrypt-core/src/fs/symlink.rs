@@ -1,7 +1,7 @@
 //! Symlink encryption and decryption for Cryptomator vaults.
 //!
 //! Cryptomator stores symlinks in `.c9r` directories containing a `symlink.c9r` file.
-//! The symlink target path is encrypted as file content (with header + AES-GCM chunks),
+//! The symlink target path is encrypted as file content (with a header and authenticated chunks),
 //! the same way regular files are encrypted.
 //!
 //! # Reference Implementation
@@ -27,21 +27,19 @@
 //!
 //! Unlike filenames (which use AES-SIV with parent dir ID as AAD), symlink targets
 //! are encrypted as file content:
-//! - 68-byte file header (nonce + encrypted content key + tag)
-//! - Content chunks encrypted with AES-GCM (chunk number + header nonce as AAD)
+//! - A file header containing the encrypted content key
+//! - Authenticated content chunks using the configured GCM or CTRMAC cipher
 //!
 //! This matches the official Cryptomator implementation where symlink targets
 //! go through `openCryptoFiles.writeCiphertextFile()`.
 
-use rand::RngCore;
 use std::fmt;
 use thiserror::Error;
 
 use crate::crypto::keys::MasterKey;
-use crate::fs::file::{
-    FileDecryptionError, FileEncryptionError, decrypt_file_content, decrypt_file_header,
-    encrypt_file_content, encrypt_file_header,
-};
+use crate::fs::file::{FileDecryptionError, FileEncryptionError};
+
+use crate::vault::config::CipherCombo;
 
 /// Context for symlink operations, providing debugging information.
 #[derive(Debug, Clone, Default)]
@@ -255,36 +253,21 @@ pub fn encrypt_symlink_target(
     target: &str,
     master_key: &MasterKey,
 ) -> Result<Vec<u8>, SymlinkError> {
-    let context = SymlinkContext::new().with_target(target);
+    encrypt_symlink_target_with_cipher(target, master_key, CipherCombo::SivGcm)
+}
 
-    // Generate a random content key for this symlink file
-    let mut content_key = [0u8; 32];
-    rand::rng().fill_bytes(&mut content_key);
-
-    // Encrypt the file header (contains the content key)
-    let encrypted_header = encrypt_file_header(&content_key, master_key).map_err(|e| {
-        SymlinkError::EncryptionFailed {
-            reason: e.to_string(),
-            context: context.clone(),
-        }
-    })?;
-
-    // Extract the header nonce (first 12 bytes of the encrypted header)
-    let header_nonce: [u8; 12] = encrypted_header[0..12].try_into().unwrap();
-
-    // Encrypt the symlink target as file content
-    let target_bytes = target.as_bytes();
-    let encrypted_content = encrypt_file_content(target_bytes, &content_key, &header_nonce)
-        .map_err(|e| SymlinkError::EncryptionFailed {
-            reason: e.to_string(),
-            context,
-        })?;
-
-    // Combine header + content
-    let mut result = encrypted_header;
-    result.extend_from_slice(&encrypted_content);
-
-    Ok(result)
+/// Encrypt the target with the vault's configured file-content cipher.
+pub fn encrypt_symlink_target_with_cipher(
+    target: &str,
+    master_key: &MasterKey,
+    cipher: CipherCombo,
+) -> Result<Vec<u8>, SymlinkError> {
+    cipher
+        .encrypt_file(target.as_bytes(), master_key)
+        .map_err(|error| SymlinkError::EncryptionFailed {
+            reason: error.to_string(),
+            context: SymlinkContext::new().with_target(target),
+        })
 }
 
 /// Decrypt a symlink target path from file content encryption.
@@ -311,47 +294,44 @@ pub fn decrypt_symlink_target(
     encrypted_data: &[u8],
     master_key: &MasterKey,
 ) -> Result<String, SymlinkError> {
-    let context = SymlinkContext::new();
+    decrypt_symlink_target_with_cipher(encrypted_data, master_key, CipherCombo::SivGcm)
+}
 
-    // Minimum size: 68-byte header + at least some content
-    // Note: Even an empty target would have encrypted content due to authentication
+/// Decrypt a target using the configured cipher. CTRMAC vaults also accept
+/// authenticated GCM symlink payloads for compatibility with mixed-cipher vaults.
+/// Both paths authenticate the complete header and content before returning data.
+pub fn decrypt_symlink_target_with_cipher(
+    encrypted_data: &[u8],
+    master_key: &MasterKey,
+    cipher: CipherCombo,
+) -> Result<String, SymlinkError> {
+    let context = SymlinkContext::new();
     if encrypted_data.len() < 68 {
         return Err(SymlinkError::TooSmall {
             size: encrypted_data.len(),
             context,
         });
     }
-
-    // Decrypt the file header to get the content key
-    let header = decrypt_file_header(&encrypted_data[0..68], master_key).map_err(|e| {
-        SymlinkError::DecryptionFailed {
-            reason: e.to_string(),
-            context: context.clone(),
-        }
-    })?;
-
-    // Extract the header nonce (first 12 bytes)
-    let header_nonce = &encrypted_data[0..12];
-
-    // Decrypt the file content
-    let decrypted_bytes =
-        decrypt_file_content(&encrypted_data[68..], &header.content_key, header_nonce).map_err(
-            |e| SymlinkError::DecryptionFailed {
-                reason: e.to_string(),
-                context: context.clone(),
-            },
-        )?;
-
-    // Convert to UTF-8 string
-    String::from_utf8(decrypted_bytes).map_err(|e| SymlinkError::Utf8Decode {
-        reason: e.to_string(),
+    let decrypted = cipher
+        .decrypt_file(encrypted_data, master_key)
+        .or_else(|error| {
+            if cipher == CipherCombo::SivCtrMac {
+                CipherCombo::SivGcm
+                    .decrypt_file(encrypted_data, master_key)
+                    .map_err(|_| error)
+            } else {
+                Err(error)
+            }
+        })?;
+    String::from_utf8(decrypted.content).map_err(|error| SymlinkError::Utf8Decode {
+        reason: error.to_string(),
         context,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::fs::symlink::*;
 
     fn create_test_master_key() -> MasterKey {
         let mut aes_key = [0u8; 32];
