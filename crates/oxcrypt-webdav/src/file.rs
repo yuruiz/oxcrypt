@@ -33,7 +33,7 @@ pub struct WriterHandle {
     stats: Arc<VaultStats>,
     pending: Arc<WriteBufferTable>,
     flush_lock: Arc<tokio::sync::Mutex<()>>,
-    _path_guards: crate::path_locks::PathGuards,
+    path_guards: Arc<crate::path_locks::PathGuards>,
 }
 impl std::fmt::Debug for WriterHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,7 +77,7 @@ impl CryptomatorFile {
             stats,
             pending,
             flush_lock,
-            _path_guards: path_guards,
+            path_guards: Arc::new(path_guards),
         })
     }
     fn size(&self) -> u64 {
@@ -120,11 +120,15 @@ impl DavFile for CryptomatorFile {
                 }
                 Self::Writer(handle) => {
                     let editor = Arc::clone(&handle.buffer);
+                    let paths = Arc::clone(&handle.path_guards);
                     let position = handle.position;
-                    let data = tokio::task::spawn_blocking(move || editor.read(position, count))
-                        .await
-                        .map_err(|_| FsError::GeneralFailure)?
-                        .map_err(|error| io_error_to_fs_error(&error))?;
+                    let data = tokio::task::spawn_blocking(move || {
+                        let _paths = paths;
+                        editor.read(position, count)
+                    })
+                    .await
+                    .map_err(|_| FsError::GeneralFailure)?
+                    .map_err(|error| io_error_to_fs_error(&error))?;
                     handle.position += data.len() as u64;
                     Ok(Bytes::from(data))
                 }
@@ -137,8 +141,10 @@ impl DavFile for CryptomatorFile {
                 return Err(FsError::Forbidden);
             };
             let editor = Arc::clone(&handle.buffer);
+            let paths = Arc::clone(&handle.path_guards);
             let position = handle.position;
             let written = tokio::task::spawn_blocking(move || {
+                let _paths = paths;
                 let mut written = 0;
                 while written < bytes.len() {
                     let count = editor.write(position + written as u64, &bytes[written..])?;
@@ -209,7 +215,9 @@ impl Drop for CryptomatorFile {
             Self::Writer(handle) => {
                 // A flush does not end the writer's lifetime: it may write again.
                 // Keep failed/unfinished writes reachable after the handle drops.
-                if !handle.buffer.is_dirty() {
+                // A cancelled future does not cancel spawn_blocking. Its lease
+                // keeps this buffer reachable and excludes replacement writers.
+                if Arc::strong_count(&handle.path_guards) == 1 && !handle.buffer.is_dirty() {
                     handle.pending.retain(|path, editor| {
                         path != &handle.vault_path || !Arc::ptr_eq(editor, &handle.buffer)
                     });
