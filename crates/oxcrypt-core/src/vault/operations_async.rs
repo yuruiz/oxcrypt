@@ -2547,6 +2547,96 @@ impl VaultOperationsAsync {
         Ok(())
     }
 
+    /// Publish a replacement without unlinking its previous destination first.
+    pub async fn rename_entry_atomic(
+        &self,
+        source_dir: &DirId,
+        source_name: &str,
+        target_dir: &DirId,
+        target_name: &str,
+    ) -> Result<(), VaultWriteError> {
+        use crate::fs::namespace::{self, Kind};
+        if source_dir == target_dir && source_name == target_name {
+            return Ok(());
+        }
+        let parent_guards = self
+            .lock_directories_write_ordered(&[source_dir, target_dir])
+            .await;
+        let source_encrypted =
+            encrypt_filename(source_name, source_dir.as_str(), &self.master_key)?;
+        let target_encrypted =
+            encrypt_filename(target_name, target_dir.as_str(), &self.master_key)?;
+        let threshold = self.core.shortening_threshold();
+        let entry_name = |name: &str| {
+            if name.len() > threshold {
+                format!("{}.c9s", create_c9s_filename(name))
+            } else {
+                format!("{name}.c9r")
+            }
+        };
+        let source = self
+            .calculate_directory_storage_path(source_dir)?
+            .join(entry_name(&source_encrypted));
+        let target = self
+            .calculate_directory_storage_path(target_dir)?
+            .join(entry_name(&target_encrypted));
+        let source_kind = namespace::inspect(&source)?;
+        let target_kind = match namespace::inspect(&target) {
+            Ok(kind) => Some(kind),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if source_kind == Kind::Directory && target_kind.is_some_and(|kind| kind != Kind::Directory)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "directory cannot replace file",
+            )
+            .into());
+        }
+        if source_kind != Kind::Directory && target_kind == Some(Kind::Directory) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "file cannot replace directory",
+            )
+            .into());
+        }
+        // Hold the overwritten directory's lock while checking all entries,
+        // including symlinks and metadata that must not be silently discarded.
+        let target_child = if target_kind == Some(Kind::Directory) {
+            Some(DirId::from_raw(
+                fs::read_to_string(target.join("dir.c9r")).await?,
+            ))
+        } else {
+            None
+        };
+        let child_guard = if let Some(id) = target_child.as_ref() {
+            Some(self.lock_directory_write(id).await)
+        } else {
+            None
+        };
+        if let Some(id) = target_child.as_ref() {
+            let storage = self.calculate_directory_storage_path(id)?;
+            let mut entries = fs::read_dir(storage).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.file_name() != "dirid.c9r" {
+                    return Err(VaultWriteError::DirectoryNotEmpty {
+                        context: VaultOpContext::new().into_box(),
+                    });
+                }
+            }
+        }
+        let root = self.vault_path().to_path_buf();
+        let shortened = (target_encrypted.len() > threshold).then_some(target_encrypted);
+        tokio::task::spawn_blocking(move || {
+            let _guards = (parent_guards, child_guard);
+            namespace::replace(&source, &target, shortened.as_deref(), &root)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(())
+    }
+
     // ==================== Rename/Move Operations ====================
 
     /// Rename a file within a directory.

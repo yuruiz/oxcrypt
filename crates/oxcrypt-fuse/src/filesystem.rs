@@ -160,7 +160,10 @@ fn persist_write_buffer(
     persist: impl FnOnce(DirId, String, Arc<Vec<u8>>) -> Result<PathBuf, c_int>,
 ) -> Result<Option<(PathBuf, bool)>, c_int> {
     let mut handle = handles.get_mut(&fh).ok_or(libc::EBADF)?;
-    let Some(buffer) = handle.as_write_buffer_mut().filter(|b| b.is_dirty()) else {
+    let Some(buffer) = handle
+        .as_write_buffer_mut()
+        .filter(|b| b.is_dirty() && !b.is_detached())
+    else {
         return Ok(None);
     };
     let revision = buffer.revision();
@@ -410,6 +413,9 @@ impl HazardousHandler {
 
             let (dir_id, filename) = match handle.value() {
                 FuseHandle::WriteBuffer(buffer) => {
+                    if buffer.is_detached() {
+                        return Ok(());
+                    }
                     (buffer.dir_id().clone(), buffer.filename().to_string())
                 }
                 _ => return Ok(()),
@@ -469,7 +475,7 @@ impl HazardousHandler {
                 self.vault_stats.record_file_close();
             }
             FuseHandle::WriteBuffer(buffer) => {
-                if buffer.is_dirty() {
+                if buffer.is_dirty() && !buffer.is_detached() {
                     let ops = Arc::clone(&self.ops);
                     let dir_id = buffer.dir_id().clone();
                     let filename = buffer.filename().to_string();
@@ -4781,269 +4787,25 @@ impl Filesystem for CryptomatorFS {
 
         trace!("rename: source type = {:?}", source_type);
 
-        // Step 2: Handle overwrite semantics (POSIX rename replaces target if it exists)
-        // Check if RENAME_NOREPLACE was set - if so, we already handled it above
-        #[cfg(target_os = "linux")]
-        let noreplace = _flags.contains(fuser::RenameFlags::RENAME_NOREPLACE);
-        #[cfg(not(target_os = "linux"))]
-        let noreplace = false;
-
-        if !noreplace {
-            // Check if destination exists as file
-            let ops_df = self.ops_clone();
-            let dest_dir_df = dest_dir_id.clone();
-            let newname_df = newname_str.to_string();
-            let dest_file_exists =
-                match self.exec(async move { ops_df.find_file(&dest_dir_df, &newname_df).await }) {
-                    Ok(Ok(Some(_))) => true,
-                    Ok(Ok(None)) => false,
-                    Ok(Err(e)) => {
-                        self.vault_stats.record_error();
-                        self.vault_stats.record_metadata_latency(start.elapsed());
-                        reply.error(fuser::Errno::from_i32(e.to_errno()));
-                        return;
-                    }
-                    Err(exec_err) => {
-                        self.vault_stats.record_error();
-                        self.vault_stats.record_metadata_latency(start.elapsed());
-                        reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
-                        return;
-                    }
-                };
-
-            // Check if destination exists as directory
-            // Note: find_directory may return an error if the entry exists but is not a directory
-            // (e.g., NotADirectory). These type-mismatch errors mean "not a directory", not a fatal error.
-            let ops_dd = self.ops_clone();
-            let dest_dir_dd = dest_dir_id.clone();
-            let newname_dd = newname_str.to_string();
-            let dest_dir_exists = match self
-                .exec(async move { ops_dd.find_directory(&dest_dir_dd, &newname_dd).await })
-            {
-                Ok(Ok(Some(_))) => true,
-                Ok(Ok(None)) => false,
-                Ok(Err(e)) => {
-                    // Check if this is a type-mismatch error (entry exists but wrong type)
-                    let errno = e.to_errno();
-                    if errno == libc::ENOTDIR || errno == libc::EISDIR || errno == libc::EIO {
-                        // EIO can happen when find_directory encounters a file instead of directory
-                        // due to io_error_category mapping - treat as "not a directory"
-                        false
-                    } else {
-                        self.vault_stats.record_error();
-                        self.vault_stats.record_metadata_latency(start.elapsed());
-                        reply.error(fuser::Errno::from_i32(errno));
-                        return;
-                    }
-                }
-                Err(exec_err) => {
-                    self.vault_stats.record_error();
-                    self.vault_stats.record_metadata_latency(start.elapsed());
-                    reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
-                    return;
-                }
-            };
-
-            // Check if destination exists as symlink
-            // Same logic: type-mismatch errors mean "not a symlink", not a fatal error.
-            let ops_ds = self.ops_clone();
-            let dest_dir_ds = dest_dir_id.clone();
-            let newname_ds = newname_str.to_string();
-            let dest_sym_exists = match self
-                .exec(async move { ops_ds.find_symlink(&dest_dir_ds, &newname_ds).await })
-            {
-                Ok(Ok(Some(_))) => true,
-                Ok(Ok(None)) => false,
-                Ok(Err(e)) => {
-                    // Check if this is a type-mismatch error
-                    let errno = e.to_errno();
-                    if errno == libc::ENOTDIR || errno == libc::EISDIR || errno == libc::EIO {
-                        // EIO can happen due to io_error_category mapping - treat as "not a symlink"
-                        false
-                    } else {
-                        self.vault_stats.record_error();
-                        self.vault_stats.record_metadata_latency(start.elapsed());
-                        reply.error(fuser::Errno::from_i32(errno));
-                        return;
-                    }
-                }
-                Err(exec_err) => {
-                    self.vault_stats.record_error();
-                    self.vault_stats.record_metadata_latency(start.elapsed());
-                    reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
-                    return;
-                }
-            };
-
-            // Handle type mismatches and overwrite
-            if dest_dir_exists {
-                match source_type {
-                    SourceType::Directory => {
-                        // dir -> dir: check if target is empty, then delete
-                        let ops_del = self.ops_clone();
-                        let dest_dir_del = dest_dir_id.clone();
-                        let newname_del = newname_str.to_string();
-                        match self.exec(async move {
-                            ops_del.delete_directory(&dest_dir_del, &newname_del).await
-                        }) {
-                            Ok(Ok(())) => { /* deleted successfully */ }
-                            Ok(Err(e)) => {
-                                // If deletion failed (e.g., not empty), return error
-                                self.vault_stats.record_error();
-                                self.vault_stats.record_metadata_latency(start.elapsed());
-                                reply.error(fuser::Errno::from_i32(
-                                    crate::error::write_error_to_errno(&e),
-                                ));
-                                return;
-                            }
-                            Err(exec_err) => {
-                                self.vault_stats.record_error();
-                                self.vault_stats.record_metadata_latency(start.elapsed());
-                                reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
-                                return;
-                            }
-                        }
-                        // Invalidate destination inode
-                        let dest_path = dest_parent_path.join(newname_str);
-                        if let Some(dest_inode) = self.inodes.get_inode(&dest_path) {
-                            self.inodes.invalidate_path(&dest_path);
-                            self.attr_cache.invalidate(dest_inode);
-                        }
-                    }
-                    SourceType::File | SourceType::Symlink => {
-                        // file/symlink -> dir: EISDIR
-                        self.vault_stats.record_error();
-                        self.vault_stats.record_metadata_latency(start.elapsed());
-                        reply.error(fuser::Errno::from_i32(libc::EISDIR));
-                        return;
-                    }
-                }
-            } else if dest_file_exists {
-                match source_type {
-                    SourceType::File | SourceType::Symlink => {
-                        // file/symlink -> file: delete target file
-                        let ops_del = self.ops_clone();
-                        let dest_dir_del = dest_dir_id.clone();
-                        let newname_del = newname_str.to_string();
-                        match self.exec(async move {
-                            ops_del.delete_file(&dest_dir_del, &newname_del).await
-                        }) {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                self.vault_stats.record_error();
-                                self.vault_stats.record_metadata_latency(start.elapsed());
-                                reply.error(fuser::Errno::from_i32(
-                                    crate::error::write_error_to_errno(&e),
-                                ));
-                                return;
-                            }
-                            Err(exec_err) => {
-                                self.vault_stats.record_error();
-                                self.vault_stats.record_metadata_latency(start.elapsed());
-                                reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
-                                return;
-                            }
-                        }
-                        // Invalidate destination inode
-                        let dest_path = dest_parent_path.join(newname_str);
-                        if let Some(dest_inode) = self.inodes.get_inode(&dest_path) {
-                            self.inodes.invalidate_path(&dest_path);
-                            self.attr_cache.invalidate(dest_inode);
-                        }
-                    }
-                    SourceType::Directory => {
-                        // dir -> file: ENOTDIR
-                        self.vault_stats.record_error();
-                        self.vault_stats.record_metadata_latency(start.elapsed());
-                        reply.error(fuser::Errno::from_i32(libc::ENOTDIR));
-                        return;
-                    }
-                }
-            } else if dest_sym_exists {
-                // Destination is a symlink - delete it (symlinks can be overwritten by any type)
-                let ops_del = self.ops_clone();
-                let dest_dir_del = dest_dir_id.clone();
-                let newname_del = newname_str.to_string();
-                match self
-                    .exec(async move { ops_del.delete_symlink(&dest_dir_del, &newname_del).await })
-                {
-                    Ok(Ok(())) => { /* deleted successfully */ }
-                    Ok(Err(e)) => {
-                        self.vault_stats.record_error();
-                        self.vault_stats.record_metadata_latency(start.elapsed());
-                        reply.error(fuser::Errno::from_i32(crate::error::write_error_to_errno(
-                            &e,
-                        )));
-                        return;
-                    }
-                    Err(exec_err) => {
-                        self.vault_stats.record_error();
-                        self.vault_stats.record_metadata_latency(start.elapsed());
-                        reply.error(fuser::Errno::from_i32(exec_err.to_errno()));
-                        return;
-                    }
-                }
-                // Invalidate destination inode
-                let dest_path = dest_parent_path.join(newname_str);
-                if let Some(dest_inode) = self.inodes.get_inode(&dest_path) {
-                    self.inodes.invalidate_path(&dest_path);
-                    self.attr_cache.invalidate(dest_inode);
-                }
-            }
-        }
-
-        // Step 3: Perform the rename based on source type
-        let name_owned = name_str.to_string();
-        let newname_owned = newname_str.to_string();
-
-        let result = match source_type {
-            SourceType::File => {
-                // Use the appropriate file rename operation
-                if parent == newparent {
-                    let ops = self.ops_clone();
-                    let dir = src_dir_id.clone();
-                    self.exec(
-                        async move { ops.rename_file(&dir, &name_owned, &newname_owned).await },
-                    )
-                } else if name_str == newname_str {
-                    let ops = self.ops_clone();
-                    let src = src_dir_id.clone();
-                    let dest = dest_dir_id.clone();
-                    self.exec(async move { ops.move_file(&src, &name_owned, &dest).await })
-                } else {
-                    let ops = self.ops_clone();
-                    let src = src_dir_id.clone();
-                    let dest = dest_dir_id.clone();
-                    self.exec(async move {
-                        ops.move_and_rename_file(&src, &name_owned, &dest, &newname_owned)
-                            .await
-                    })
-                }
-            }
-            SourceType::Directory => {
-                // Use directory rename operations
-                let ops = self.ops_clone();
-                let src = src_dir_id.clone();
-                let dest = dest_dir_id.clone();
-                self.exec(async move {
-                    ops.move_and_rename_directory(&src, &name_owned, &dest, &newname_owned)
-                        .await
-                })
-            }
-            SourceType::Symlink => {
-                // Use symlink rename operations
-                let ops = self.ops_clone();
-                let src = src_dir_id.clone();
-                let dest = dest_dir_id.clone();
-                self.exec(async move {
-                    ops.move_and_rename_symlink(&src, &name_owned, &dest, &newname_owned)
-                        .await
-                })
-            }
-        };
+        let overwritten_path = dest_parent_path.join(newname_str);
+        let overwritten_inode = self.inodes.get_inode(&overwritten_path);
+        let ops = self.ops_clone();
+        let src = src_dir_id.clone();
+        let dest = dest_dir_id.clone();
+        let name_owned = name_str.to_owned();
+        let newname_owned = newname_str.to_owned();
+        let result = self.exec(async move {
+            ops.rename_entry_atomic(&src, &name_owned, &dest, &newname_owned)
+                .await
+        });
 
         match result {
             Ok(Ok(())) => {
+                self.handle_table.detach_writers(&dest_dir_id, newname_str);
+                if let Some(inode) = overwritten_inode {
+                    self.inodes.invalidate_path(&overwritten_path);
+                    self.attr_cache.invalidate(inode);
+                }
                 self.handle_table.relocate_writers(
                     &src_dir_id,
                     name_str,

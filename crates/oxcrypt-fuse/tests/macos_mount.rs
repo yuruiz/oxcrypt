@@ -177,3 +177,83 @@ fn open_writer_follows_rename_across_directories_and_remount() {
     assert_eq!(content, b"UPDATED!");
     assert!(!old_exists);
 }
+
+#[test]
+fn failed_replacement_preserves_target_after_remount() {
+    let vault = TempVault::new();
+    let mount_dir = tempfile::tempdir().unwrap();
+    let backend = FuseBackend::new();
+    let mount = backend
+        .mount(
+            "oxcrypt-replace-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    let root = mount.mountpoint();
+    fs::write(root.join("source"), b"new").unwrap();
+    fs::write(root.join("target"), b"must survive").unwrap();
+    fs::metadata(root.join("source")).unwrap();
+    let ops =
+        oxcrypt_core::vault::VaultOperations::open(vault.path(), TempVault::password()).unwrap();
+    let source = ops
+        .find_file(&oxcrypt_core::vault::DirId::root(), "source")
+        .unwrap()
+        .unwrap();
+    fs::remove_file(source.encrypted_path).unwrap();
+    let rename = fs::rename(root.join("source"), root.join("target"));
+    mount.unmount().unwrap();
+    let mount = backend
+        .mount(
+            "oxcrypt-replace-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    let result = fs::read(mount.mountpoint().join("target"));
+    mount.unmount().unwrap();
+    assert!(rename.is_err());
+    assert_eq!(result.unwrap(), b"must survive");
+}
+
+#[test]
+fn replaced_open_writer_cannot_overwrite_replacement() {
+    use std::os::unix::fs::FileExt;
+    let vault = TempVault::new();
+    let mount_dir = tempfile::tempdir().unwrap();
+    let backend = FuseBackend::new();
+    let mount = backend
+        .mount(
+            "oxcrypt-orphan-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    let root = mount.mountpoint();
+    fs::write(root.join("target"), b"old target").unwrap();
+    fs::write(root.join("source"), b"saved version").unwrap();
+    let old = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("target"))
+        .unwrap();
+    fs::rename(root.join("source"), root.join("target")).unwrap();
+    old.write_all_at(b"orphan", 0).unwrap();
+    old.sync_all().unwrap();
+    drop(old);
+    mount.unmount().unwrap();
+    let mount = backend
+        .mount(
+            "oxcrypt-orphan-test",
+            vault.path(),
+            TempVault::password(),
+            mount_dir.path(),
+        )
+        .unwrap();
+    let result = fs::read(mount.mountpoint().join("target"));
+    mount.unmount().unwrap();
+    assert_eq!(result.unwrap(), b"saved version");
+}
