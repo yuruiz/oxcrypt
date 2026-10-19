@@ -73,6 +73,10 @@ fn finder_attributes_survive_remount() {
             .to_lowercase(),
         "00112233aabbccdd"
     );
+    xattr(
+        &["-w", "user.oxcrypt.directory", "directory metadata"],
+        &directory,
+    );
     mount.unmount().unwrap();
 
     let mount = backend
@@ -99,6 +103,12 @@ fn finder_attributes_survive_remount() {
     xattr(&["-d", attr], &path);
     let list = String::from_utf8(xattr(&[], &path)).unwrap();
     assert!(!list.lines().any(|name| name == attr));
+    assert!(
+        xattr(&["-p", "user.oxcrypt.directory"], &directory).starts_with(b"directory metadata")
+    );
+    let renamed = mount.mountpoint().join("renamed-notes");
+    fs::rename(&directory, &renamed).unwrap();
+    assert!(xattr(&["-p", "user.oxcrypt.directory"], &renamed).starts_with(b"directory metadata"));
     mount.unmount().unwrap();
 }
 

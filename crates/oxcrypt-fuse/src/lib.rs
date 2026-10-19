@@ -21,6 +21,8 @@
 //! mount(fs, mountpoint, options)?;
 //! ```
 
+#[cfg(target_os = "macos")]
+mod appledouble;
 mod async_bridge;
 pub mod attr;
 pub mod backend;

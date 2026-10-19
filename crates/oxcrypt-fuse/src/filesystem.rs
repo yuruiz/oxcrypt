@@ -944,16 +944,31 @@ impl CryptomatorFS {
         create: bool,
     ) -> Result<(DirId, String, VaultPath, Vec<u8>), i32> {
         let entry = self.inodes.get(ino).ok_or(libc::ENOENT)?;
-        let InodeKind::File { dir_id, name } = &entry.kind else {
-            return Err(libc::EISDIR);
+        let entry_path = entry.path.clone();
+        let direct_dir = match &entry.kind {
+            InodeKind::File { dir_id, .. } | InodeKind::Symlink { dir_id, .. } => {
+                Some(dir_id.clone())
+            }
+            InodeKind::Directory { .. } => None,
+            InodeKind::Root => return Err(libc::ENOATTR),
         };
-        if name.starts_with("._") {
-            return Err(libc::ENOTSUP);
-        }
-        let dir_id = dir_id.clone();
-        let name = format!("._{name}");
-        let path = entry.path.parent().ok_or(libc::EINVAL)?.join(&name);
         drop(entry);
+        let original_name = entry_path.file_name().ok_or(libc::ENOATTR)?;
+        if original_name.starts_with("._") {
+            return Err(libc::ENOATTR);
+        }
+        let parent_path = entry_path.parent().ok_or(libc::ENOATTR)?;
+        let dir_id = if let Some(dir) = direct_dir {
+            dir
+        } else {
+            let parent = self.inodes.get_inode(&parent_path).ok_or(libc::ENOENT)?;
+            self.inodes
+                .get(parent)
+                .and_then(|entry| entry.dir_id())
+                .ok_or(libc::ENOENT)?
+        };
+        let name = format!("._{original_name}");
+        let path = parent_path.join(&name);
         if let Some(inode) = self.inodes.get_inode(&path)
             && self.open_handle_tracker.has_open_handles(inode)
         {
@@ -990,9 +1005,10 @@ impl CryptomatorFS {
     }
 
     #[cfg(target_os = "macos")]
-    fn write_resource(
+    fn write_native_attribute(
         &self,
         ino: u64,
+        attribute: &str,
         value: &[u8],
         flags: i32,
         position: u32,
@@ -1000,15 +1016,9 @@ impl CryptomatorFS {
     ) -> Result<(), i32> {
         let _guard = self.resource_lock.lock();
         let (directory, filename, path, data) = self.resource_sidecar(ino, !remove)?;
-        let exists = !crate::resource_fork::resource(&data)?.is_empty();
-        trace!(
-            flags,
-            position,
-            value_len = value.len(),
-            exists,
-            "resource fork update"
-        );
-        if flags & 6 == 6 {
+        let mut attributes = crate::appledouble::decode(&data)?;
+        let exists = attributes.contains_key(attribute);
+        if flags & 6 == 6 || (position != 0 && attribute != crate::appledouble::RESOURCE) {
             return Err(libc::EINVAL);
         }
         if flags & 2 != 0 && exists {
@@ -1017,7 +1027,21 @@ impl CryptomatorFS {
         if (flags & 4 != 0 || remove) && !exists {
             return Err(libc::ENOATTR);
         }
-        let data = crate::resource_fork::replace(&data, value, position)?;
+        if remove {
+            attributes.remove(attribute);
+        } else if position != 0 {
+            let data = attributes.entry(attribute.into()).or_default();
+            let position = usize::try_from(position).map_err(|_| libc::E2BIG)?;
+            let end = position
+                .checked_add(value.len())
+                .filter(|end| *end <= crate::resource_fork::MAX_SIDECAR_SIZE)
+                .ok_or(libc::E2BIG)?;
+            data.resize(data.len().max(end), 0);
+            data[position..end].copy_from_slice(value);
+        } else {
+            attributes.insert(attribute.into(), value.to_vec());
+        }
+        let data = crate::appledouble::encode(&attributes)?;
         let ops = self.ops_clone();
         let name_for_write = filename.clone();
         self.exec_with_timeout(
@@ -5371,8 +5395,8 @@ impl Filesystem for CryptomatorFS {
 
     // ==================== Extended Attributes ====================
     //
-    // Resource forks are handled natively using standard encrypted AppleDouble
-    // entries. Other attributes use macFUSE sidecar fallback through ENOTSUP.
+    // A single native handler owns all attributes in the encrypted AppleDouble
+    // entry, avoiding competing native and kernel-fallback write-back paths.
 
     fn getxattr(
         &self,
@@ -5396,29 +5420,35 @@ impl Filesystem for CryptomatorFS {
         reply: fuser::ReplyXattr,
     ) {
         #[cfg(target_os = "macos")]
-        if _name == OsStr::new("com.apple.ResourceFork") {
+        {
             let _guard = self.resource_lock.lock();
-            let result = self
-                .resource_sidecar(_ino.0, false)
-                .and_then(|(_, _, _, data)| {
-                    let resource = crate::resource_fork::resource(&data)?;
-                    if resource.is_empty() {
-                        return Err(libc::ENOATTR);
-                    }
-                    Ok(resource.to_vec())
-                });
-            trace!(inode = _ino.0, position = _position, size = _size, result = ?result.as_ref().map(Vec::len), "native resource read");
+            let result = (|| {
+                let name = _name.to_str().ok_or(libc::EINVAL)?;
+                if _position != 0 && name != crate::appledouble::RESOURCE {
+                    return Err(libc::EINVAL);
+                }
+                let (_, _, _, bytes) = self.resource_sidecar(_ino.0, false)?;
+                crate::appledouble::decode(&bytes)?
+                    .remove(name)
+                    .ok_or(libc::ENOATTR)
+            })();
             match result {
                 Ok(data) if _size == 0 => reply.size(u32::try_from(data.len()).unwrap_or(u32::MAX)),
                 Ok(data) => {
+                    if _name != OsStr::new(crate::appledouble::RESOURCE)
+                        && data.len() > _size as usize
+                    {
+                        reply.error(fuser::Errno::from_i32(libc::ERANGE));
+                        return;
+                    }
                     let start = (_position as usize).min(data.len());
                     let end = start.saturating_add(_size as usize).min(data.len());
                     reply.data(&data[start..end]);
                 }
-                Err(error) => reply.error(fuser::Errno::from_i32(error)),
+                Err(errno) => reply.error(fuser::Errno::from_i32(errno)),
             }
-            return;
         }
+        #[cfg(not(target_os = "macos"))]
         reply.error(fuser::Errno::from_i32(libc::ENOTSUP));
     }
 
@@ -5434,16 +5464,20 @@ impl Filesystem for CryptomatorFS {
         reply: ReplyEmpty,
     ) {
         #[cfg(target_os = "macos")]
-        if _name == OsStr::new("com.apple.ResourceFork") {
-            match self.write_resource(_ino.0, _value, _flags, _position, false) {
+        {
+            let result = _name.to_str().ok_or(libc::EINVAL).and_then(|name| {
+                self.write_native_attribute(_ino.0, name, _value, _flags, _position, false)
+            });
+            match result {
                 Ok(()) => reply.ok(),
-                Err(error) => reply.error(fuser::Errno::from_i32(error)),
+                Err(errno) => reply.error(fuser::Errno::from_i32(errno)),
             }
-            return;
         }
+        #[cfg(not(target_os = "macos"))]
         reply.error(fuser::Errno::from_i32(libc::ENOTSUP));
     }
 
+    #[allow(clippy::used_underscore_binding)]
     fn listxattr(
         &self,
         _req: &fuser::Request,
@@ -5451,6 +5485,27 @@ impl Filesystem for CryptomatorFS {
         _size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        #[cfg(target_os = "macos")]
+        {
+            let _guard = self.resource_lock.lock();
+            let result = match self.resource_sidecar(_ino.0, false) {
+                Ok((_, _, _, data)) => crate::appledouble::decode(&data).map(|attributes| {
+                    attributes
+                        .keys()
+                        .flat_map(|name| name.as_bytes().iter().copied().chain(std::iter::once(0)))
+                        .collect::<Vec<_>>()
+                }),
+                Err(libc::ENOATTR) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(data) if _size == 0 => reply.size(u32::try_from(data.len()).unwrap_or(u32::MAX)),
+                Ok(data) if data.len() <= _size as usize => reply.data(&data),
+                Ok(_) => reply.error(fuser::Errno::from_i32(libc::ERANGE)),
+                Err(error) => reply.error(fuser::Errno::from_i32(error)),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         reply.error(fuser::Errno::from_i32(libc::ENOTSUP));
     }
 
@@ -5463,13 +5518,17 @@ impl Filesystem for CryptomatorFS {
         reply: ReplyEmpty,
     ) {
         #[cfg(target_os = "macos")]
-        if _name == OsStr::new("com.apple.ResourceFork") {
-            match self.write_resource(_ino.0, &[], 0, 0, true) {
+        {
+            let result = _name
+                .to_str()
+                .ok_or(libc::EINVAL)
+                .and_then(|name| self.write_native_attribute(_ino.0, name, &[], 0, 0, true));
+            match result {
                 Ok(()) => reply.ok(),
-                Err(error) => reply.error(fuser::Errno::from_i32(error)),
+                Err(errno) => reply.error(fuser::Errno::from_i32(errno)),
             }
-            return;
         }
+        #[cfg(not(target_os = "macos"))]
         reply.error(fuser::Errno::from_i32(libc::ENOTSUP));
     }
 }
