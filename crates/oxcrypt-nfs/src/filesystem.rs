@@ -8,8 +8,8 @@ use crate::inode::{InodeEntry, InodeKind, NfsInodeTable, ROOT_FILEID};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_atime,
-    set_mtime, set_size3, specdata3,
+    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
+    set_atime, set_mtime, set_size3, specdata3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use oxcrypt_core::fs::streaming::encrypted_to_plaintext_size_or_zero_for_cipher;
@@ -50,8 +50,8 @@ pub struct CryptomatorNFS {
     namespace: tokio::sync::RwLock<()>,
     /// Pending encrypted edits, retained after write-back failures.
     editors: Arc<DashMap<fileid3, Arc<EditBuffer>>>,
-    /// Server generation number (for cookieverf3).
-    generation: u64,
+    /// Random namespace for handles and directory cookies of this export instance.
+    export_id: [u8; 16],
     /// UID for all files (from process).
     uid: u32,
     /// GID for all files (from process).
@@ -103,18 +103,13 @@ impl NfsWriteback {
 impl CryptomatorNFS {
     /// Creates a new NFS filesystem for the given vault.
     pub fn new(ops: Arc<VaultOperationsAsync>) -> Self {
-        let generation = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         Self {
             ops,
             inodes: NfsInodeTable::new(),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             namespace: tokio::sync::RwLock::new(()),
             editors: Arc::new(DashMap::new()),
-            generation,
+            export_id: *uuid::Uuid::new_v4().as_bytes(),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             stats: Arc::new(VaultStats::new()),
@@ -565,7 +560,30 @@ impl NFSFileSystem for CryptomatorNFS {
     }
 
     fn serverid(&self) -> [u8; 8] {
-        self.generation.to_be_bytes()
+        let mut verifier = [0; 8];
+        verifier.copy_from_slice(&self.export_id[..8]);
+        verifier
+    }
+
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&self.export_id);
+        data.extend_from_slice(&id.to_be_bytes());
+        nfs_fh3 { data }
+    }
+
+    fn fh_to_id(&self, handle: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        if handle.data.len() != 24 {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        if handle.data[..16] != self.export_id {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(&handle.data[16..]);
+        let id = u64::from_be_bytes(bytes);
+        self.get_entry(id)?;
+        Ok(id)
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
@@ -1369,6 +1387,14 @@ impl NFSFileSystem for ArcNfs {
         self.0.serverid()
     }
 
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        self.0.id_to_fh(id)
+    }
+
+    fn fh_to_id(&self, handle: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        self.0.fh_to_id(handle)
+    }
+
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         self.0.lookup(dirid, filename).await
     }
@@ -1463,6 +1489,22 @@ impl NFSFileSystem for ArcNfs {
 mod writeback_tests {
     use crate::filesystem::*;
     use oxcrypt_mount::testing::TempVault;
+
+    #[test]
+    fn shared_rpc_wrapper_preserves_export_handle_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = Arc::new(oxcrypt_core::crypto::keys::MasterKey::random().unwrap());
+        let ops = Arc::new(VaultOperationsAsync::new(temp.path(), key));
+        let shared = ArcNfs::new(CryptomatorNFS::new(Arc::clone(&ops)));
+        let other = ArcNfs::new(CryptomatorNFS::new(ops));
+        let handle = shared.id_to_fh(shared.root_dir());
+        assert_eq!(shared.0.fh_to_id(&handle).unwrap(), shared.root_dir());
+        assert_eq!(shared.fh_to_id(&handle).unwrap(), shared.root_dir());
+        assert!(matches!(
+            other.fh_to_id(&handle),
+            Err(nfsstat3::NFS3ERR_STALE)
+        ));
+    }
 
     #[tokio::test]
     async fn resize_preserves_prefix_and_zero_fills_extension() {
