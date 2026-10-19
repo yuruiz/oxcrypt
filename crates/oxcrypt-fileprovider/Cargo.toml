@@ -27,6 +27,7 @@ base64 = "0.22"
 dirs = "6"
 include_dir = "0.7"
 sha2 = "0.10"
+uuid = { version = "1.28.0", features = ["v4"] }
 
 # macOS-specific dependencies
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -128,7 +128,7 @@ class DirectoryEnumerator: NSObject, NSFileProviderEnumerator {
 
             debugLog("DirectoryEnumerator: Enumerating changes for container: \(containerId), anchor: \(anchorStr)")
 
-            let result = fs.changesSince(anchorStr)
+            let result = fs.changesInDirectorySince(containerId, anchorStr)
 
             if result.isOk() {
                 // Get updated items, filtering out any with empty identifiers
@@ -186,6 +186,7 @@ class DirectoryEnumerator: NSObject, NSFileProviderEnumerator {
         DispatchQueue.global(qos: .userInitiated).async {
             let anchor = fs.currentAnchor().toString()
             debugLog("DirectoryEnumerator.currentSyncAnchor returning anchor: \(anchor)")
+            guard !anchor.isEmpty else { completionHandler(nil); return }
             let anchorData = anchor.data(using: .utf8) ?? Data()
             completionHandler(NSFileProviderSyncAnchor(anchorData))
         }
@@ -330,6 +331,7 @@ class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
         DispatchQueue.global(qos: .userInitiated).async {
             let anchor = fs.currentAnchor().toString()
             debugLog("WorkingSetEnumerator.currentSyncAnchor returning anchor: \(anchor)")
+            guard !anchor.isEmpty else { completionHandler(nil); return }
             let anchorData = anchor.data(using: .utf8) ?? Data()
             completionHandler(NSFileProviderSyncAnchor(anchorData))
         }

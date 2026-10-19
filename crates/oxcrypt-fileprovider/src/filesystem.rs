@@ -14,9 +14,11 @@ use oxcrypt_core::vault::config::VaultError;
 use oxcrypt_core::vault::operations::DirEntry;
 use oxcrypt_core::vault::path::VaultPath;
 use oxcrypt_mount::moka_cache::SyncTtlCache;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::runtime::Runtime;
 use tracing::{debug, error, trace};
@@ -31,6 +33,9 @@ const ENUMERATION_PAGE_SIZE: usize = 100;
 /// Error type for File Provider operations.
 #[derive(Debug, Clone, Error)]
 pub enum FpError {
+    /// The client must restart enumeration because its baseline is unavailable.
+    #[error("sync anchor expired")]
+    SyncAnchorExpired,
     /// Item not found
     #[error("item not found: {0}")]
     NotFound(String),
@@ -72,6 +77,7 @@ impl FpError {
     /// Get the errno-like error code for this error.
     pub fn error_code(&self) -> i32 {
         match self {
+            FpError::SyncAnchorExpired => libc::ESTALE,
             FpError::NotFound(_) => libc::ENOENT,
             FpError::AlreadyExists(_) => libc::EEXIST,
             FpError::PermissionDenied(_) | FpError::NotAuthenticated => libc::EACCES,
@@ -85,6 +91,7 @@ impl FpError {
     /// Get the NSFileProviderError domain string for this error.
     pub fn error_domain(&self) -> &'static str {
         match self {
+            FpError::SyncAnchorExpired => "NSFileProviderErrorSyncAnchorExpired",
             FpError::NotFound(_) | FpError::NotDirectory(_) => "NSFileProviderErrorNoSuchItem",
             FpError::AlreadyExists(_) => "NSFileProviderErrorFilenameCollision",
             FpError::PermissionDenied(_) | FpError::NotAuthenticated => {
@@ -207,6 +214,7 @@ impl From<crate::item::ItemIdError> for FpError {
 // ============================================================================
 
 /// A File Provider item with all necessary attributes.
+#[derive(Clone)]
 pub struct FileProviderItem {
     identifier: String,
     parent_id: String,
@@ -595,6 +603,57 @@ struct CachedItem {
 // Main Filesystem
 // ============================================================================
 
+#[derive(Clone)]
+struct SnapshotEntry {
+    item: FileProviderItem,
+    fingerprint: [u8; 32],
+}
+
+type Snapshot = BTreeMap<String, SnapshotEntry>;
+
+struct ChangeHistory {
+    epoch: uuid::Uuid,
+    sequence: u64,
+    snapshots: VecDeque<(String, Arc<Snapshot>)>,
+}
+
+impl ChangeHistory {
+    fn new() -> Self {
+        Self {
+            epoch: uuid::Uuid::new_v4(),
+            sequence: 0,
+            snapshots: VecDeque::new(),
+        }
+    }
+
+    fn record(&mut self, snapshot: Snapshot) -> (String, Arc<Snapshot>) {
+        if let Some((anchor, previous)) = self.snapshots.back()
+            && previous.len() == snapshot.len()
+            && snapshot.iter().all(|(id, entry)| {
+                previous
+                    .get(id)
+                    .is_some_and(|old| old.fingerprint == entry.fingerprint)
+            })
+        {
+            return (anchor.clone(), Arc::clone(previous));
+        }
+        if self.sequence == u64::MAX {
+            self.epoch = uuid::Uuid::new_v4();
+            self.sequence = 0;
+            self.snapshots.clear();
+        }
+        self.sequence += 1;
+        let anchor = format!("{}:{}", self.epoch, self.sequence);
+        let snapshot = Arc::new(snapshot);
+        self.snapshots
+            .push_back((anchor.clone(), Arc::clone(&snapshot)));
+        while self.snapshots.len() > 8 {
+            self.snapshots.pop_front();
+        }
+        (anchor, snapshot)
+    }
+}
+
 /// Main filesystem handle for File Provider operations.
 ///
 /// This struct wraps the vault operations and provides the interface
@@ -607,7 +666,7 @@ pub struct FileProviderFilesystem {
     /// Attribute cache for performance (keyed by vault path).
     attr_cache: SyncTtlCache<String, CachedItem>,
     /// Sync anchor for change tracking.
-    sync_anchor: AtomicU64,
+    changes: Mutex<ChangeHistory>,
 }
 
 impl FileProviderFilesystem {
@@ -1199,60 +1258,181 @@ impl FileProviderFilesystem {
         })
     }
 
-    /// Get changes since a sync anchor.
-    ///
-    /// This is used for incremental updates to the File Provider working set.
+    /// Scan metadata and encrypted prefixes, without decrypting file contents.
+    /// Failed scans never advance an anchor or report entries as deleted.
+    fn snapshot(&self) -> Result<Snapshot, FpError> {
+        let mut snapshot = Snapshot::new();
+        let mut pending = vec![("/".to_string(), oxcrypt_core::vault::DirId::root())];
+        let sync_ops = self
+            .ops
+            .as_sync()
+            .map_err(|error| FpError::VaultError(error.to_string()))?;
+        let mut visited = BTreeSet::from([String::new()]);
+        while let Some((parent, dir_id)) = pending.pop() {
+            let storage = sync_ops
+                .calculate_directory_storage_path(&dir_id)
+                .map_err(|error| FpError::VaultError(error.to_string()))?;
+            if !std::fs::metadata(storage)?.is_dir() {
+                return Err(FpError::NotDirectory(parent));
+            }
+            let entries = self
+                .runtime
+                .block_on(self.ops.list_by_path(&parent))
+                .map_err(FpError::from)?;
+            for entry in entries {
+                let (name, kind, size, encrypted_path) = match entry {
+                    DirEntry::File(info) => (
+                        info.name,
+                        ItemType::File,
+                        encrypted_to_plaintext_size_or_zero(info.encrypted_size),
+                        info.encrypted_path,
+                    ),
+                    DirEntry::Directory(info) => {
+                        if !visited.insert(info.directory_id.as_str().to_owned()) {
+                            return Err(FpError::VaultError(
+                                "Repeated directory ID during enumeration".into(),
+                            ));
+                        }
+                        let child = format!("{}/{}", parent.trim_end_matches('/'), info.name);
+                        pending.push((child, info.directory_id.clone()));
+                        (
+                            info.name,
+                            ItemType::Directory,
+                            0,
+                            info.encrypted_path.join("dir.c9r"),
+                        )
+                    }
+                    DirEntry::Symlink(info) => (
+                        info.name,
+                        ItemType::Symlink,
+                        0,
+                        info.encrypted_path.join("symlink.c9r"),
+                    ),
+                };
+                let path = format!("{}/{name}", parent.trim_end_matches('/'));
+                let metadata = std::fs::metadata(&encrypted_path)?;
+                let modified = metadata.modified()?;
+                let created = metadata.created().unwrap_or(modified);
+                let mut prefix = Vec::with_capacity(96);
+                std::fs::File::open(&encrypted_path)?
+                    .take(96)
+                    .read_to_end(&mut prefix)?;
+                let mut digest = Sha256::new();
+                digest.update([kind as u8]);
+                digest.update(metadata.len().to_le_bytes());
+                digest.update(format!("{modified:?}{created:?}").as_bytes());
+                digest.update(prefix);
+                let seconds = |time: std::time::SystemTime| {
+                    time.duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0.0, |duration| duration.as_secs_f64())
+                };
+                let item =
+                    FileProviderItem::new(&path, kind, size, seconds(modified), seconds(created));
+                snapshot.insert(
+                    item.identifier.clone(),
+                    SnapshotEntry {
+                        item,
+                        fingerprint: digest.finalize().into(),
+                    },
+                );
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// Return changes relative to a bounded, session-specific metadata baseline.
     pub fn changes_since(&self, anchor: &str) -> FpResultChanges {
-        debug!("changes_since: {}", anchor);
-
-        let current_anchor = self.sync_anchor.load(Ordering::SeqCst);
-
-        // TODO: Implement proper change tracking
-        // For now, we return empty changes with the current anchor
-        // In production, we would track file system changes and return them here
-
         FpResultChanges {
-            result: Ok(ChangesResult {
-                updated: Vec::new(),
-                deleted: Vec::new(),
-                anchor: current_anchor.to_string(),
-            }),
+            result: self.changes_since_internal(anchor),
         }
     }
 
-    /// Increment the sync anchor.
-    ///
-    /// Call this when the vault contents change to signal the working set enumerator.
+    fn changes_since_internal(&self, anchor: &str) -> Result<ChangesResult, FpError> {
+        let mut history = self
+            .changes
+            .lock()
+            .map_err(|_| FpError::IoError("Change history lock poisoned".into()))?;
+        let previous = history
+            .snapshots
+            .iter()
+            .find(|(key, _)| key == anchor)
+            .map(|(_, snapshot)| Arc::clone(snapshot))
+            .ok_or(FpError::SyncAnchorExpired)?;
+        let (anchor, current) = history.record(self.snapshot()?);
+        let updated = current
+            .iter()
+            .filter(|(id, entry)| {
+                previous
+                    .get(*id)
+                    .is_none_or(|old| old.fingerprint != entry.fingerprint)
+            })
+            .map(|(_, entry)| entry.item.clone())
+            .collect();
+        let deleted = previous
+            .keys()
+            .filter(|id| !current.contains_key(*id))
+            .cloned()
+            .collect();
+        Ok(ChangesResult {
+            updated,
+            deleted,
+            anchor,
+        })
+    }
+
+    /// Limit directory enumerations to direct children of their container.
+    pub fn changes_in_directory_since(&self, container: &str, anchor: &str) -> FpResultChanges {
+        let result = self.changes_since_internal(anchor).map(|mut changes| {
+            changes.updated.retain(|item| item.parent_id == container);
+            changes.deleted.retain(|id| {
+                decode_identifier(id).is_ok_and(|path| parent_identifier(&path) == container)
+            });
+            changes
+        });
+        FpResultChanges { result }
+    }
+
+    /// Invalidate cached baselines after an untracked external notification.
     pub fn increment_sync_anchor(&self) -> u64 {
-        self.sync_anchor.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Get the current sync anchor.
-    pub fn current_anchor(&self) -> String {
-        self.sync_anchor.load(Ordering::SeqCst).to_string()
-    }
-
-    /// Enumerate working set items.
-    ///
-    /// Returns items that should be in the working set (recently accessed/important items).
-    /// For now, this returns all top-level items.
-    pub fn enumerate_working_set(&self) -> FpResultWorkingSet {
-        debug!("enumerate_working_set");
-
-        // Enumerate root directory for working set
-        match self.enumerate_internal(ROOT_ITEM_IDENTIFIER, 0) {
-            Ok(enum_result) => FpResultWorkingSet {
-                result: Ok(enum_result.items),
-            },
-            Err(e) => FpResultWorkingSet { result: Err(e) },
+        match self.changes.lock() {
+            Ok(mut history) => {
+                history.snapshots.clear();
+                history.sequence = history.sequence.saturating_add(1);
+                history.sequence
+            }
+            Err(_) => 0,
         }
     }
 
-    /// Get working set changes since an anchor.
-    ///
-    /// For now, delegates to changes_since with full vault scope.
+    /// Capture the enumeration baseline; an empty value signals a failed scan.
+    pub fn current_anchor(&self) -> String {
+        let result = (|| {
+            let mut history = self
+                .changes
+                .lock()
+                .map_err(|_| FpError::IoError("Change history lock poisoned".into()))?;
+            Ok::<_, FpError>(history.record(self.snapshot()?).0)
+        })();
+        match result {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                error!(%error, "Cannot capture sync anchor");
+                String::new()
+            }
+        }
+    }
+
+    /// Enumerate the full working set, including nested items.
+    pub fn enumerate_working_set(&self) -> FpResultWorkingSet {
+        FpResultWorkingSet {
+            result: self
+                .snapshot()
+                .map(|snapshot| snapshot.into_values().map(|entry| entry.item).collect()),
+        }
+    }
+
+    /// Return changes across the complete working set.
     pub fn working_set_changes_since(&self, anchor: &str) -> FpResultChanges {
-        debug!("working_set_changes_since: {}", anchor);
         self.changes_since(anchor)
     }
 
@@ -1302,7 +1482,7 @@ pub fn fp_fs_new(vault_path: &str, password: &str) -> FpResultFs {
             runtime,
             ops,
             attr_cache: SyncTtlCache::with_defaults(),
-            sync_anchor: AtomicU64::new(0),
+            changes: Mutex::new(ChangeHistory::new()),
         }),
     }
 }
@@ -1313,7 +1493,115 @@ pub fn fp_fs_new(vault_path: &str, password: &str) -> FpResultFs {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::filesystem::*;
+
+    fn fixture() -> (oxcrypt_mount::testing::TempVault, FileProviderFilesystem) {
+        let vault = oxcrypt_mount::testing::TempVault::new();
+        let fs = fp_fs_new(
+            vault.path().to_str().unwrap(),
+            oxcrypt_mount::testing::TempVault::password(),
+        )
+        .result
+        .unwrap();
+        (vault, fs)
+    }
+
+    #[test]
+    fn changes_include_nested_external_updates_and_deletions() {
+        let (_vault, fs) = fixture();
+        let baseline = fs.current_anchor();
+        assert!(!baseline.is_empty());
+        let root = oxcrypt_core::vault::DirId::root();
+        let nested = fs
+            .runtime
+            .block_on(fs.ops.create_directory(&root, "nested"))
+            .unwrap();
+        fs.runtime
+            .block_on(fs.ops.write_file(&nested, "note", b"first"))
+            .unwrap();
+        let first = fs.changes_since(&baseline).result.unwrap();
+        assert_eq!(first.updated.len(), 2);
+        assert!(first.deleted.is_empty());
+        let scope = fs
+            .changes_in_directory_since(ROOT_ITEM_IDENTIFIER, &baseline)
+            .result
+            .unwrap();
+        assert_eq!(scope.updated.len(), 1);
+        assert_eq!(scope.updated[0].identifier, encode_identifier("/nested"));
+        let nested_scope = fs
+            .changes_in_directory_since(&encode_identifier("/nested"), &baseline)
+            .result
+            .unwrap();
+        assert_eq!(nested_scope.updated.len(), 1);
+        fs.runtime
+            .block_on(fs.ops.write_file(&nested, "note", b"other"))
+            .unwrap();
+        let changed = fs.changes_since(&first.anchor).result.unwrap();
+        assert_eq!(changed.updated.len(), 1);
+        assert_eq!(
+            changed.updated[0].identifier,
+            encode_identifier("/nested/note")
+        );
+        fs.runtime
+            .block_on(fs.ops.delete_file(&nested, "note"))
+            .unwrap();
+        let deleted = fs.changes_since(&changed.anchor).result.unwrap();
+        assert_eq!(deleted.deleted, vec![encode_identifier("/nested/note")]);
+    }
+
+    #[test]
+    fn unavailable_storage_does_not_advance_or_empty_the_baseline() {
+        let (_vault, fs) = fixture();
+        let root = oxcrypt_core::vault::DirId::root();
+        fs.runtime
+            .block_on(fs.ops.write_file(&root, "note", b"first"))
+            .unwrap();
+        let baseline = fs.current_anchor();
+        let storage = fs
+            .ops
+            .as_sync()
+            .unwrap()
+            .calculate_directory_storage_path(&root)
+            .unwrap();
+        let backup = storage.with_extension("test-backup");
+        std::fs::rename(&storage, &backup).unwrap();
+        assert!(fs.changes_since(&baseline).result.is_err());
+        std::fs::rename(&backup, &storage).unwrap();
+        let changes = fs.changes_since(&baseline).result.unwrap();
+        assert!(changes.updated.is_empty() && changes.deleted.is_empty());
+        assert_eq!(changes.anchor, baseline);
+    }
+
+    #[test]
+    fn stale_and_cross_session_anchors_require_resync() {
+        let (vault, fs) = fixture();
+        let baseline = fs.current_anchor();
+        let second = fp_fs_new(
+            vault.path().to_str().unwrap(),
+            oxcrypt_mount::testing::TempVault::password(),
+        )
+        .result
+        .unwrap();
+        assert!(matches!(
+            second.changes_since(&baseline).result,
+            Err(FpError::SyncAnchorExpired)
+        ));
+        for index in 0..9 {
+            fs.runtime
+                .block_on(
+                    fs.ops
+                        .write_file(&oxcrypt_core::vault::DirId::root(), "note", &[index]),
+                )
+                .unwrap();
+            assert!(!fs.current_anchor().is_empty());
+        }
+        assert!(matches!(
+            fs.changes_since(&baseline).result,
+            Err(FpError::SyncAnchorExpired)
+        ));
+        assert!(fs.changes_since("malformed").result.is_err());
+        assert_eq!(FpError::SyncAnchorExpired.error_code(), libc::ESTALE);
+    }
 
     #[test]
     fn test_fp_error_codes() {

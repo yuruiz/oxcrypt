@@ -411,6 +411,8 @@ class OxCryptExtension: NSObject, NSFileProviderReplicatedExtension {
     /// Map errno-like error codes to NSFileProviderError.
     func mapError(code: Int32) -> NSError {
         switch code {
+        case 70: // ESTALE on macOS
+            return NSFileProviderError(.syncAnchorExpired) as NSError
         case 2:  // ENOENT
             return NSFileProviderError(.noSuchItem) as NSError
         case 13:  // EACCES
