@@ -217,7 +217,10 @@ impl VaultLockManager {
     /// * `dir_id` - The parent directory ID
     /// * `filename` - The decrypted filename
     pub fn file_lock(&self, dir_id: &DirId, filename: &str) -> Arc<RwLock<()>> {
-        let key = (dir_id.clone(), filename.to_string());
+        let key = (
+            dir_id.clone(),
+            crate::fs::name::normalize_filename(filename).into_owned(),
+        );
         self.file_locks
             .entry(key)
             .or_insert_with(|| Arc::new(RwLock::new(())))
@@ -304,7 +307,10 @@ impl VaultLockManager {
         filenames: &[&str],
     ) -> Vec<(String, OwnedRwLockWriteGuard<()>)> {
         // Sort filenames for consistent ordering
-        let mut sorted: Vec<_> = filenames.iter().map(|&s| s.to_string()).collect();
+        let mut sorted: Vec<_> = filenames
+            .iter()
+            .map(|name| crate::fs::name::normalize_filename(name).into_owned())
+            .collect();
         sorted.sort();
         sorted.dedup();
 

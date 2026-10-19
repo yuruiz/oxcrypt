@@ -295,3 +295,45 @@ fn cancelled_queued_write_remains_tracked_until_background_work_finishes() {
         assert_eq!(reader.read_bytes(8).await.unwrap().as_ref(), b"queued!!");
     });
 }
+
+#[tokio::test]
+async fn unicode_aliases_share_the_same_writer_lease() {
+    let (_temp, ops) = vault();
+    let fs = CryptomatorWebDav::new(Arc::clone(&ops));
+    let nfc = DavPath::new("/caf%C3%A9").unwrap();
+    let nfd = DavPath::new("/cafe%CC%81").unwrap();
+    let mut first = fs
+        .open(
+            &nfc,
+            OpenOptions {
+                write: true,
+                create: true,
+                ..OpenOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    first
+        .write_bytes(Bytes::from_static(b"first"))
+        .await
+        .unwrap();
+    let second = fs.open(
+        &nfd,
+        OpenOptions {
+            write: true,
+            ..OpenOptions::default()
+        },
+    );
+    tokio::pin!(second);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut second)
+            .await
+            .is_err()
+    );
+    drop(first);
+    let mut second = tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.read_bytes(5).await.unwrap().as_ref(), b"first");
+}
