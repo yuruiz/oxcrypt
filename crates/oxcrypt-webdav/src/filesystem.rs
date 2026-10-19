@@ -99,16 +99,18 @@ impl CryptomatorWebDav {
     }
 
     /// Parse a WebDAV path to a vault path string.
-    fn parse_path(path: &DavPath) -> String {
-        let path_str = path.as_url_string();
+    fn parse_path(path: &DavPath) -> Result<String, FsError> {
+        // DavPath already contains decoded, normalized path bytes. URL-encoding
+        // them again would store percent escapes as literal vault filenames.
+        let path_str = std::str::from_utf8(path.as_bytes()).map_err(|_| FsError::Forbidden)?;
         // Remove leading slash if present, then re-add it for consistency
         // Also remove trailing slash which would cause parsing issues
         let normalized = path_str.trim_start_matches('/').trim_end_matches('/');
         tracing::trace!(raw_path = %path_str, normalized = %normalized, "parse_path");
         if normalized.is_empty() {
-            String::new()
+            Ok(String::new())
         } else {
-            format!("/{normalized}")
+            Ok(format!("/{normalized}"))
         }
     }
 
@@ -512,7 +514,7 @@ impl DavFileSystem for CryptomatorWebDav {
         options: OpenOptions,
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         Box::pin(async move {
-            let vault_path = Self::parse_path(path);
+            let vault_path = Self::parse_path(path)?;
             debug!(vault_path = %vault_path, options = ?options, "Opening file");
 
             let writing = options.write || options.create || options.create_new;
@@ -586,7 +588,7 @@ impl DavFileSystem for CryptomatorWebDav {
         Box::pin(async move {
             let start = Instant::now();
             self.stats.record_metadata_op();
-            let vault_path = Self::parse_path(path);
+            let vault_path = Self::parse_path(path)?;
             let _paths = self.path_locks.acquire(&[(&vault_path, false)]).await?;
             debug!(vault_path = %vault_path, "Reading directory");
 
@@ -637,7 +639,7 @@ impl DavFileSystem for CryptomatorWebDav {
     fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         Box::pin(async move {
             let _meta_start = Instant::now();
-            let vault_path = Self::parse_path(path);
+            let vault_path = Self::parse_path(path)?;
             let _paths = self.path_locks.acquire(&[(&vault_path, false)]).await?;
             trace!(vault_path = %vault_path, "Getting metadata");
 
@@ -651,7 +653,7 @@ impl DavFileSystem for CryptomatorWebDav {
         Box::pin(async move {
             let start = Instant::now();
             self.stats.record_metadata_op();
-            let vault_path = Self::parse_path(path);
+            let vault_path = Self::parse_path(path)?;
             let _paths = self.path_locks.acquire(&[(&vault_path, true)]).await?;
             self.flush_tree(&vault_path).await?;
             debug!(vault_path = %vault_path, "Creating directory");
@@ -692,7 +694,7 @@ impl DavFileSystem for CryptomatorWebDav {
         Box::pin(async move {
             let start = Instant::now();
             self.stats.record_metadata_op();
-            let vault_path = Self::parse_path(path);
+            let vault_path = Self::parse_path(path)?;
             let _paths = self.path_locks.acquire(&[(&vault_path, true)]).await?;
             self.flush_tree(&vault_path).await?;
             debug!(vault_path = %vault_path, "Removing directory");
@@ -729,7 +731,7 @@ impl DavFileSystem for CryptomatorWebDav {
         Box::pin(async move {
             let start = Instant::now();
             self.stats.record_metadata_op();
-            let vault_path = Self::parse_path(path);
+            let vault_path = Self::parse_path(path)?;
             let _paths = self.path_locks.acquire(&[(&vault_path, true)]).await?;
             debug!(vault_path = %vault_path, "Removing file");
 
@@ -782,8 +784,8 @@ impl DavFileSystem for CryptomatorWebDav {
         Box::pin(async move {
             let start = Instant::now();
             self.stats.record_metadata_op();
-            let from_path = Self::parse_path(from);
-            let to_path = Self::parse_path(to);
+            let from_path = Self::parse_path(from)?;
+            let to_path = Self::parse_path(to)?;
             let _paths = self
                 .path_locks
                 .acquire(&[(&from_path, true), (&to_path, true)])
@@ -845,8 +847,8 @@ impl DavFileSystem for CryptomatorWebDav {
         Box::pin(async move {
             let start = Instant::now();
             self.stats.record_metadata_op();
-            let from_path = Self::parse_path(from);
-            let to_path = Self::parse_path(to);
+            let from_path = Self::parse_path(from)?;
+            let to_path = Self::parse_path(to)?;
             let _paths = self
                 .path_locks
                 .acquire(&[(&from_path, false), (&to_path, true)])
@@ -1074,15 +1076,15 @@ mod tests {
     #[test]
     fn test_parse_path() {
         assert_eq!(
-            CryptomatorWebDav::parse_path(&DavPath::new("/").unwrap()),
+            CryptomatorWebDav::parse_path(&DavPath::new("/").unwrap()).unwrap(),
             ""
         );
         assert_eq!(
-            CryptomatorWebDav::parse_path(&DavPath::new("/test.txt").unwrap()),
+            CryptomatorWebDav::parse_path(&DavPath::new("/test.txt").unwrap()).unwrap(),
             "/test.txt"
         );
         assert_eq!(
-            CryptomatorWebDav::parse_path(&DavPath::new("/foo/bar/baz.txt").unwrap()),
+            CryptomatorWebDav::parse_path(&DavPath::new("/foo/bar/baz.txt").unwrap()).unwrap(),
             "/foo/bar/baz.txt"
         );
     }
