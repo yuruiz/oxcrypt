@@ -14,6 +14,47 @@ use common::{
 };
 use reqwest::StatusCode;
 
+#[tokio::test]
+async fn overlapping_move_and_copy_preserve_the_original_tree() {
+    let server = TestServer::with_temp_vault().await;
+    server.mkcol_ok("/a").await;
+    server.mkcol_ok("/a/b").await;
+    server.put_ok("/a/b/important", "preserved").await;
+    for (from, to) in [("/a", "/a/nested"), ("/a", "/a/b/nested"), ("/a/b", "/a")] {
+        assert_eq!(
+            server.move_(from, to, true).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_file_content(&server, "/a/b/important", b"preserved").await;
+    }
+    let response = server
+        .client()
+        .request(
+            reqwest::Method::from_bytes(b"COPY").unwrap(),
+            server.url("/a/b"),
+        )
+        .header("Destination", server.url("/a"))
+        .header("Overwrite", "T")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_file_content(&server, "/a/b/important", b"preserved").await;
+    // Encoded separators must receive the same ancestry checks as decoded paths.
+    let response = server
+        .client()
+        .request(
+            reqwest::Method::from_bytes(b"MOVE").unwrap(),
+            server.url("/a"),
+        )
+        .header("Destination", server.url("/%61/b/nested"))
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert_file_content(&server, "/a/b/important", b"preserved").await;
+}
+
 // ============================================================================
 // File Move (Rename) Tests
 // ============================================================================

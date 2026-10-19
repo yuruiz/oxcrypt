@@ -120,7 +120,44 @@ impl Drop for WebDavServer {
     }
 }
 
-/// Run the server accept loop.
+/// Reject overlapping trees before downstream overwrite handling.
+fn validate_copy_move_paths<B>(request: &Request<B>) -> Result<(), hyper::StatusCode> {
+    use dav_server::davpath::DavPath;
+    use hyper::StatusCode;
+    let method = request.method().as_str();
+    if method != "MOVE" && method != "COPY" {
+        return Ok(());
+    }
+    let Some(destination) = request.headers().get("Destination") else {
+        return Ok(());
+    };
+    let destination = destination.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let destination: hyper::Uri = destination.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let source = DavPath::new(request.uri().path()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let target = DavPath::new(destination.path()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let source = source
+        .as_bytes()
+        .strip_suffix(b"/")
+        .unwrap_or(source.as_bytes());
+    let target = target
+        .as_bytes()
+        .strip_suffix(b"/")
+        .unwrap_or(target.as_bytes());
+    let descendant = |path: &[u8], parent: &[u8]| {
+        path.strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+    };
+    // dav-server can recursively delete an overwritten destination before
+    // calling the filesystem. Reject overlapping trees before that deletion.
+    if source == target
+        || descendant(source, target)
+        || (method == "MOVE" && descendant(target, source))
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
 async fn run_server(listener: TcpListener, handler: Arc<DavHandler>) {
     loop {
         match listener.accept().await {
@@ -131,6 +168,12 @@ async fn run_server(listener: TcpListener, handler: Arc<DavHandler>) {
                     let service = service_fn(move |req: Request<Incoming>| {
                         let handler = handler.clone();
                         async move {
+                            if let Err(status) = validate_copy_move_paths(&req) {
+                                let mut response =
+                                    hyper::Response::new(dav_server::body::Body::empty());
+                                *response.status_mut() = status;
+                                return Ok::<_, Infallible>(response);
+                            }
                             let resp = handler.handle(req).await;
                             Ok::<_, Infallible>(resp)
                         }
