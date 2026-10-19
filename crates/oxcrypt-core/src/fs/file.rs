@@ -66,8 +66,8 @@ impl fmt::Display for FileContext {
         if let Some(ref dir_id) = self.dir_id {
             let display_id = if dir_id.is_empty() {
                 "<root>".to_string()
-            } else if dir_id.len() > 8 {
-                format!("{}...", &dir_id[..8])
+            } else if dir_id.chars().nth(8).is_some() {
+                format!("{dir_id:.8}...")
             } else {
                 dir_id.clone()
             };

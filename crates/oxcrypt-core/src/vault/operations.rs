@@ -131,8 +131,8 @@ impl std::fmt::Display for VaultOpContext {
             parts.push(format!("file '{filename}'"));
         }
         if let Some(ref dir_id) = self.dir_id {
-            let display_id = if dir_id.len() > 12 {
-                format!("{}...", &dir_id[..12])
+            let display_id = if dir_id.chars().nth(12).is_some() {
+                format!("{dir_id:.12}...")
             } else {
                 dir_id.clone()
             };
