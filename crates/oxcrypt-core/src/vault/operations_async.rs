@@ -45,7 +45,7 @@ use crate::{
     fs::file_async::decrypt_file_with_context_and_cipher_async,
     fs::name::{create_c9s_filename, decrypt_filename, encrypt_filename},
     fs::streaming::{VaultFileReader, VaultFileWriter},
-    fs::symlink::{decrypt_symlink_target, encrypt_symlink_target},
+    fs::symlink::{decrypt_symlink_target_with_cipher, encrypt_symlink_target_with_cipher},
     vault::cache::VaultCache,
     vault::config::{
         CipherCombo, ClaimValidationError, VaultError, extract_master_key, validate_vault_claims,
@@ -1363,7 +1363,11 @@ impl VaultOperationsAsync {
         // Perform async I/O to check if symlink exists and read its target
         match fs::read(&paths.content_path).await {
             Ok(encrypted_data) => {
-                let target = decrypt_symlink_target(&encrypted_data, &self.master_key)?;
+                let target = decrypt_symlink_target_with_cipher(
+                    &encrypted_data,
+                    &self.master_key,
+                    self.cipher_combo(),
+                )?;
                 trace!(
                     target_len = target.len(),
                     shortened = paths.is_shortened,
@@ -3888,7 +3892,11 @@ impl VaultOperationsAsync {
                         .with_encrypted_path(&symlink_file)
                         .with_dir_id(parent_dir_id.as_str()),
                 })?;
-        let target = decrypt_symlink_target(&encrypted_data, &self.master_key)?;
+        let target = decrypt_symlink_target_with_cipher(
+            &encrypted_data,
+            &self.master_key,
+            self.cipher_combo(),
+        )?;
 
         Ok(VaultSymlinkInfo {
             name: decrypted_name,
@@ -3962,7 +3970,11 @@ impl VaultOperationsAsync {
                 let symlink_file = shortened_dir.join("symlink.c9r");
                 if fs::try_exists(&symlink_file).await.unwrap_or(false) {
                     let encrypted_data = fs::read(&symlink_file).await?;
-                    let target = decrypt_symlink_target(&encrypted_data, &self.master_key)?;
+                    let target = decrypt_symlink_target_with_cipher(
+                        &encrypted_data,
+                        &self.master_key,
+                        self.cipher_combo(),
+                    )?;
                     info!(
                         target_len = target.len(),
                         "Symlink target decrypted successfully"
@@ -3987,7 +3999,11 @@ impl VaultOperationsAsync {
         }
 
         let encrypted_data = fs::read(&symlink_file).await?;
-        let target = decrypt_symlink_target(&encrypted_data, &self.master_key)?;
+        let target = decrypt_symlink_target_with_cipher(
+            &encrypted_data,
+            &self.master_key,
+            self.cipher_combo(),
+        )?;
         info!(
             target_len = target.len(),
             "Symlink target decrypted successfully"
@@ -4081,7 +4097,8 @@ impl VaultOperationsAsync {
         }
 
         // Encrypt and write the symlink target
-        let encrypted_target = encrypt_symlink_target(target, &self.master_key)?;
+        let encrypted_target =
+            encrypt_symlink_target_with_cipher(target, &self.master_key, self.cipher_combo())?;
         self.safe_write(&symlink_dir.join("symlink.c9r"), &encrypted_target)
             .await?;
 
