@@ -2450,7 +2450,7 @@ impl VaultOperationsAsync {
 
         let _topology_guard = self.lock_manager.topology_write().await;
         // Acquire parent directory write lock first
-        let _parent_guard = self.lock_directory_write(parent_dir_id).await;
+        let parent_guard = self.lock_directory_write(parent_dir_id).await;
         trace!("Acquired parent directory write lock for delete_directory");
 
         let ctx = VaultOpContext::new()
@@ -2478,9 +2478,12 @@ impl VaultOperationsAsync {
 
         trace!(target_dir_id = %dir_info.directory_id.as_str(), "Found directory to delete");
 
-        // Acquire target directory write lock (in addition to parent lock)
-        let _target_guard = self.lock_directory_write(&dir_info.directory_id).await;
-        trace!("Acquired target directory write lock for delete_directory");
+        // Keep topology fixed while acquiring parent and child exactly once,
+        // in the same order used by cross-directory file operations.
+        drop(parent_guard);
+        let _directory_guards = self
+            .lock_directories_write_ordered(&[parent_dir_id, &dir_info.directory_id])
+            .await;
 
         // Check directory is empty (use unlocked versions since we hold both locks)
         let target_ctx = ctx.clone().with_dir_id(dir_info.directory_id.as_str());
@@ -2791,7 +2794,7 @@ impl VaultOperationsAsync {
             return Ok(());
         }
         let topology_guard = self.lock_manager.topology_write().await;
-        let parent_guards = self
+        let mut parent_guards = self
             .lock_directories_write_ordered(&[source_dir, target_dir])
             .await;
         let source_encrypted =
@@ -2848,11 +2851,15 @@ impl VaultOperationsAsync {
         } else {
             None
         };
-        let child_guard = if let Some(id) = target_child.as_ref() {
-            Some(self.lock_directory_write(id).await)
-        } else {
-            None
-        };
+        if let Some(id) = target_child.as_ref() {
+            // Topology remains fixed while reacquiring the complete lock set.
+            // Deduplication handles replacing an ancestor; ordering also avoids
+            // inversion with file moves that lock multiple directories.
+            drop(parent_guards);
+            parent_guards = self
+                .lock_directories_write_ordered(&[source_dir, target_dir, id])
+                .await;
+        }
         if let Some(id) = target_child.as_ref() {
             let storage = self.calculate_directory_storage_path(id)?;
             let mut entries = fs::read_dir(storage).await?;
@@ -2867,7 +2874,7 @@ impl VaultOperationsAsync {
         let root = self.vault_path().to_path_buf();
         let shortened = (target_encrypted.len() > threshold).then_some(target_encrypted);
         tokio::task::spawn_blocking(move || {
-            let _guards = (topology_guard, parent_guards, child_guard);
+            let _guards = (topology_guard, parent_guards);
             namespace::replace(&source, &target, shortened.as_deref(), &root)
         })
         .await

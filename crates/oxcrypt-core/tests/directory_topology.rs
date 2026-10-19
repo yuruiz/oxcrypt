@@ -70,3 +70,33 @@ async fn competing_moves_cannot_create_a_cycle() {
         1
     );
 }
+
+#[tokio::test]
+async fn replacing_an_ancestor_returns_an_error_without_relocking_it() {
+    let (_temp, ops) = vault();
+    let root = DirId::root();
+    let a = ops.create_directory(&root, "a").await.unwrap();
+    let b = ops.create_directory(&a, "b").await.unwrap();
+    let c = ops.create_directory(&b, "c").await.unwrap();
+    for (parent, name) in [(&a, "b"), (&b, "c")] {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ops.rename_entry_atomic(parent, name, &root, "a"),
+        )
+        .await;
+        assert!(result.unwrap().is_err());
+    }
+    assert_eq!(
+        ops.find_directory(&root, "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .directory_id,
+        a
+    );
+    ops.write_file(&c, "still-usable", b"intact").await.unwrap();
+    assert_eq!(
+        ops.read_file(&c, "still-usable").await.unwrap().content,
+        b"intact"
+    );
+}
