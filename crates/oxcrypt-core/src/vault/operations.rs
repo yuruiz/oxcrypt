@@ -2447,20 +2447,36 @@ impl VaultOperations {
         // Check physical entries so symlinks and unreadable/unknown names cannot
         // be silently discarded by a logical listing that filters them out.
         let storage_path = self.calculate_directory_storage_path(&dir_info.directory_id)?;
-        for entry in fs::read_dir(&storage_path)? {
-            if entry?.file_name() != "dirid.c9r" {
-                return Err(VaultWriteError::DirectoryNotEmpty {
-                    context: Box::new(ctx.clone().with_encrypted_path(&dir_info.encrypted_path)),
-                });
+        if !crate::fs::durability::directory_exists_checked(
+            &dir_info.encrypted_path,
+            self.vault_path(),
+        )? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "directory entry disappeared",
+            )
+            .into());
+        }
+        let storage_exists =
+            crate::fs::durability::directory_exists_checked(&storage_path, self.vault_path())?;
+        if storage_exists {
+            for entry in fs::read_dir(&storage_path)? {
+                if entry?.file_name() != "dirid.c9r" {
+                    return Err(VaultWriteError::DirectoryNotEmpty {
+                        context: Box::new(
+                            ctx.clone().with_encrypted_path(&dir_info.encrypted_path),
+                        ),
+                    });
+                }
             }
+            match fs::remove_file(storage_path.join("dirid.c9r")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            // Non-recursive removal also protects entries created after the check.
+            fs::remove_dir(&storage_path)?;
         }
-        match fs::remove_file(storage_path.join("dirid.c9r")) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        // Non-recursive removal also protects entries created after the check.
-        fs::remove_dir(&storage_path)?;
 
         // 4. Remove the directory entry from parent
         debug!("Removing directory entry from parent");
@@ -2468,7 +2484,7 @@ impl VaultOperations {
             fs::remove_dir_all(&dir_info.encrypted_path)?;
         }
 
-        if let Some(parent) = storage_path.parent() {
+        if storage_exists && let Some(parent) = storage_path.parent() {
             crate::fs::durability::sync_directory_chain(parent, self.vault_path())?;
         }
         if let Some(parent) = dir_info.encrypted_path.parent() {
