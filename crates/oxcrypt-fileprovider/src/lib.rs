@@ -105,6 +105,9 @@ mod ffi {
         #[swift_bridge(swift_name = "changesSince")]
         fn changes_since(&self, anchor: &str) -> FpResultChanges;
 
+        #[swift_bridge(swift_name = "changesInDirectorySince")]
+        fn changes_in_directory_since(&self, container: &str, anchor: &str) -> FpResultChanges;
+
         #[swift_bridge(swift_name = "currentAnchor")]
         fn current_anchor(&self) -> String;
 
