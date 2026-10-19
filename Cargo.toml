@@ -98,3 +98,5 @@ debug = true
 # copy probes libfuse3 first there. Remove once fixed upstream.
 [patch.crates-io]
 fuser = { path = "vendor/fuser" }
+# Atomic GUARDED and persistent-verifier EXCLUSIVE CREATE hooks.
+nfsserve = { path = "vendor/nfsserve" }

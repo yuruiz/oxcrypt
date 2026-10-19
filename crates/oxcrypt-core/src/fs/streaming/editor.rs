@@ -63,6 +63,7 @@ pub struct VaultFileEditor {
     expected: Option<Identity>,
     pending_accessed: Option<std::time::SystemTime>,
     pending_modified: Option<std::time::SystemTime>,
+    require_exact_times: bool,
     stats: EditStats,
 }
 
@@ -98,6 +99,7 @@ impl VaultFileEditor {
             expected,
             pending_accessed: None,
             pending_modified: None,
+            require_exact_times: false,
             stats: EditStats::default(),
         })
     }
@@ -471,6 +473,39 @@ impl VaultFileEditor {
         Ok(())
     }
 
+    /// Set timestamps that must survive publication exactly, on an unpublished
+    /// file only. Used for protocols that store creation verifiers in metadata.
+    pub fn set_initial_times_exact(
+        &mut self,
+        accessed: std::time::SystemTime,
+        modified: std::time::SystemTime,
+    ) -> io::Result<()> {
+        if self.expected.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file already exists",
+            ));
+        }
+        self.set_times(Some(accessed), Some(modified))?;
+        self.require_exact_times = true;
+        self.check_exact_times(&self.reader.file)
+    }
+
+    fn check_exact_times(&self, file: &File) -> io::Result<()> {
+        if self.require_exact_times {
+            let metadata = file.metadata()?;
+            if Some(metadata.accessed()?) != self.pending_accessed
+                || Some(metadata.modified()?) != self.pending_modified
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "filesystem cannot preserve the creation verifier timestamps",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Copy the current ciphertext to an independent recovery location.
     pub fn copy_ciphertext(&mut self, destination: &Path) -> io::Result<()> {
         // Recovery must work even when the vault stage can no longer be written.
@@ -560,6 +595,7 @@ impl VaultFileEditor {
         }
         published.set_times(times)?;
         published.sync_all()?;
+        self.check_exact_times(&published)?;
         fs::rename(&candidate_path, destination)?;
         self.expected = Some(Identity::of(&published.metadata()?)?);
         crate::fs::durability::sync_directory_chain(parent, vault_root)?;
@@ -570,6 +606,7 @@ impl VaultFileEditor {
         self.pending_accessed = None;
         self.pending_modified = None;
         self.dirty = false;
+        self.require_exact_times = false;
         Ok(())
     }
 }
