@@ -51,6 +51,7 @@ mod error;
 mod file;
 mod filesystem;
 mod metadata;
+mod path_locks;
 mod server;
 
 // Public exports

@@ -50,6 +50,7 @@ pub struct CryptomatorWebDav {
     /// Write buffer table for pending PUT operations.
     write_buffers: Arc<WriteBufferTable>,
     flush_lock: Arc<tokio::sync::Mutex<()>>,
+    path_locks: Arc<crate::path_locks::PathLocks>,
     /// Metadata cache to reduce vault operations.
     metadata_cache: Arc<MetadataCache>,
     /// Path resolution cache (vault_path -> DirId).
@@ -76,6 +77,7 @@ impl CryptomatorWebDav {
             ops,
             write_buffers: Arc::new(HandleTable::new()),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            path_locks: Arc::new(crate::path_locks::PathLocks::default()),
             metadata_cache: Arc::new(metadata_cache),
             path_cache: Arc::new(path_cache),
             stats,
@@ -253,6 +255,10 @@ impl CryptomatorWebDav {
     /// Flush a write buffer to the vault.
     async fn flush_write_buffer(&self, path: &str) -> Result<(), FsError> {
         let _guard = self.flush_lock.lock().await;
+        self.flush_write_buffer_unlocked(path).await
+    }
+
+    async fn flush_write_buffer_unlocked(&self, path: &str) -> Result<(), FsError> {
         let path_key = path.to_string();
         let Some(buffer) = self
             .write_buffers
@@ -277,6 +283,24 @@ impl CryptomatorWebDav {
         } else {
             format!("{}/{}", parent.trim_end_matches('/'), name)
         }
+    }
+
+    /// Flush retained edits before a tree is moved, copied, or removed.
+    /// The caller holds a path lock excluding writers throughout this subtree.
+    async fn flush_tree(&self, root: &str) -> Result<(), FsError> {
+        let _guard = self.flush_lock.lock().await;
+        let prefix = format!("{root}/");
+        let mut paths = Vec::new();
+        self.write_buffers.retain(|path, _| {
+            if path == root || path.starts_with(&prefix) {
+                paths.push(path.clone());
+            }
+            true
+        });
+        for path in paths {
+            self.flush_write_buffer_unlocked(&path).await?;
+        }
+        Ok(())
     }
 
     async fn delete_directory_contents_recursive(
@@ -491,6 +515,8 @@ impl DavFileSystem for CryptomatorWebDav {
             let vault_path = Self::parse_path(path);
             debug!(vault_path = %vault_path, options = ?options, "Opening file");
 
+            let writing = options.write || options.create || options.create_new;
+            let path_guards = self.path_locks.acquire(&[(&vault_path, writing)]).await?;
             let (dir_id, filename) = self.resolve_path(&vault_path).await?;
             if options.write || options.create || options.create_new {
                 let _guard = self.flush_lock.lock().await;
@@ -504,6 +530,9 @@ impl DavFileSystem for CryptomatorWebDav {
                         Err(error) => return Err(error),
                     }
                 }
+                // A previous request may have dropped after a failed flush.
+                // Persist that data before opening a replacement writer.
+                self.flush_write_buffer_unlocked(&vault_path).await?;
                 let editor = Arc::new(
                     EditBuffer::open(
                         &self.ops,
@@ -526,12 +555,14 @@ impl DavFileSystem for CryptomatorWebDav {
                     Arc::clone(&self.stats),
                     Arc::clone(&self.write_buffers),
                     Arc::clone(&self.flush_lock),
+                    path_guards,
                 );
                 if options.append {
                     file.seek(std::io::SeekFrom::End(0)).await?;
                 }
                 Ok(Box::new(file) as Box<dyn DavFile>)
             } else {
+                self.flush_write_buffer(&vault_path).await?;
                 let reader = self
                     .ops
                     .open_file_unlocked(&dir_id, &filename)
@@ -556,6 +587,7 @@ impl DavFileSystem for CryptomatorWebDav {
             let start = Instant::now();
             self.stats.record_metadata_op();
             let vault_path = Self::parse_path(path);
+            let _paths = self.path_locks.acquire(&[(&vault_path, false)]).await?;
             debug!(vault_path = %vault_path, "Reading directory");
 
             let dir_id = match self.resolve_dir_path(&vault_path).await {
@@ -606,6 +638,7 @@ impl DavFileSystem for CryptomatorWebDav {
         Box::pin(async move {
             let _meta_start = Instant::now();
             let vault_path = Self::parse_path(path);
+            let _paths = self.path_locks.acquire(&[(&vault_path, false)]).await?;
             trace!(vault_path = %vault_path, "Getting metadata");
 
             let meta = self.find_entry(&vault_path).await?;
@@ -619,6 +652,8 @@ impl DavFileSystem for CryptomatorWebDav {
             let start = Instant::now();
             self.stats.record_metadata_op();
             let vault_path = Self::parse_path(path);
+            let _paths = self.path_locks.acquire(&[(&vault_path, true)]).await?;
+            self.flush_tree(&vault_path).await?;
             debug!(vault_path = %vault_path, "Creating directory");
 
             // Check if the path already exists (RFC 4918: MKCOL on existing resource returns 405)
@@ -658,6 +693,8 @@ impl DavFileSystem for CryptomatorWebDav {
             let start = Instant::now();
             self.stats.record_metadata_op();
             let vault_path = Self::parse_path(path);
+            let _paths = self.path_locks.acquire(&[(&vault_path, true)]).await?;
+            self.flush_tree(&vault_path).await?;
             debug!(vault_path = %vault_path, "Removing directory");
 
             let (parent_dir_id, name) = match self.resolve_path(&vault_path).await {
@@ -693,10 +730,11 @@ impl DavFileSystem for CryptomatorWebDav {
             let start = Instant::now();
             self.stats.record_metadata_op();
             let vault_path = Self::parse_path(path);
+            let _paths = self.path_locks.acquire(&[(&vault_path, true)]).await?;
             debug!(vault_path = %vault_path, "Removing file");
 
             // First flush any pending writes
-            self.flush_write_buffer(&vault_path).await?;
+            self.flush_tree(&vault_path).await?;
 
             let (parent_dir_id, name) = match self.resolve_path(&vault_path).await {
                 Ok(result) => result,
@@ -746,10 +784,15 @@ impl DavFileSystem for CryptomatorWebDav {
             self.stats.record_metadata_op();
             let from_path = Self::parse_path(from);
             let to_path = Self::parse_path(to);
+            let _paths = self
+                .path_locks
+                .acquire(&[(&from_path, true), (&to_path, true)])
+                .await?;
             debug!(from = %from_path, to = %to_path, "Renaming/moving");
 
             // Flush any pending writes on source
-            self.flush_write_buffer(&from_path).await?;
+            self.flush_tree(&from_path).await?;
+            self.flush_tree(&to_path).await?;
 
             let (from_dir_id, from_name) = match self.resolve_path(&from_path).await {
                 Ok(result) => result,
@@ -804,7 +847,14 @@ impl DavFileSystem for CryptomatorWebDav {
             self.stats.record_metadata_op();
             let from_path = Self::parse_path(from);
             let to_path = Self::parse_path(to);
+            let _paths = self
+                .path_locks
+                .acquire(&[(&from_path, false), (&to_path, true)])
+                .await?;
             debug!(from = %from_path, to = %to_path, "Copying");
+
+            self.flush_tree(&from_path).await?;
+            self.flush_tree(&to_path).await?;
 
             let source_meta = match self.find_entry(&from_path).await {
                 Ok(meta) => meta,
