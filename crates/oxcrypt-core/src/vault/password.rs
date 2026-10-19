@@ -192,13 +192,15 @@ impl PasswordValidator {
         let vault_config_path = self.vault_path.join("vault.cryptomator");
         tracing::info!("Reading vault.cryptomator...");
         let vault_config_jwt =
-            read_with_timeout(&vault_config_path, timeout).map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    PasswordValidationError::ConfigNotFound(vault_config_path.clone())
-                }
-                std::io::ErrorKind::TimedOut => PasswordValidationError::Timeout,
-                _ => PasswordValidationError::Io(e),
-            })?;
+            read_with_timeout(&self.vault_path, Path::new("vault.cryptomator"), timeout).map_err(
+                |e| match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        PasswordValidationError::ConfigNotFound(vault_config_path.clone())
+                    }
+                    std::io::ErrorKind::TimedOut => PasswordValidationError::Timeout,
+                    _ => PasswordValidationError::Io(e),
+                },
+            )?;
         tracing::info!("vault.cryptomator read successfully");
 
         // Parse JWT header to find masterkey file path
@@ -207,27 +209,19 @@ impl PasswordValidator {
             PasswordValidationError::InvalidFormat("Missing 'kid' in vault config JWT".to_string())
         })?;
 
-        let masterkey_uri = url::Url::parse(&kid).map_err(|e| {
-            PasswordValidationError::InvalidFormat(format!("Invalid masterkey URI: {e}"))
-        })?;
-
-        if masterkey_uri.scheme() != "masterkeyfile" {
-            return Err(PasswordValidationError::InvalidFormat(format!(
-                "Unsupported masterkey scheme: {}",
-                masterkey_uri.scheme()
-            )));
-        }
-
-        // Read masterkey.cryptomator with timeout
-        let masterkey_path = self.vault_path.join(Path::new(masterkey_uri.path()));
+        let relative = crate::vault::config::masterkey_relative_path(&kid)
+            .map_err(|error| PasswordValidationError::InvalidFormat(error.to_string()))?;
+        let masterkey_path = self.vault_path.join(&relative);
         tracing::info!("Reading masterkey.cryptomator...");
         let masterkey_json =
-            read_with_timeout(&masterkey_path, timeout).map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    PasswordValidationError::MasterKeyNotFound(masterkey_path.clone())
+            read_with_timeout(&self.vault_path, &relative, timeout).map_err(|e| {
+                match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        PasswordValidationError::MasterKeyNotFound(masterkey_path.clone())
+                    }
+                    std::io::ErrorKind::TimedOut => PasswordValidationError::Timeout,
+                    _ => PasswordValidationError::Io(e),
                 }
-                std::io::ErrorKind::TimedOut => PasswordValidationError::Timeout,
-                _ => PasswordValidationError::Io(e),
             })?;
         tracing::info!("masterkey.cryptomator read successfully");
 
@@ -275,14 +269,17 @@ impl PasswordValidator {
 ///
 /// Spawns a thread to perform the read, returning an error if it doesn't
 /// complete within the timeout.
-fn read_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<String> {
-    let path = path.to_path_buf();
+fn read_with_timeout(root: &Path, relative: &Path, timeout: Duration) -> std::io::Result<String> {
+    let root = root.to_path_buf();
+    let relative = relative.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
 
-    std::thread::spawn(move || {
-        let result = std::fs::read_to_string(&path);
-        let _ = tx.send(result);
-    });
+    std::thread::Builder::new()
+        .name("vault-metadata-read".into())
+        .spawn(move || {
+            let result = crate::vault::metadata::read_vault_file(&root, &relative);
+            let _ = tx.send(result);
+        })?;
 
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
@@ -298,7 +295,7 @@ fn read_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<String> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::vault::password::*;
     use tempfile::TempDir;
 
     #[test]
@@ -317,14 +314,18 @@ mod tests {
         let file_path = temp.path().join("test.txt");
         std::fs::write(&file_path, "hello").unwrap();
 
-        let result = read_with_timeout(&file_path, Duration::from_secs(1));
+        let result = read_with_timeout(temp.path(), Path::new("test.txt"), Duration::from_secs(1));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "hello");
     }
 
     #[test]
     fn test_read_with_timeout_nonexistent_file() {
-        let result = read_with_timeout(Path::new("/nonexistent/file"), Duration::from_secs(1));
+        let result = read_with_timeout(
+            Path::new("/nonexistent"),
+            Path::new("file"),
+            Duration::from_secs(1),
+        );
         assert!(matches!(result, Err(e) if e.kind() == std::io::ErrorKind::NotFound));
     }
 }

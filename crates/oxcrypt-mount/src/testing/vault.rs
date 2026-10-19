@@ -109,7 +109,7 @@ mod tests {
         assert!(vault.path.exists());
         assert!(vault.path.join("vault.cryptomator").exists());
         // VaultCreator puts masterkey in a subdirectory
-        assert!(vault.path.join("masterkey/masterkey.cryptomator").exists());
+        assert!(vault.path.join("masterkey.cryptomator").exists());
     }
 
     #[test]

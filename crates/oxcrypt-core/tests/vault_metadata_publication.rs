@@ -10,7 +10,7 @@ fn creation_refuses_existing_key_material_even_if_config_is_missing() {
     original
         .write_file(&DirId::root(), "note", b"preserved")
         .unwrap();
-    let key_path = path.join("masterkey/masterkey.cryptomator");
+    let key_path = path.join("masterkey.cryptomator");
     let key_bytes = std::fs::read(&key_path).unwrap();
     std::fs::remove_file(path.join("vault.cryptomator")).unwrap();
     assert!(
@@ -91,8 +91,7 @@ async fn password_change_does_not_follow_a_predictable_temporary_symlink() {
         .unwrap();
     let sentinel = temp.path().join("sentinel");
     std::fs::write(&sentinel, b"must not be overwritten").unwrap();
-    std::os::unix::fs::symlink(&sentinel, path.join("masterkey/masterkey.cryptomator.tmp"))
-        .unwrap();
+    std::os::unix::fs::symlink(&sentinel, path.join("masterkey.cryptomator.tmp")).unwrap();
     change_password_async(&path, "original-password", "new-password")
         .await
         .unwrap();

@@ -397,6 +397,9 @@ pub enum MasterKeyExtractionError {
     #[error("Invalid masterkey file scheme")]
     InvalidScheme,
 
+    #[error("Invalid masterkey path: {0}")]
+    InvalidMasterKeyPath(&'static str),
+
     #[error("Master key file not found at path: {0}")]
     MasterKeyFileNotFound(PathBuf),
 
@@ -430,28 +433,52 @@ pub fn extract_master_key(
     vault_path: &Path,
     passphrase: &str,
 ) -> Result<MasterKey, MasterKeyExtractionError> {
-    let vault_config_path = vault_path.join("vault.cryptomator");
-    let vault_config = fs::read_to_string(&vault_config_path)?;
-    let header = jsonwebtoken::decode_header(&vault_config)?;
-
-    let kid = header.kid.ok_or(MasterKeyExtractionError::MissingKid)?;
-    let masterkey_uri = Url::parse(&kid)?;
-
-    if masterkey_uri.scheme() != "masterkeyfile" {
-        return Err(MasterKeyExtractionError::InvalidScheme);
-    }
-
-    let master_key_path = vault_path.join(Path::new(masterkey_uri.path()));
-    if !master_key_path.exists() {
-        return Err(MasterKeyExtractionError::MasterKeyFileNotFound(
-            master_key_path,
-        ));
-    }
+    let vault_config =
+        crate::vault::metadata::read_vault_file(vault_path, Path::new("vault.cryptomator"))?;
+    let master_key_path = masterkey_path(vault_path, &vault_config)?;
 
     let master_key_data_json = fs::read_to_string(&master_key_path)?;
     let master_key_data: MasterKeyFile = serde_json::from_str(&master_key_data_json)?;
 
     Ok(master_key_data.unlock(passphrase)?)
+}
+
+/// Parse an unverified key identifier without touching local or network paths.
+pub(crate) fn masterkey_relative_path(kid: &str) -> Result<PathBuf, MasterKeyExtractionError> {
+    let uri = Url::parse(kid)?;
+    if uri.scheme() != "masterkeyfile" {
+        return Err(MasterKeyExtractionError::InvalidScheme);
+    }
+    if uri.has_host() || uri.query().is_some() || uri.fragment().is_some() {
+        return Err(MasterKeyExtractionError::InvalidMasterKeyPath(
+            "authority, query and fragment are not permitted",
+        ));
+    }
+    let decoded = percent_encoding::percent_decode_str(uri.path())
+        .decode_utf8()
+        .map_err(|_| MasterKeyExtractionError::InvalidMasterKeyPath("path is not UTF-8"))?;
+    if !crate::vault::metadata::valid_relative_path(&decoded) {
+        return Err(MasterKeyExtractionError::InvalidMasterKeyPath(
+            "path must stay inside the vault",
+        ));
+    }
+    Ok(PathBuf::from(decoded.as_ref()))
+}
+
+pub(crate) fn masterkey_path(
+    vault: &Path,
+    config: &str,
+) -> Result<PathBuf, MasterKeyExtractionError> {
+    let header = jsonwebtoken::decode_header(config)?;
+    let relative =
+        masterkey_relative_path(&header.kid.ok_or(MasterKeyExtractionError::MissingKid)?)?;
+    crate::vault::metadata::resolve_vault_file(vault, &relative).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            MasterKeyExtractionError::MasterKeyFileNotFound(vault.join(relative))
+        } else {
+            MasterKeyExtractionError::Io(error)
+        }
+    })
 }
 
 /// Validate and decode the vault configuration JWT claims.
@@ -515,16 +542,49 @@ pub fn create_vault_config(
 
     let encoding_key = master_key.create_jwt_encoding_key()?;
     let mut header = jsonwebtoken::Header::new(Algorithm::HS256);
-    header.kid = Some("masterkeyfile:masterkey/masterkey.cryptomator".to_string());
+    header.kid = Some("masterkeyfile:masterkey.cryptomator".to_string());
 
     Ok(jsonwebtoken::encode(&header, &claims, &encoding_key)?)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::vault::config::*;
     use data_encoding::BASE64URL_NOPAD;
     use uuid::Uuid;
+
+    #[test]
+    fn unverified_key_uris_reject_escapes_and_devices_without_io() {
+        for kid in [
+            "masterkeyfile:../outside",
+            "masterkeyfile:/absolute/key",
+            "masterkeyfile://example.invalid/share/key",
+            r"masterkeyfile:\\example.invalid\share\key",
+            "masterkeyfile:C:/key",
+            "masterkeyfile:%2e%2e/outside",
+            "masterkeyfile:..%20/outside",
+            "masterkeyfile:keys%5c..%5coutside",
+            "masterkeyfile:keys/key?query",
+            "masterkeyfile:keys/key#fragment",
+            "masterkeyfile:NUL",
+            "masterkeyfile:COM1.txt",
+            "masterkeyfile:CON%20.txt",
+            "masterkeyfile:keys/key:stream",
+            "masterkeyfile:.",
+            "masterkeyfile:%00key",
+            "masterkeyfile:%FF",
+        ] {
+            assert!(masterkey_relative_path(kid).is_err(), "accepted {kid}");
+        }
+        assert_eq!(
+            masterkey_relative_path("masterkeyfile:masterkey.cryptomator").unwrap(),
+            Path::new("masterkey.cryptomator")
+        );
+        assert_eq!(
+            masterkey_relative_path("masterkeyfile:my%20keys/key%2Bfile").unwrap(),
+            Path::new("my keys/key+file")
+        );
+    }
 
     #[test]
     fn test_claim_validation() {
