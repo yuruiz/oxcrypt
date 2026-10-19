@@ -5,14 +5,17 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+#[path = "bundle_validation.rs"]
+mod bundle_validation;
+
 fn main() {
     // Configure swift_bridge to generate FFI bindings
     configure_swift_bridge();
 
     let extension_bundle = PathBuf::from("extension/build/OxCryptFileProvider.app");
 
-    if extension_bundle.exists() {
-        println!("cargo:rerun-if-changed=extension/build/OxCryptFileProvider.app");
+    println!("cargo:rerun-if-changed=extension/build/OxCryptFileProvider.app");
+    if bundle_validation::complete_bundle(&extension_bundle) {
         println!(
             "cargo:rustc-env=EXTENSION_BUNDLE_PATH={}",
             extension_bundle.display()

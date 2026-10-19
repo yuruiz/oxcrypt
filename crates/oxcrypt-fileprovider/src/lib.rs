@@ -14,6 +14,10 @@
 // swift_bridge generates code with unnecessary casts that we can't control
 #![allow(clippy::unnecessary_cast)]
 
+#[cfg(test)]
+#[path = "../bundle_validation.rs"]
+mod bundle_validation;
+
 mod filesystem;
 mod item;
 
