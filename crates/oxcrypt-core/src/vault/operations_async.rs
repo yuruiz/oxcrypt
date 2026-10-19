@@ -4703,23 +4703,22 @@ pub async fn change_password_async(
 ) -> Result<(), ChangePasswordAsyncError> {
     use crate::vault::master_key::change_password;
 
-    let masterkey_dir = vault_path.join("masterkey");
-    let masterkey_path = masterkey_dir.join("masterkey.cryptomator");
-
-    // Clone values for the blocking task
-    let path = masterkey_path.clone();
-    let old_pw = old_passphrase.to_string();
-    let new_pw = new_passphrase.to_string();
-
-    // Run crypto operations in blocking task (scrypt is CPU-intensive)
-    let new_content = tokio::task::spawn_blocking(move || change_password(&path, &old_pw, &new_pw))
-        .await
-        .map_err(|e| ChangePasswordAsyncError::TaskJoin(e.to_string()))??;
-
-    // Atomic write: write to temp file, then rename
-    let temp_path = masterkey_dir.join("masterkey.cryptomator.tmp");
-    fs::write(&temp_path, &new_content).await?;
-    fs::rename(&temp_path, &masterkey_path).await?;
+    let root = std::path::absolute(vault_path)?;
+    let masterkey_path = root.join("masterkey/masterkey.cryptomator");
+    let old_pw = zeroize::Zeroizing::new(old_passphrase.to_owned());
+    let new_pw = zeroize::Zeroizing::new(new_passphrase.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let new_content = change_password(&masterkey_path, &old_pw, &new_pw)?;
+        crate::fs::durability::write_atomic(
+            &masterkey_path,
+            new_content.as_bytes(),
+            &root,
+            crate::fs::durability::AtomicWriteMode::Replace,
+        )?;
+        Ok::<_, ChangePasswordAsyncError>(())
+    })
+    .await
+    .map_err(|error| ChangePasswordAsyncError::TaskJoin(error.to_string()))??;
 
     info!("Vault password changed successfully");
     Ok(())

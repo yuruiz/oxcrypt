@@ -65,53 +65,22 @@ pub fn ChangePasswordDialog(props: ChangePasswordDialogProps) -> Element {
             let new_pw = new_password();
 
             spawn(async move {
-                // Use the async change_password function from oxcrypt-core
-                let masterkey_dir = path.join("masterkey");
-                let result = tokio::task::spawn_blocking({
-                    let masterkey_path = masterkey_dir.clone().join("masterkey.cryptomator");
-                    move || oxcrypt_core::vault::change_password(&masterkey_path, &old_pw, &new_pw)
-                })
-                .await;
-
+                let result =
+                    oxcrypt_core::vault::change_password_async(&path, &old_pw, &new_pw).await;
                 match result {
-                    Ok(Ok(new_content)) => {
-                        // Atomic write: write to temp file, then rename
-                        let temp_path = masterkey_dir.join("masterkey.cryptomator.tmp");
-                        let masterkey_path = masterkey_dir.join("masterkey.cryptomator");
-
-                        match tokio::fs::write(&temp_path, &new_content).await {
-                            Ok(()) => match tokio::fs::rename(&temp_path, &masterkey_path).await {
-                                Ok(()) => {
-                                    state.set(ChangePasswordState::Idle);
-                                    on_complete.call(());
-                                }
-                                Err(e) => {
-                                    state.set(ChangePasswordState::Error(format!(
-                                        "Failed to save new password: {}",
-                                        e
-                                    )));
-                                }
-                            },
-                            Err(e) => {
-                                state.set(ChangePasswordState::Error(format!(
-                                    "Failed to write new password: {}",
-                                    e
-                                )));
-                            }
-                        }
+                    Ok(()) => {
+                        state.set(ChangePasswordState::Idle);
+                        on_complete.call(());
                     }
-                    Ok(Err(e)) => {
-                        let msg = if e.to_string().contains("integrity")
-                            || e.to_string().contains("Unwrap")
+                    Err(error) => {
+                        let message = if error.to_string().contains("integrity")
+                            || error.to_string().contains("Unwrap")
                         {
                             "Incorrect current password".to_string()
                         } else {
-                            format!("Failed to change password: {}", e)
+                            format!("Failed to change password: {error}")
                         };
-                        state.set(ChangePasswordState::Error(msg));
-                    }
-                    Err(e) => {
-                        state.set(ChangePasswordState::Error(format!("Task error: {}", e)));
+                        state.set(ChangePasswordState::Error(message));
                     }
                 }
             });

@@ -126,12 +126,65 @@ impl VaultCreator {
     /// * `VaultCreationError::Io` for filesystem errors
     /// * `VaultCreationError::MasterkeyCreation` if key wrapping fails
     /// * `VaultCreationError::ConfigCreation` if JWT creation fails
-    pub fn create(self) -> Result<VaultOperations, VaultCreationError> {
-        // Check vault doesn't already exist
-        if self.vault_path.join("vault.cryptomator").exists() {
-            return Err(VaultCreationError::VaultAlreadyExists(
-                self.vault_path.clone(),
-            ));
+    pub fn create(mut self) -> Result<VaultOperations, VaultCreationError> {
+        self.vault_path = std::path::absolute(&self.vault_path)?;
+        // Refuse damaged or partially initialized vaults as well as complete ones.
+        // Missing config must never authorize overwriting surviving key material.
+        for entry in [
+            "vault.cryptomator",
+            "masterkey.cryptomator",
+            "masterkey/masterkey.cryptomator",
+        ] {
+            match fs::symlink_metadata(self.vault_path.join(entry)) {
+                Ok(_) => {
+                    return Err(VaultCreationError::VaultAlreadyExists(
+                        self.vault_path.clone(),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for entry in ["d", "masterkey"] {
+            let directory = self.vault_path.join(entry);
+            match fs::symlink_metadata(&directory) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() || fs::read_dir(&directory)?.next().transpose()?.is_some()
+                    {
+                        return Err(VaultCreationError::VaultAlreadyExists(
+                            self.vault_path.clone(),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // Remember the pre-existing namespace boundary so newly created parent
+        // directories are also made durable before reporting successful creation.
+        let mut boundary = self
+            .vault_path
+            .parent()
+            .unwrap_or(&self.vault_path)
+            .to_owned();
+        loop {
+            match fs::metadata(&boundary) {
+                Ok(metadata) if metadata.is_dir() => break,
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "vault parent is not a directory",
+                    )
+                    .into());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    boundary = boundary
+                        .parent()
+                        .ok_or_else(|| std::io::Error::other("no existing vault parent"))?
+                        .to_owned();
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
 
         // Create directory structure
@@ -152,16 +205,15 @@ impl VaultCreator {
             payload: None,
         };
         let jwt = create_vault_config(&config, &master_key)?;
-        fs::write(self.vault_path.join("vault.cryptomator"), &jwt)?;
 
         // Create masterkey.cryptomator
         let masterkey_content = create_masterkey_file(&master_key, &self.passphrase)
             .map_err(|e| VaultCreationError::MasterkeyCreation(e.to_string()))?;
-        fs::write(
-            self.vault_path
-                .join("masterkey")
-                .join("masterkey.cryptomator"),
-            &masterkey_content,
+        crate::fs::durability::write_atomic(
+            &self.vault_path.join("masterkey/masterkey.cryptomator"),
+            masterkey_content.as_bytes(),
+            &self.vault_path,
+            crate::fs::durability::AtomicWriteMode::CreateNew,
         )?;
 
         // Create root directory storage path
@@ -172,6 +224,16 @@ impl VaultCreator {
         );
         let root_storage_path = vault_ops.calculate_directory_storage_path(&DirId::root())?;
         fs::create_dir_all(&root_storage_path)?;
+        crate::fs::durability::sync_directory_chain(&root_storage_path, &self.vault_path)?;
+        // Config is the readiness marker and is published only after its key and
+        // root storage exist durably. Concurrent initializers cannot clobber it.
+        crate::fs::durability::write_atomic(
+            &self.vault_path.join("vault.cryptomator"),
+            jwt.as_bytes(),
+            &self.vault_path,
+            crate::fs::durability::AtomicWriteMode::CreateNew,
+        )?;
+        crate::fs::durability::sync_directory_chain(&self.vault_path, &boundary)?;
 
         Ok(vault_ops)
     }
