@@ -64,3 +64,23 @@ fn later_content_write_supersedes_explicit_mtime_but_not_atime() {
     assert!(metadata.modified().unwrap() > requested);
     assert_eq!(metadata.accessed().unwrap(), requested);
 }
+
+#[test]
+fn metadata_only_commit_is_tracked_without_rewriting_ciphertext() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("file");
+    let key = MasterKey::random().unwrap();
+    let cipher = CipherCombo::SivGcm;
+    let original = cipher.encrypt_file(b"original", &key).unwrap();
+    fs::write(&path, &original).unwrap();
+    let mut editor = VaultFileEditor::open(&path, &key, cipher, temp.path()).unwrap();
+    let requested = SystemTime::UNIX_EPOCH + Duration::from_secs(946684800);
+    editor.set_times(None, Some(requested)).unwrap();
+    assert!(editor.is_dirty());
+    editor.commit(&path, temp.path()).unwrap();
+    assert!(!editor.is_dirty());
+    assert_eq!(editor.stats().encrypted_chunks, 0);
+    assert_eq!(editor.stats().copied_ciphertext_bytes, 0);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), requested);
+}

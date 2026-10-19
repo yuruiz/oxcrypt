@@ -128,9 +128,9 @@ impl VaultFileEditor {
     pub fn is_empty(&self) -> bool {
         self.size == 0
     }
-    /// Whether the stage differs from the committed file.
+    /// Whether content or metadata still need a durable commit.
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.dirty || self.pending_accessed.is_some() || self.pending_modified.is_some()
     }
     /// Crypto and fallback copy counters.
     pub fn stats(&self) -> EditStats {
@@ -513,7 +513,7 @@ impl VaultFileEditor {
 
     /// Commit with conflict detection; failed commits retain the complete stage.
     pub fn commit(&mut self, destination: &Path, vault_root: &Path) -> io::Result<()> {
-        if !self.dirty {
+        if !self.is_dirty() {
             return Ok(());
         }
         let actual = match fs::metadata(destination) {
@@ -526,6 +526,13 @@ impl VaultFileEditor {
                 io::ErrorKind::WouldBlock,
                 "file changed since editor opened",
             ));
+        }
+        if !self.dirty {
+            // Metadata-only edits still require fsync, without rewriting content.
+            self.reader.file.sync_all()?;
+            self.pending_accessed = None;
+            self.pending_modified = None;
+            return Ok(());
         }
         self.flush_chunk()?;
         let cipher = self.cipher();
