@@ -2278,7 +2278,7 @@ impl VaultOperations {
             self.write_shortened_file(&storage_path, &encrypted_name, &file_data)?
         } else {
             let path = storage_path.join(format!("{encrypted_name}.c9r"));
-            Self::atomic_write(&path, &file_data)?;
+            self.atomic_write(&path, &file_data)?;
             path
         };
 
@@ -2321,7 +2321,7 @@ impl VaultOperations {
         } else {
             let encrypted_dir_path = parent_storage_path.join(format!("{encrypted_name}.c9r"));
             fs::create_dir_all(&encrypted_dir_path)?;
-            Self::atomic_write(
+            self.atomic_write(
                 &encrypted_dir_path.join("dir.c9r"),
                 dir_id.as_str().as_bytes(),
             )?;
@@ -2339,7 +2339,7 @@ impl VaultOperations {
             .core
             .cipher_combo()
             .encrypt_dir_id_backup(dir_id.as_str(), &self.master_key)?;
-        Self::atomic_write(&new_storage_path.join("dirid.c9r"), &encrypted_dir_id)?;
+        self.atomic_write(&new_storage_path.join("dirid.c9r"), &encrypted_dir_id)?;
 
         info!(created_dir_id = %dir_id.as_str(), "Directory created successfully");
         Ok(dir_id)
@@ -2566,7 +2566,7 @@ impl VaultOperations {
             self.write_shortened_file(&storage_path, &new_encrypted_name, &file_data)?;
         } else {
             let new_path = storage_path.join(format!("{new_encrypted_name}.c9r"));
-            Self::atomic_write(&new_path, &file_data)?;
+            self.atomic_write(&new_path, &file_data)?;
         }
 
         // Remove the old file
@@ -2649,7 +2649,7 @@ impl VaultOperations {
         } else {
             let new_path = parent_storage_path.join(format!("{new_encrypted_name}.c9r"));
             fs::create_dir_all(&new_path)?;
-            Self::atomic_write(&new_path.join("dir.c9r"), dir_id.as_str().as_bytes())?;
+            self.atomic_write(&new_path.join("dir.c9r"), dir_id.as_str().as_bytes())?;
 
             // Note: dirid.c9r is in the content directory, not the .c9r folder.
             // Since the content directory doesn't change during a rename, we don't need
@@ -2793,7 +2793,7 @@ impl VaultOperations {
             self.write_shortened_file(&dest_storage_path, &new_encrypted_name, &file_data)?;
         } else {
             let dest_path = dest_storage_path.join(format!("{new_encrypted_name}.c9r"));
-            Self::atomic_write(&dest_path, &file_data)?;
+            self.atomic_write(&dest_path, &file_data)?;
         }
 
         // Remove from source
@@ -2883,7 +2883,7 @@ impl VaultOperations {
             self.write_shortened_file(&dest_storage_path, &new_encrypted_name, &file_data)?;
         } else {
             let dest_path = dest_storage_path.join(format!("{new_encrypted_name}.c9r"));
-            Self::atomic_write(&dest_path, &file_data)?;
+            self.atomic_write(&dest_path, &file_data)?;
         }
 
         // Remove from source
@@ -2945,11 +2945,11 @@ impl VaultOperations {
         fs::create_dir_all(&short_dir)?;
 
         // Write name.c9s (contains the original encrypted name)
-        Self::atomic_write(&short_dir.join("name.c9s"), encrypted_name.as_bytes())?;
+        self.atomic_write(&short_dir.join("name.c9s"), encrypted_name.as_bytes())?;
 
         // Write contents.c9r (contains the actual file data)
         let contents_path = short_dir.join("contents.c9r");
-        Self::atomic_write(&contents_path, file_data)?;
+        self.atomic_write(&contents_path, file_data)?;
 
         Ok(contents_path)
     }
@@ -2974,10 +2974,10 @@ impl VaultOperations {
         fs::create_dir_all(&short_dir)?;
 
         // Write name.c9s (contains the original encrypted name)
-        Self::atomic_write(&short_dir.join("name.c9s"), encrypted_name.as_bytes())?;
+        self.atomic_write(&short_dir.join("name.c9s"), encrypted_name.as_bytes())?;
 
         // Write dir.c9r (contains the directory ID)
-        Self::atomic_write(&short_dir.join("dir.c9r"), dir_id.as_str().as_bytes())?;
+        self.atomic_write(&short_dir.join("dir.c9r"), dir_id.as_str().as_bytes())?;
 
         // Note: dirid.c9r is NOT written here. It belongs in the content directory (d/XX/...),
         // not in the .c9s folder. The caller (create_directory) handles writing dirid.c9r
@@ -2987,7 +2987,7 @@ impl VaultOperations {
     }
 
     /// Write data atomically using temp file + rename pattern
-    fn atomic_write(path: &Path, content: &[u8]) -> Result<(), VaultWriteError> {
+    fn atomic_write(&self, path: &Path, content: &[u8]) -> Result<(), VaultWriteError> {
         let parent = path
             .parent()
             .ok_or_else(|| VaultWriteError::AtomicWriteFailed {
@@ -3000,6 +3000,7 @@ impl VaultOperations {
         // Create temp file in the same directory (ensures same filesystem for rename)
         let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
         temp_file.write_all(content)?;
+        temp_file.as_file().sync_all()?;
         temp_file
             .persist(path)
             .map_err(|e| VaultWriteError::AtomicWriteFailed {
@@ -3009,6 +3010,7 @@ impl VaultOperations {
                 ),
             })?;
 
+        crate::fs::durability::sync_directory_chain(parent, self.vault_path())?;
         Ok(())
     }
 
