@@ -14,14 +14,24 @@ pub(crate) fn inspect(path: &Path) -> io::Result<Kind> {
         return Ok(Kind::File);
     }
     if metadata.is_dir() {
+        let mut found = None;
         for (name, kind) in [
             ("contents.c9r", Kind::File),
             ("dir.c9r", Kind::Directory),
             ("symlink.c9r", Kind::Symlink),
         ] {
             if path.join(name).try_exists()? {
-                return Ok(kind);
+                if found.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ambiguous encrypted entry",
+                    ));
+                }
+                found = Some(kind);
             }
+        }
+        if let Some(kind) = found {
+            return Ok(kind);
         }
     }
     Err(io::Error::new(
