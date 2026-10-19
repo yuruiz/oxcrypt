@@ -208,14 +208,14 @@ impl Benchmark for WorkingSetWorkload {
         let start = Instant::now();
 
         // Track which files have been accessed (for cache analysis if needed)
-        let mut _access_counts = vec![0usize; self.total_files];
+        let mut access_counts = vec![0usize; self.total_files];
 
         for _op_num in 0..self.num_operations {
             let file_idx = self.select_file_index(&mut rng);
             let operation = self.select_operation(&mut rng);
             let path = self.file_path(mount_point, iteration, file_idx);
 
-            _access_counts[file_idx] += 1;
+            access_counts[file_idx] += 1;
 
             match operation {
                 Operation::ReadFull => {
@@ -305,7 +305,7 @@ impl Benchmark for WorkingSetWorkload {
         let start = Instant::now();
 
         // Track which files have been accessed (for cache analysis if needed)
-        let mut _access_counts = vec![0usize; self.total_files];
+        let mut access_counts = vec![0usize; self.total_files];
 
         report(0, self.num_operations);
 
@@ -314,7 +314,7 @@ impl Benchmark for WorkingSetWorkload {
             let operation = self.select_operation(&mut rng);
             let path = self.file_path(mount_point, iteration, file_idx);
 
-            _access_counts[file_idx] += 1;
+            access_counts[file_idx] += 1;
 
             match operation {
                 Operation::ReadFull => {
