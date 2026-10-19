@@ -2444,56 +2444,51 @@ impl VaultOperations {
 
         trace!(target_dir_id = %dir_info.directory_id.as_str(), "Found directory to delete");
 
-        // 2. Check directory is empty
-        debug!("Checking if directory is empty");
-        let target_ctx = ctx.clone().with_dir_id(dir_info.directory_id.as_str());
-        let files = self
-            .list_files(&dir_info.directory_id)
-            .map_err(|e| match e {
-                VaultOperationError::Io { source, context } => VaultWriteError::Io {
-                    source,
-                    context: Box::new(context),
-                },
-                _ => VaultWriteError::Io {
-                    source: std::io::Error::other(e.to_string()),
-                    context: Box::new(target_ctx.clone()),
-                },
-            })?;
-        let subdirs = self
-            .list_directories(&dir_info.directory_id)
-            .map_err(|e| match e {
-                VaultOperationError::Io { source, context } => VaultWriteError::Io {
-                    source,
-                    context: Box::new(context),
-                },
-                _ => VaultWriteError::Io {
-                    source: std::io::Error::other(e.to_string()),
-                    context: Box::new(target_ctx.clone()),
-                },
-            })?;
-
-        if !files.is_empty() || !subdirs.is_empty() {
-            warn!(
-                file_count = files.len(),
-                subdir_count = subdirs.len(),
-                "Cannot delete non-empty directory"
-            );
-            return Err(VaultWriteError::DirectoryNotEmpty {
-                context: Box::new(target_ctx.with_encrypted_path(&dir_info.encrypted_path)),
-            });
-        }
-
-        // 3. Remove the storage directory for this dir_id
-        debug!("Removing storage directory");
+        // Check physical entries so symlinks and unreadable/unknown names cannot
+        // be silently discarded by a logical listing that filters them out.
         let storage_path = self.calculate_directory_storage_path(&dir_info.directory_id)?;
-        if storage_path.exists() {
-            fs::remove_dir_all(&storage_path)?;
+        if !crate::fs::durability::directory_exists_checked(
+            &dir_info.encrypted_path,
+            self.vault_path(),
+        )? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "directory entry disappeared",
+            )
+            .into());
+        }
+        let storage_exists =
+            crate::fs::durability::directory_exists_checked(&storage_path, self.vault_path())?;
+        if storage_exists {
+            for entry in fs::read_dir(&storage_path)? {
+                if entry?.file_name() != "dirid.c9r" {
+                    return Err(VaultWriteError::DirectoryNotEmpty {
+                        context: Box::new(
+                            ctx.clone().with_encrypted_path(&dir_info.encrypted_path),
+                        ),
+                    });
+                }
+            }
+            match fs::remove_file(storage_path.join("dirid.c9r")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            // Non-recursive removal also protects entries created after the check.
+            fs::remove_dir(&storage_path)?;
         }
 
         // 4. Remove the directory entry from parent
         debug!("Removing directory entry from parent");
         if dir_info.encrypted_path.exists() {
             fs::remove_dir_all(&dir_info.encrypted_path)?;
+        }
+
+        if storage_exists && let Some(parent) = storage_path.parent() {
+            crate::fs::durability::sync_directory_chain(parent, self.vault_path())?;
+        }
+        if let Some(parent) = dir_info.encrypted_path.parent() {
+            crate::fs::durability::sync_directory_chain(parent, self.vault_path())?;
         }
 
         info!("Directory deleted successfully");
