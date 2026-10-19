@@ -2320,7 +2320,7 @@ impl VaultOperations {
             self.create_shortened_directory(&parent_storage_path, &encrypted_name, &dir_id)?;
         } else {
             let encrypted_dir_path = parent_storage_path.join(format!("{encrypted_name}.c9r"));
-            fs::create_dir_all(&encrypted_dir_path)?;
+            fs::create_dir(&encrypted_dir_path)?;
             self.atomic_write(
                 &encrypted_dir_path.join("dir.c9r"),
                 dir_id.as_str().as_bytes(),
@@ -2971,7 +2971,7 @@ impl VaultOperations {
     ) -> Result<PathBuf, VaultWriteError> {
         let hash = create_c9s_filename(encrypted_name);
         let short_dir = parent_storage_path.join(format!("{hash}.c9s"));
-        fs::create_dir_all(&short_dir)?;
+        fs::create_dir(&short_dir)?;
 
         // Write name.c9s (contains the original encrypted name)
         self.atomic_write(&short_dir.join("name.c9s"), encrypted_name.as_bytes())?;
