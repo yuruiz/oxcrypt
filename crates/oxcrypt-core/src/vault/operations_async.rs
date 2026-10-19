@@ -2679,20 +2679,53 @@ impl VaultOperationsAsync {
         let storage = self.calculate_directory_storage_path(dir)?;
         fs::create_dir_all(&storage).await?;
         let encrypted_name = encrypt_filename(name, dir.as_str(), &self.master_key)?;
-        let path = if encrypted_name.len() > self.core.shortening_threshold() {
-            let directory = storage.join(format!("{}.c9s", create_c9s_filename(&encrypted_name)));
-            fs::create_dir_all(&directory).await?;
-            self.safe_write(&directory.join("name.c9s"), encrypted_name.as_bytes())
-                .await?;
-            directory.join("contents.c9r")
-        } else {
-            storage.join(format!("{encrypted_name}.c9r"))
-        };
+        let shortened = encrypted_name.len() > self.core.shortening_threshold();
         let root = self.vault_path().to_owned();
         tokio::task::spawn_blocking(move || {
+            use std::io::Write;
             let _guards = (directory_guard, file_guard);
-            editor.lock().commit(&path, &root)?;
-            Ok::<_, std::io::Error>(path)
+            let entry = if shortened {
+                storage.join(format!("{}.c9s", create_c9s_filename(&encrypted_name)))
+            } else {
+                storage.join(format!("{encrypted_name}.c9r"))
+            };
+            let exists = entry.try_exists()?;
+            if exists && crate::fs::namespace::inspect(&entry)? != crate::fs::namespace::Kind::File
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination exists with a different type",
+                ));
+            }
+            let created_directory = shortened && !exists;
+            if created_directory {
+                // create_dir refuses a concurrently created entry instead of adopting it.
+                std::fs::create_dir(&entry)?;
+            }
+            let path = if shortened {
+                entry.join("contents.c9r")
+            } else {
+                entry.clone()
+            };
+            let result = (|| {
+                if created_directory {
+                    let mut name = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(entry.join("name.c9s"))?;
+                    name.write_all(encrypted_name.as_bytes())?;
+                    name.sync_all()?;
+                }
+                editor.lock().commit(&path, &root)?;
+                Ok::<_, std::io::Error>(path.clone())
+            })();
+            // Only clean up an unpublished entry we created. If publication
+            // succeeded but directory sync failed, keep it for a durable retry.
+            if result.is_err() && created_directory && matches!(path.try_exists(), Ok(false)) {
+                let _ = std::fs::remove_file(entry.join("name.c9s"));
+                let _ = std::fs::remove_dir(&entry);
+            }
+            result
         })
         .await
         .map_err(std::io::Error::other)?
