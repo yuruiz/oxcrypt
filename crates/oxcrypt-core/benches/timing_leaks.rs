@@ -18,11 +18,8 @@
 //! # Running the tests
 //!
 //! ```bash
-//! # Quick test (fast, lower confidence)
-//! cargo bench --release --bench timing_leaks -- --quick
-//!
-//! # Full test (slower, higher confidence)
-//! cargo bench --release --bench timing_leaks
+//! cargo bench -p oxcrypt-core --bench timing_leaks --no-run --message-format=json > timing-build.json
+//! python3 scripts/run-timing-tests.py timing-build.json
 //! ```
 
 use base64::{Engine, engine::general_purpose::URL_SAFE};
@@ -70,10 +67,10 @@ fn timing_key_unwrap(runner: &mut CtRunner, rng: &mut BenchRng) {
     let wrong_integrity: [u8; 8] = rand_bytes::<8>(rng);
 
     // Generate batch of inputs with random class assignments
-    let mut classes = Vec::with_capacity(1000);
-    let mut integrity_checks = Vec::with_capacity(1000);
+    let mut classes = Vec::with_capacity(100_000);
+    let mut integrity_checks = Vec::with_capacity(100_000);
 
-    for _ in 0..1000 {
+    for _ in 0..100_000 {
         if rng.gen_bool(0.5) {
             classes.push(Class::Left);
             integrity_checks.push(expected); // Matching (correct KEK scenario)
@@ -86,7 +83,7 @@ fn timing_key_unwrap(runner: &mut CtRunner, rng: &mut BenchRng) {
     // Run timing measurements - ONLY the ct_eq comparison
     for (class, integrity_check) in classes.into_iter().zip(integrity_checks) {
         runner.run_one(class, || {
-            // This is exactly what key_wrap.rs does at line 178
+            // Compare the RFC 3394 integrity value without an early-exit branch.
             let result = integrity_check.ct_eq(&expected);
             std::hint::black_box(result);
         });
@@ -99,8 +96,11 @@ fn timing_key_unwrap(runner: &mut CtRunner, rng: &mut BenchRng) {
 /// this property to catch any regressions or unexpected behavior.
 ///
 /// We compare:
-/// - Left: Verify correct MAC
-/// - Right: Verify incorrect MAC (one byte flipped)
+/// - Left: Reject a tag corrupted at its first byte
+/// - Right: Reject a tag corrupted at its last byte
+///
+/// Both classes have the same public failure result, isolating any secret-prefix
+/// early-exit behavior from the observable success/failure branch.
 fn timing_hmac_verify(runner: &mut CtRunner, rng: &mut BenchRng) {
     // Generate a random key and message
     let key_bytes = rand_bytes::<32>(rng);
@@ -111,21 +111,23 @@ fn timing_hmac_verify(runner: &mut CtRunner, rng: &mut BenchRng) {
     let correct_tag = hmac::sign(&key, &message);
     let correct_tag_bytes: Vec<u8> = correct_tag.as_ref().to_vec();
 
-    // Create an incorrect MAC (flip one byte)
-    let mut wrong_tag_bytes = correct_tag_bytes.clone();
-    wrong_tag_bytes[0] ^= 0xFF;
+    let mut first_mismatch = correct_tag_bytes.clone();
+    first_mismatch[0] ^= 0xFF;
+    let mut last_mismatch = correct_tag_bytes.clone();
+    let last = last_mismatch.len() - 1;
+    last_mismatch[last] ^= 0xFF;
 
     // Generate batch of inputs
-    let mut classes = Vec::with_capacity(1000);
-    let mut tags = Vec::with_capacity(1000);
+    let mut classes = Vec::with_capacity(100_000);
+    let mut tags = Vec::with_capacity(100_000);
 
-    for _ in 0..1000 {
+    for _ in 0..100_000 {
         if rng.gen_bool(0.5) {
             classes.push(Class::Left);
-            tags.push(correct_tag_bytes.clone());
+            tags.push(first_mismatch.clone());
         } else {
             classes.push(Class::Right);
-            tags.push(wrong_tag_bytes.clone());
+            tags.push(last_mismatch.clone());
         }
     }
 
