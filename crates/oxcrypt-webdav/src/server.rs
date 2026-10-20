@@ -274,7 +274,7 @@ async fn run_server(
 }
 
 /// Timeout for auto-mount operations (15 seconds).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const AUTO_MOUNT_TIMEOUT_SECS: u64 = 15;
 
 /// Attempt to auto-mount via macOS mount_webdav command.
@@ -297,6 +297,7 @@ pub async fn auto_mount_macos(
         .arg("-S") // Suppress authentication dialog
         .arg(url)
         .arg(mountpoint)
+        .kill_on_drop(true)
         .status();
 
     let status = match timeout(Duration::from_secs(AUTO_MOUNT_TIMEOUT_SECS), mount_future).await {
@@ -369,57 +370,102 @@ pub async fn auto_mount_macos(
     _url: &str,
     _mountpoint: &std::path::Path,
 ) -> Result<(), std::io::Error> {
-    // No auto-mount on Linux - user mounts manually via davfs2 or file manager
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Automatic WebDAV mounting is unavailable on Linux; mount the server URL with davfs2 or a file manager",
+    ))
 }
 
 /// Attempt to unmount on Windows (for mapped network drives).
 #[cfg(target_os = "windows")]
 pub fn unmount_macos(mountpoint: &std::path::Path) -> Result<(), std::io::Error> {
-    use std::process::Command;
+    unmap_windows_drive(mountpoint)
+}
 
-    debug!(mountpoint = %mountpoint.display(), "Unmounting on Windows");
+/// Force unmount a mapped WebDAV drive on Windows.
+#[cfg(target_os = "windows")]
+pub fn force_unmount_macos(mountpoint: &std::path::Path) -> Result<(), std::io::Error> {
+    unmap_windows_drive(mountpoint)
+}
 
-    // Use net use to disconnect the mapped drive
-    let status = Command::new("net")
-        .args(["use", "/delete"])
-        .arg(mountpoint)
-        .status()?;
-
-    if status.success() {
-        Ok(())
+#[cfg(any(target_os = "windows", test))]
+fn windows_drive(mountpoint: &std::path::Path) -> std::io::Result<&str> {
+    let path = mountpoint.to_str().unwrap_or("");
+    let bytes = path.as_bytes();
+    if (bytes.len() == 2 || (bytes.len() == 3 && matches!(bytes[2], b'/' | b'\\')))
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+    {
+        Ok(&path[..2])
     } else {
-        Err(std::io::Error::other("unmount failed"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows WebDAV mounts require a drive letter such as X: or X:\\",
+        ))
     }
 }
 
-/// Force unmount on Windows.
 #[cfg(target_os = "windows")]
-pub fn force_unmount_macos(mountpoint: &std::path::Path) -> Result<(), std::io::Error> {
-    use std::process::Command;
-
-    debug!(mountpoint = %mountpoint.display(), "Force unmounting on Windows");
-
-    // Use /y to force without prompting
-    let status = Command::new("net")
-        .args(["use", "/delete", "/y"])
-        .arg(mountpoint)
-        .status()?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other("force unmount failed"))
+fn unmap_windows_drive(mountpoint: &std::path::Path) -> std::io::Result<()> {
+    use std::{
+        process::{Command, Stdio},
+        time::Instant,
+    };
+    let drive = windows_drive(mountpoint)?;
+    let mut child = Command::new("net.exe")
+        .args(["use", drive, "/delete", "/y"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(AUTO_MOUNT_TIMEOUT_SECS);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "net use /delete failed: {status}"
+                )))
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "net use /delete timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
 #[cfg(target_os = "windows")]
 pub async fn auto_mount_macos(
-    _url: &str,
-    _mountpoint: &std::path::Path,
+    url: &str,
+    mountpoint: &std::path::Path,
 ) -> Result<(), std::io::Error> {
-    // TODO: Could implement auto-mount via `net use` on Windows
-    Ok(())
+    let drive = windows_drive(mountpoint)?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(AUTO_MOUNT_TIMEOUT_SECS),
+        tokio::process::Command::new("net.exe")
+            .args(["use", drive, url, "/persistent:no"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "net use timed out"))??;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "net use failed: {} {}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -427,22 +473,56 @@ pub async fn auto_mount_macos(
     _url: &str,
     _mountpoint: &std::path::Path,
 ) -> Result<(), std::io::Error> {
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "WebDAV mounting is unsupported on this platform",
+    ))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn unmount_macos(_mountpoint: &std::path::Path) -> Result<(), std::io::Error> {
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "WebDAV mounting is unsupported on this platform",
+    ))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn force_unmount_macos(_mountpoint: &std::path::Path) -> Result<(), std::io::Error> {
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "WebDAV unmounting is unsupported on this platform",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::server::{ServerConfig, windows_drive};
+
+    #[test]
+    fn windows_mount_requires_an_explicit_drive() {
+        for path in ["X:", "x:/", "X:\\"] {
+            assert!(windows_drive(std::path::Path::new(path)).is_ok());
+        }
+        for path in ["", "*", "/delete", "X:/folder", "folder", "1:", "é:"] {
+            assert!(windows_drive(std::path::Path::new(path)).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn manual_mount_is_not_reported_as_success() {
+        assert_eq!(
+            crate::server::auto_mount_macos(
+                "http://127.0.0.1:8080",
+                std::path::Path::new("/tmp/vault")
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
 
     #[test]
     fn test_server_config_default() {
