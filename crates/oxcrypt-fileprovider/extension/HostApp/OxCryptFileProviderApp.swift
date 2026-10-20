@@ -47,7 +47,7 @@ enum AppMain {
             let command = args[1]
 
             // CLI commands
-            if command == "register" || command == "unregister" || command == "list" || command == "status" {
+            if ["register", "unregister", "list", "status", "signal-changes"].contains(command) {
                 runCLI()
                 exit(0)
             }
@@ -117,6 +117,8 @@ private func runCLI() {
         cliList()
     case "status":
         cliStatus(args: Array(args.dropFirst(2)))
+    case "signal-changes":
+        cliSignalChanges(args: Array(args.dropFirst(2)))
     default:
         printUsage()
     }
@@ -139,6 +141,9 @@ private func printUsage() {
 
           status --domain <id>
               Check if a domain is active.
+
+          signal-changes --domain <id>
+              Refresh the domain after encrypted vault contents change.
 
         Daemon Mode:
           --daemon  Run as background service (no GUI, XPC services only)
@@ -220,6 +225,26 @@ private func cliRegister(args: [String]) {
         fputs("Error: \(result.message ?? "Unknown error")\n", stderr)
         exit(1)
     }
+}
+
+private func cliSignalChanges(args: [String]) {
+    guard args.count == 2, args[0] == "--domain", !args[1].isEmpty else {
+        fputs("Error: expected signal-changes --domain <id>\n", stderr)
+        exit(1)
+    }
+    let domainId = args[1]
+    Task {
+        do {
+            try await DomainManager.signalChanges(for: domainId)
+            print("OK")
+            exit(0)
+        } catch {
+            fputs("Error: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+    }
+    // Keep the main queue available for File Provider's asynchronous callbacks.
+    dispatchMain()
 }
 
 private func cliUnregister(args: [String]) {

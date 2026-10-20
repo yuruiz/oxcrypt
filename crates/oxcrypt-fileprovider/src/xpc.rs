@@ -17,7 +17,7 @@
 use crate::extension_manager::ExtensionManager;
 use crate::ffi::XPCPasswordClient;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -105,23 +105,78 @@ impl XpcClient {
 
     /// Run a command on the host app and return stdout.
     fn run_command(&self, args: &[&str], env: Option<(&str, &str)>) -> Result<String, XpcError> {
+        self.run_command_with_timeout(args, env, Duration::from_secs(30))
+    }
+
+    fn run_command_with_timeout(
+        &self,
+        args: &[&str],
+        env: Option<(&str, &str)>,
+        timeout: Duration,
+    ) -> Result<String, XpcError> {
         debug!("Running host app command: {:?}", args);
 
-        let mut cmd = Command::new(&self.host_app_path);
-        cmd.args(args);
+        // Callers include both synchronous watcher threads and async app code.
+        // Keep the command runtime on its own thread to avoid nested runtimes.
+        let (status, stdout, stderr) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| -> std::io::Result<_> {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(async {
+                            let mut cmd = tokio::process::Command::new(&self.host_app_path);
+                            cmd.args(args)
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .kill_on_drop(true);
+                            if let Some((key, value)) = env {
+                                cmd.env(key, value);
+                            }
+                            let mut child = cmd.spawn()?;
+                            let stdout = child
+                                .stdout
+                                .take()
+                                .ok_or_else(|| std::io::Error::other("missing host stdout"))?;
+                            let stderr = child
+                                .stderr
+                                .take()
+                                .ok_or_else(|| std::io::Error::other("missing host stderr"))?;
+                            let result = tokio::time::timeout(timeout, async {
+                                tokio::try_join!(
+                                    read_command_output(stdout),
+                                    read_command_output(stderr),
+                                    child.wait()
+                                )
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok((stdout, stderr, status))) => Ok((status, stdout, stderr)),
+                                Ok(Err(error)) => {
+                                    let _ = child.kill().await;
+                                    Err(error)
+                                }
+                                Err(_) => {
+                                    let _ = child.kill().await;
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "File Provider host command timed out",
+                                    ))
+                                }
+                            }
+                        })
+                })
+                .join()
+                .map_err(|_| std::io::Error::other("host command worker panicked"))?
+        })?;
 
-        if let Some((key, value)) = env {
-            cmd.env(key, value);
-        }
-
-        let output = cmd.output()?;
-
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if status.success() {
+            let stdout = String::from_utf8_lossy(&stdout).to_string();
             debug!("Command output: {}", stdout.trim());
             Ok(stdout)
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = String::from_utf8_lossy(&stderr).to_string();
             warn!("Command failed: {}", stderr.trim());
             Err(XpcError::ServiceError(stderr.trim().to_string()))
         }
@@ -173,11 +228,13 @@ impl XpcClient {
     }
 
     /// Signal the working set enumerator to refresh.
-    pub fn signal_changes(&self, _domain_id: &str) -> Result<(), XpcError> {
-        // Signal changes is not exposed via CLI yet
-        // This would require the XPC service to be running
-        debug!("Signal changes not implemented via CLI");
-        Ok(())
+    pub fn signal_changes(&self, domain_id: &str) -> Result<(), XpcError> {
+        let output = self.run_command(&["signal-changes", "--domain", domain_id], None)?;
+        if output.trim() == "OK" {
+            Ok(())
+        } else {
+            Err(XpcError::InvalidResponse(output))
+        }
     }
 
     /// List all registered domains.
@@ -256,9 +313,9 @@ impl XpcClient {
         // Spawn the daemon in background (detached from this process)
         let child = Command::new(&self.host_app_path)
             .arg("--daemon")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn();
 
         match child {
@@ -369,9 +426,108 @@ impl XpcClient {
     }
 }
 
+async fn read_command_output(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    const MAX_OUTPUT: usize = 1024 * 1024;
+    let mut output = Vec::new();
+    let mut exceeded = false;
+    let mut buffer = [0; 4096];
+    loop {
+        let count = pipe.read(&mut buffer).await?;
+        if count == 0 {
+            return if exceeded {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "File Provider host output exceeds 1 MiB",
+                ))
+            } else {
+                Ok(output)
+            };
+        }
+        let retained = count.min(MAX_OUTPUT.saturating_sub(output.len()));
+        exceeded |= retained < count;
+        output.extend_from_slice(&buffer[..retained]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::xpc::{XpcClient, XpcError};
+    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+
+    fn host(script: &str) -> (tempfile::TempDir, XpcClient) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("host");
+        fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        (
+            temp,
+            XpcClient {
+                host_app_path: path,
+            },
+        )
+    }
+
+    #[test]
+    fn refresh_sends_the_domain_as_one_argument() {
+        let (_temp, client) = host(
+            "[ \"$#\" = 3 ] && [ \"$1\" = signal-changes ] && [ \"$2\" = --domain ] && [ \"$3\" = 'domain with spaces' ] || exit 1\nprintf 'OK\\n'",
+        );
+        client.signal_changes("domain with spaces").unwrap();
+    }
+
+    #[test]
+    fn refresh_propagates_host_failures_and_invalid_responses() {
+        let (_temp, client) = host("echo 'domain missing' >&2; exit 1");
+        assert!(matches!(
+            client.signal_changes("domain"),
+            Err(XpcError::ServiceError(_))
+        ));
+        let (_temp, client) = host("echo 'not an acknowledgment'");
+        assert!(matches!(
+            client.signal_changes("domain"),
+            Err(XpcError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn unresponsive_host_is_terminated() {
+        let (_temp, client) = host("exec sleep 30");
+        let error = client
+            .run_command_with_timeout(&[], None, Duration::from_millis(50))
+            .unwrap_err();
+        assert!(
+            matches!(error, XpcError::IoError(error) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+    }
+
+    #[test]
+    fn inherited_output_pipes_cannot_bypass_the_timeout() {
+        let (_temp, client) = host("sleep 1 & exit 0");
+        let start = std::time::Instant::now();
+        let result = client.run_command_with_timeout(&[], None, Duration::from_millis(50));
+        assert!(
+            matches!(result, Err(XpcError::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(start.elapsed() < Duration::from_millis(800));
+    }
+
+    #[tokio::test]
+    async fn refresh_is_safe_from_an_async_caller() {
+        let (_temp, client) = host("echo OK");
+        client.signal_changes("domain").unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_host_responses_are_rejected_instead_of_truncated() {
+        let response = vec![b'x'; 1024 * 1024 + 1];
+        let error = crate::xpc::read_command_output(response.as_slice())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn test_find_host_app() {

@@ -5,7 +5,7 @@
 #define Bridging_Header_h
 
 // Swift-bridge generated headers
-#include "../../generated/SwiftBridgeCore.h"
-#include "../../generated/oxcrypt-fileprovider/oxcrypt-fileprovider.h"
+#include "../Shared/generated/SwiftBridgeCore.h"
+#include "../Shared/generated/generated/generated.h"
 
 #endif /* Bridging_Header_h */

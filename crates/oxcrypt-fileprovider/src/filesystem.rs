@@ -1288,7 +1288,7 @@ impl FileProviderFilesystem {
             }
             let entries = self
                 .runtime
-                .block_on(self.ops.list_by_path(&parent))
+                .block_on(self.ops.list(&dir_id))
                 .map_err(FpError::from)?;
             for entry in entries {
                 let (name, kind, size, encrypted_path) = match entry {

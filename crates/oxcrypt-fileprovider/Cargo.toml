@@ -18,7 +18,7 @@ name = "oxcrypt_fileprovider"
 oxcrypt-core = { workspace = true, features = ["async"] }
 oxcrypt-mount = { path = "../oxcrypt-mount" }
 swift-bridge = { version = "0.1.58", features = ["async"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 dashmap = "6"
 tracing = { workspace = true }
 libc = "0.2"

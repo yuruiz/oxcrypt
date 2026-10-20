@@ -225,3 +225,10 @@ query; native event-driven indexing is a possible performance improvement.
 Rust tests validate change semantics. Rebuild and install the Swift extension to
 exercise these changes through the live File Provider UI; a previously built
 extension does not pick up Rust/Swift source changes automatically.
+
+Vault filesystem events request a working-set refresh through the host's
+`signal-changes --domain <id>` command. The watcher coalesces events in a bounded
+queue, refreshes even during continuous writes, and retries failed notifications.
+Read-access events do not trigger another scan. Host command failures and timeouts
+are reported instead of acknowledging a refresh that never happened. Both the
+Rust host integration and Swift app must be rebuilt for this path to work.

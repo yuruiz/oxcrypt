@@ -137,7 +137,8 @@ struct DomainManager {
     static func signalChanges(for domainIdentifier: String) async throws {
         guard let manager = await manager(for: domainIdentifier) else {
             logger.warning("Cannot signal changes: domain not found: \(domainIdentifier)")
-            return
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError,
+                          userInfo: [NSLocalizedDescriptionKey: "File Provider domain not found"])
         }
 
         try await manager.signalEnumerator(for: .workingSet)
