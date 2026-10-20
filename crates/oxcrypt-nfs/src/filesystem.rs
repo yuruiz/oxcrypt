@@ -1255,26 +1255,17 @@ impl NFSFileSystem for CryptomatorNFS {
             });
         }
 
-        // Sort entries by name for deterministic ordering
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-        // Handle pagination
-        let start_idx = if start_after == 0 {
-            0
-        } else {
-            entries
-                .iter()
-                .position(|e| e.fileid == start_after)
-                .map_or(0, |i| i + 1)
-        };
-
-        let result_entries: Vec<DirEntry> = entries
+        // IDs are monotonic and never reused within an export. Ordering by ID
+        // keeps cookies usable after deletion or rename without retaining stale
+        // directory snapshots. New entries receive IDs after existing entries.
+        entries.sort_unstable_by_key(|entry| entry.fileid);
+        let start_idx = entries.partition_point(|entry| entry.fileid <= start_after);
+        let end = entries.len() - start_idx <= max_entries;
+        let result_entries = entries
             .into_iter()
             .skip(start_idx)
             .take(max_entries)
             .collect();
-
-        let end = result_entries.len() < max_entries;
 
         self.stats.record_metadata_latency(start.elapsed());
         Ok(ReadDirResult {

@@ -9,7 +9,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
 use std::io::{Read, Write};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, warn};
 /*
 program NFS_PROGRAM {
  version NFS_V3 {
@@ -758,23 +758,6 @@ struct READDIR3args {
 }
 XDRStruct!(READDIR3args, dir, cookie, cookieverf, dircount);
 
-#[allow(non_camel_case_types)]
-#[derive(Debug, Default)]
-struct entryplus3 {
-    fileid: nfs::fileid3,
-    name: nfs::filename3,
-    cookie: nfs::cookie3,
-    name_attributes: nfs::post_op_attr,
-    name_handle: nfs::post_op_fh3,
-}
-XDRStruct!(
-    entryplus3,
-    fileid,
-    name,
-    cookie,
-    name_attributes,
-    name_handle
-);
 /*
 
       READDIRPLUS3res NFSPROC3_READDIRPLUS(READDIRPLUS3args) = 17;
@@ -810,194 +793,16 @@ pub async fn nfsproc3_readdirplus(
 ) -> Result<(), anyhow::Error> {
     let mut args = READDIRPLUS3args::default();
     args.deserialize(input)?;
-    debug!("nfsproc3_readdirplus({:?},{:?}) ", xid, args);
-
-    let dirid = context.vfs.fh_to_id(&args.dir);
-    // fail if unable to convert file handle
-    if let Err(stat) = dirid {
-        make_success_reply(xid).serialize(output)?;
-        stat.serialize(output)?;
-        nfs::post_op_attr::Void.serialize(output)?;
-        return Ok(());
-    }
-    let dirid = dirid.unwrap();
-    let dir_attr_maybe = context.vfs.getattr(dirid).await;
-
-    let dir_attr = match dir_attr_maybe {
-        Ok(v) => nfs::post_op_attr::attributes(v),
-        Err(_) => nfs::post_op_attr::Void,
-    };
-
-    let dirversion = if let Ok(ref dir_attr) = dir_attr_maybe {
-        let cvf_version = (dir_attr.mtime.seconds as u64) << 32 | (dir_attr.mtime.nseconds as u64);
-        cvf_version.to_be_bytes()
-    } else {
-        nfs::cookieverf3::default()
-    };
-    debug!(" -- Dir attr {:?}", dir_attr);
-    debug!(" -- Dir version {:?}", dirversion);
-    let has_version = args.cookieverf != nfs::cookieverf3::default();
-    // initial call should hve empty cookie verf
-    // subsequent calls should have cvf_version as defined above
-    // which is based off the mtime.
-    //
-    // TODO: This is *far* too aggressive. and unnecessary.
-    // The client should maintain this correctly typically.
-    //
-    // The way cookieverf is handled is quite interesting...
-    //
-    // There are 2 notes in the RFC of interest:
-    // 1. If the
-    // server detects that the cookie is no longer valid, the
-    // server will reject the READDIR request with the status,
-    // NFS3ERR_BAD_COOKIE. The client should be careful to
-    // avoid holding directory entry cookies across operations
-    // that modify the directory contents, such as REMOVE and
-    // CREATE.
-    //
-    // 2. One implementation of the cookie-verifier mechanism might
-    //  be for the server to use the modification time of the
-    //  directory. This might be overly restrictive, however. A
-    //  better approach would be to record the time of the last
-    //  directory modification that changed the directory
-    //  organization in a way that would make it impossible to
-    //  reliably interpret a cookie. Servers in which directory
-    //  cookies are always valid are free to use zero as the
-    //  verifier always.
-    //
-    //  Basically, as long as the cookie is "kinda" intepretable,
-    //  we should keep accepting it.
-    //  On testing, the Mac NFS client pretty much expects that
-    //  especially on highly concurrent modifications to the directory.
-    //
-    //  1. If part way through a directory enumeration we fail with BAD_COOKIE
-    //  if the directory contents change, the client listing may fail resulting
-    //  in a "no such file or directory" error.
-    //  2. if we cache readdir results. i.e. we think of a readdir as two parts
-    //     a. enumerating everything first
-    //     b. the cookie is then used to paginate the enumeration
-    //     we can run into file time synchronization issues. i.e. while one
-    //     listing occurs and another file is touched, the listing may report
-    //     an outdated file status.
-    //
-    //     This cache also appears to have to be *quite* long lasting
-    //     as the client may hold on to a directory enumerator
-    //     with unbounded time.
-    //
-    //  Basically, if we think about how linux directory listing works
-    //  is that you just get an enumerator. There is no mechanic available for
-    //  "restarting" a pagination and this enumerator is assumed to be valid
-    //  even across directory modifications and should reflect changes
-    //  immediately.
-    //
-    //  The best solution is simply to really completely avoid sending
-    //  BAD_COOKIE all together and to ignore the cookie mechanism.
-    //
-    /*if args.cookieverf != nfs::cookieverf3::default() && args.cookieverf != dirversion {
-        info!(" -- Dir version mismatch. Received {:?}", args.cookieverf);
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_BAD_COOKIE.serialize(output)?;
-        dir_attr.serialize(output)?;
-        return Ok(());
-    }*/
-    // subtract off the final entryplus* field (which must be false) and the eof
-    if args.maxcount < 128 {
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
-        dir_attr.serialize(output)?;
-        return Ok(());
-    }
-    let max_bytes_allowed = args.maxcount.min(crate::vfs::MAX_TRANSFER_SIZE) as usize - 128;
-    // args.dircount is bytes of just fileid, name, cookie.
-    // This is hard to ballpark, so we just divide it by 16
-    let estimated_max_results = args.dircount.min(crate::vfs::MAX_TRANSFER_SIZE) / 16;
-    let max_dircount_bytes = args.dircount.min(crate::vfs::MAX_TRANSFER_SIZE) as usize;
-    let mut ctr = 0;
-    match context
-        .vfs
-        .readdir(dirid, args.cookie, estimated_max_results as usize)
-        .await
-    {
-        Ok(result) => {
-            // we count dir_count seperately as it is just a subset of fields
-            let mut accumulated_dircount: usize = 0;
-            let mut all_entries_written = true;
-
-            // this is a wrapper around a writer that also just counts the number of bytes
-            // written
-            let mut counting_output = crate::write_counter::WriteCounter::new(output);
-
-            make_success_reply(xid).serialize(&mut counting_output)?;
-            nfs::nfsstat3::NFS3_OK.serialize(&mut counting_output)?;
-            dir_attr.serialize(&mut counting_output)?;
-            dirversion.serialize(&mut counting_output)?;
-            for entry in result.entries {
-                let obj_attr = entry.attr;
-                let handle = nfs::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid));
-
-                let entry = entryplus3 {
-                    fileid: entry.fileid,
-                    name: entry.name,
-                    cookie: entry.fileid,
-                    name_attributes: nfs::post_op_attr::attributes(obj_attr),
-                    name_handle: handle,
-                };
-                // write the entry into a buffer first
-                let mut write_buf: Vec<u8> = Vec::new();
-                let mut write_cursor = std::io::Cursor::new(&mut write_buf);
-                // true flag for the entryplus3* to mark that this contains an entry
-                true.serialize(&mut write_cursor)?;
-                entry.serialize(&mut write_cursor)?;
-                write_cursor.flush()?;
-                let added_dircount = std::mem::size_of::<nfs::fileid3>()                   // fileid
-                                    + std::mem::size_of::<u32>() + entry.name.len()  // name
-                                    + std::mem::size_of::<nfs::cookie3>(); // cookie
-                let added_output_bytes = write_buf.len();
-                // check if we can write without hitting the limits
-                if added_output_bytes + counting_output.bytes_written() < max_bytes_allowed
-                    && added_dircount + accumulated_dircount < max_dircount_bytes
-                {
-                    trace!("  -- dirent {:?}", entry);
-                    // commit the entry
-                    ctr += 1;
-                    counting_output.write_all(&write_buf)?;
-                    accumulated_dircount += added_dircount;
-                    trace!(
-                        "  -- lengths: {:?} / {:?} {:?} / {:?}",
-                        accumulated_dircount,
-                        max_dircount_bytes,
-                        counting_output.bytes_written(),
-                        max_bytes_allowed
-                    );
-                } else {
-                    trace!(" -- insufficient space. truncating");
-                    all_entries_written = false;
-                    break;
-                }
-            }
-            // false flag for the final entryplus* linked list
-            false.serialize(&mut counting_output)?;
-            // eof flag is only valid here if we wrote everything
-            if all_entries_written {
-                debug!("  -- readdir eof {:?}", result.end);
-                result.end.serialize(&mut counting_output)?;
-            } else {
-                debug!("  -- readdir eof {:?}", false);
-                false.serialize(&mut counting_output)?;
-            }
-            debug!(
-                "readir {}, has_version {},  start at {}, flushing {} entries, complete {}",
-                dirid, has_version, args.cookie, ctr, all_entries_written
-            );
-        }
-        Err(stat) => {
-            error!("readdir error {:?} --> {:?} ", xid, stat);
-            make_success_reply(xid).serialize(output)?;
-            stat.serialize(output)?;
-            dir_attr.serialize(output)?;
-        }
-    };
-    Ok(())
+    write_directory_page(
+        xid,
+        output,
+        context,
+        &args.dir,
+        args.cookie,
+        args.maxcount,
+        Some(args.dircount),
+    )
+    .await
 }
 
 pub async fn nfsproc3_readdir(
@@ -1008,121 +813,110 @@ pub async fn nfsproc3_readdir(
 ) -> Result<(), anyhow::Error> {
     let mut args = READDIR3args::default();
     args.deserialize(input)?;
-    debug!("nfsproc3_readdirplus({:?},{:?}) ", xid, args);
+    write_directory_page(
+        xid,
+        output,
+        context,
+        &args.dir,
+        args.cookie,
+        args.dircount,
+        None,
+    )
+    .await
+}
 
-    let dirid = context.vfs.fh_to_id(&args.dir);
-    // fail if unable to convert file handle
-    if let Err(stat) = dirid {
-        make_success_reply(xid).serialize(output)?;
-        stat.serialize(output)?;
-        nfs::post_op_attr::Void.serialize(output)?;
-        return Ok(());
-    }
-    let dirid = dirid.unwrap();
-    let dir_attr_maybe = context.vfs.getattr(dirid).await;
-
-    let dir_attr = match dir_attr_maybe {
-        Ok(v) => nfs::post_op_attr::attributes(v),
+/// Encode the complete resok before committing a successful RPC reply. The count
+/// limits include XDR padding and list terminators, but exclude the RPC envelope
+/// and NFS status. An unrepresentable first entry must return TOOSMALL so clients
+/// never receive a nonterminal page that cannot advance their cookie.
+async fn write_directory_page(
+    xid: u32,
+    output: &mut impl Write,
+    context: &RPCContext,
+    dir: &nfs::nfs_fh3,
+    cookie: nfs::cookie3,
+    count: u32,
+    dircount: Option<u32>,
+) -> Result<(), anyhow::Error> {
+    let dirid = match context.vfs.fh_to_id(dir) {
+        Ok(id) => id,
+        Err(status) => {
+            make_success_reply(xid).serialize(output)?;
+            status.serialize(output)?;
+            nfs::post_op_attr::Void.serialize(output)?;
+            return Ok(());
+        }
+    };
+    let dir_attr = match context.vfs.getattr(dirid).await {
+        Ok(attr) => nfs::post_op_attr::attributes(attr),
         Err(_) => nfs::post_op_attr::Void,
     };
-
-    let dirversion = if let Ok(ref dir_attr) = dir_attr_maybe {
-        let cvf_version = (dir_attr.mtime.seconds as u64) << 32 | (dir_attr.mtime.nseconds as u64);
-        cvf_version.to_be_bytes()
+    let max_bytes = count.min(crate::vfs::MAX_TRANSFER_SIZE) as usize;
+    let max_dir_bytes = dircount.map(|n| n.min(crate::vfs::MAX_TRANSFER_SIZE) as usize);
+    let mut body = Vec::new();
+    dir_attr.serialize(&mut body)?;
+    // File IDs are stable cookies; directory timestamp changes do not invalidate
+    // them. The export's file handles protect against cookies from a restart.
+    nfs::cookieverf3::default().serialize(&mut body)?;
+    let mut status = nfs::nfsstat3::NFS3_OK;
+    let mut eof = false;
+    // Reserve both the terminating list pointer and the EOF flag.
+    if body.len() + 8 > max_bytes {
+        status = nfs::nfsstat3::NFS3ERR_TOOSMALL;
     } else {
-        nfs::cookieverf3::default()
-    };
-    debug!(" -- Dir attr {:?}", dir_attr);
-    debug!(" -- Dir version {:?}", dirversion);
-    let has_version = args.cookieverf != nfs::cookieverf3::default();
-    // subtract off the final entryplus* field (which must be false) and the eof
-    if args.dircount < 128 {
-        make_success_reply(xid).serialize(output)?;
-        nfs::nfsstat3::NFS3ERR_TOOSMALL.serialize(output)?;
-        dir_attr.serialize(output)?;
-        return Ok(());
-    }
-    let max_bytes_allowed = args.dircount.min(crate::vfs::MAX_TRANSFER_SIZE) as usize - 128;
-    // args.dircount is bytes of just fileid, name, cookie.
-    // This is hard to ballpark, so we just divide it by 16
-    let estimated_max_results = args.dircount.min(crate::vfs::MAX_TRANSFER_SIZE) / 16;
-    let mut ctr = 0;
-    match context
-        .vfs
-        .readdir_simple(dirid, estimated_max_results as usize)
-        .await
-    {
-        Ok(result) => {
-            // we count dir_count seperately as it is just a subset of fields
-            let mut accumulated_dircount: usize = 0;
-            let mut all_entries_written = true;
-
-            // this is a wrapper around a writer that also just counts the number of bytes
-            // written
-            let mut counting_output = crate::write_counter::WriteCounter::new(output);
-
-            make_success_reply(xid).serialize(&mut counting_output)?;
-            nfs::nfsstat3::NFS3_OK.serialize(&mut counting_output)?;
-            dir_attr.serialize(&mut counting_output)?;
-            dirversion.serialize(&mut counting_output)?;
-            for entry in result.entries {
-                let entry = entry3 {
-                    fileid: entry.fileid,
-                    name: entry.name,
-                    cookie: entry.fileid,
-                };
-                // write the entry into a buffer first
-                let mut write_buf: Vec<u8> = Vec::new();
-                let mut write_cursor = std::io::Cursor::new(&mut write_buf);
-                // true flag for the entryplus3* to mark that this contains an entry
-                true.serialize(&mut write_cursor)?;
-                entry.serialize(&mut write_cursor)?;
-                write_cursor.flush()?;
-                let added_dircount = std::mem::size_of::<nfs::fileid3>()                   // fileid
-                                    + std::mem::size_of::<u32>() + entry.name.len()  // name
-                                    + std::mem::size_of::<nfs::cookie3>(); // cookie
-                let added_output_bytes = write_buf.len();
-                // check if we can write without hitting the limits
-                if added_output_bytes + counting_output.bytes_written() < max_bytes_allowed {
-                    trace!("  -- dirent {:?}", entry);
-                    // commit the entry
-                    ctr += 1;
-                    counting_output.write_all(&write_buf)?;
-                    accumulated_dircount += added_dircount;
-                    trace!(
-                        "  -- lengths: {:?} / {:?} / {:?}",
-                        accumulated_dircount,
-                        counting_output.bytes_written(),
-                        max_bytes_allowed
-                    );
-                } else {
-                    trace!(" -- insufficient space. truncating");
-                    all_entries_written = false;
-                    break;
+        // Every encoded directory entry needs at least 24 bytes. Ask for one
+        // even with a tiny budget to distinguish an empty directory from a
+        // first entry which cannot fit.
+        let max_entries = (max_dir_bytes.unwrap_or(max_bytes).min(max_bytes) / 24).max(1);
+        match context.vfs.readdir(dirid, cookie, max_entries).await {
+            Err(error) => status = error,
+            Ok(result) => {
+                eof = result.end;
+                let mut dir_bytes = 0;
+                let mut written = 0;
+                for item in result.entries {
+                    let mut encoded = Vec::new();
+                    true.serialize(&mut encoded)?;
+                    let entry = entry3 {
+                        fileid: item.fileid,
+                        name: item.name,
+                        cookie: item.fileid,
+                    };
+                    entry.serialize(&mut encoded)?;
+                    let entry_dir_bytes = encoded.len();
+                    if dircount.is_some() {
+                        nfs::post_op_attr::attributes(item.attr).serialize(&mut encoded)?;
+                        nfs::post_op_fh3::handle(context.vfs.id_to_fh(item.fileid))
+                            .serialize(&mut encoded)?;
+                    }
+                    if body.len() + encoded.len() + 8 > max_bytes
+                        || max_dir_bytes.is_some_and(|limit| dir_bytes + entry_dir_bytes > limit)
+                    {
+                        eof = false;
+                        if written == 0 {
+                            status = nfs::nfsstat3::NFS3ERR_TOOSMALL;
+                        }
+                        break;
+                    }
+                    body.extend_from_slice(&encoded);
+                    dir_bytes += entry_dir_bytes;
+                    written += 1;
+                }
+                if written == 0 && !eof {
+                    status = nfs::nfsstat3::NFS3ERR_TOOSMALL;
                 }
             }
-            // false flag for the final entryplus* linked list
-            false.serialize(&mut counting_output)?;
-            // eof flag is only valid here if we wrote everything
-            if all_entries_written {
-                debug!("  -- readdir eof {:?}", result.end);
-                result.end.serialize(&mut counting_output)?;
-            } else {
-                debug!("  -- readdir eof {:?}", false);
-                false.serialize(&mut counting_output)?;
-            }
-            debug!(
-                "readir {}, has_version {},  start at {}, flushing {} entries, complete {}",
-                dirid, has_version, args.cookie, ctr, all_entries_written
-            );
         }
-        Err(stat) => {
-            error!("readdir error {:?} --> {:?} ", xid, stat);
-            make_success_reply(xid).serialize(output)?;
-            stat.serialize(output)?;
-            dir_attr.serialize(output)?;
-        }
-    };
+    }
+    make_success_reply(xid).serialize(output)?;
+    status.serialize(output)?;
+    if matches!(status, nfs::nfsstat3::NFS3_OK) {
+        false.serialize(&mut body)?;
+        eof.serialize(&mut body)?;
+        output.write_all(&body)?;
+    } else {
+        dir_attr.serialize(output)?;
+    }
     Ok(())
 }
 
@@ -1379,14 +1173,23 @@ pub async fn nfsproc3_create(
 
     let (fid, postopattr) = match createhow {
         createmode3::EXCLUSIVE => (
-            context.vfs.create_exclusive_with_verifier(dirid, &dirops.name, verifier).await,
+            context
+                .vfs
+                .create_exclusive_with_verifier(dirid, &dirops.name, verifier)
+                .await,
             nfs::post_op_attr::Void,
         ),
         mode => {
             let result = if matches!(mode, createmode3::GUARDED) {
-                context.vfs.create_guarded(dirid, &dirops.name, target_attributes).await
+                context
+                    .vfs
+                    .create_guarded(dirid, &dirops.name, target_attributes)
+                    .await
             } else {
-                context.vfs.create(dirid, &dirops.name, target_attributes).await
+                context
+                    .vfs
+                    .create(dirid, &dirops.name, target_attributes)
+                    .await
             };
             match result {
                 Ok((id, attrs)) => (Ok(id), nfs::post_op_attr::attributes(attrs)),
