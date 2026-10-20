@@ -110,76 +110,31 @@ final class XPCModeAppDelegate: NSObject, NSApplicationDelegate {
 
         // Trigger FSKit mount
         Task {
-            await triggerFSKitMount(vaultPath: vaultPath, mountpoint: mountpoint)
+            await mountPublicResource(vaultPath: vaultPath, mountpoint: mountpoint)
         }
     }
 
-    /// Trigger FSKit mount using the disk image trigger approach.
+    /// Mount through the public API and report the actual system mount path.
     /// Password must already be stored in Keychain (via XPC mount call).
-    private func triggerFSKitMount(vaultPath: String, mountpoint: String?) async {
-        Self.logger.info("Triggering FSKit mount for: \(vaultPath)")
-        fputs("OxVaultFS: Triggering FSKit mount for: \(vaultPath)\n", stderr)
-
-        // Verify password is in Keychain (should have been stored by XPC mount call)
-        guard KeychainHelper.exists(for: vaultPath) else {
-            fputs("OxVaultFS: Password not found in Keychain - use 'oxcrypt mount' CLI first\n", stderr)
-            Self.logger.error("Password not in Keychain for: \(vaultPath)")
-
-            NotificationCenter.default.post(
-                name: .oxcryptMountFailed,
-                object: nil,
-                userInfo: [
-                    "vaultPath": vaultPath,
-                    "error": "Password not found in Keychain. Use 'oxcrypt mount' CLI command instead."
-                ]
-            )
-            return
-        }
-
-        // Use the trigger disk image approach
-        let volumeName = URL(fileURLWithPath: vaultPath).lastPathComponent
-
+    private func mountPublicResource(vaultPath: String, mountpoint: String?) async {
         do {
-            // Create trigger DMG
-            fputs("OxVaultFS: Creating trigger DMG...\n", stderr)
-            let dmgPath = try TriggerImageManager.createTrigger(
+            let mount = try await NativeMountManager.mountStoredVault(
                 vaultPath: vaultPath,
-                volumeName: volumeName
+                requestedMountpoint: mountpoint,
+                ownerTeamId: HostAppXPCDelegate.ourTeamId
             )
-            fputs("OxVaultFS: Created trigger at: \(dmgPath.path)\n", stderr)
-
-            // Attach trigger - this causes fskitd to probe our extension
-            fputs("OxVaultFS: Attaching trigger...\n", stderr)
-            let devicePath = try TriggerImageManager.attachTrigger(dmgPath)
-            fputs("OxVaultFS: Attached at device: \(devicePath)\n", stderr)
-
-            Self.logger.info("Trigger attached at: \(devicePath)")
-
-            // Post success notification
             NotificationCenter.default.post(
                 name: .oxcryptMountRequested,
                 object: nil,
-                userInfo: [
-                    "vaultPath": vaultPath,
-                    "mountpoint": mountpoint ?? "/Volumes/\(volumeName)",
-                    "status": "trigger_attached",
-                    "devicePath": devicePath
-                ]
+                userInfo: ["vaultPath": mount.vaultPath, "mountpoint": mount.mountpoint, "status": "mounted"]
             )
-
-            fputs("OxVaultFS: Mount triggered successfully - FSKit will handle the rest\n", stderr)
-
         } catch {
-            fputs("OxVaultFS: Trigger failed: \(error.localizedDescription)\n", stderr)
-            Self.logger.error("Trigger mount failed: \(error.localizedDescription)")
-
+            let error = (error as? OxVaultServiceError)?.nsError ?? (error as NSError)
+            Self.logger.error("Public FSKit mount failed: \(error.localizedDescription)")
             NotificationCenter.default.post(
                 name: .oxcryptMountFailed,
                 object: nil,
-                userInfo: [
-                    "vaultPath": vaultPath,
-                    "error": error.localizedDescription
-                ]
+                userInfo: ["vaultPath": vaultPath, "error": error.localizedDescription]
             )
         }
     }
@@ -260,54 +215,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Self.logger.info("URL mount request: vault=\(vaultPath), mountpoint=\(mountpoint ?? "auto")")
 
         // Trigger FSKit mount via FSClient
-        // FSKit will receive this as FSGenericURLResource and call probeResource/loadResource
+        // The host converts the vault directory to an FSPathURLResource.
         Task {
-            await triggerFSKitMount(vaultPath: vaultPath, mountpoint: mountpoint)
+            await mountPublicResource(vaultPath: vaultPath, mountpoint: mountpoint)
         }
     }
 
-    /// Trigger FSKit mount using disk image trigger approach.
+    /// Mount through the public API and report the actual system mount path.
     /// Password must already be in Keychain (via XPC mount flow).
-    private func triggerFSKitMount(vaultPath: String, mountpoint: String?) async {
-        Self.logger.info("Triggering FSKit mount for: \(vaultPath)")
-
-        // Verify password is in Keychain
-        guard KeychainHelper.exists(for: vaultPath) else {
-            Self.logger.error("Password not in Keychain for: \(vaultPath)")
-            NotificationCenter.default.post(
-                name: .oxcryptMountFailed,
-                object: nil,
-                userInfo: [
-                    "vaultPath": vaultPath,
-                    "error": "Password not found. Use 'oxcrypt mount' CLI command."
-                ]
-            )
-            return
-        }
-
-        let volumeName = URL(fileURLWithPath: vaultPath).lastPathComponent
-
+    private func mountPublicResource(vaultPath: String, mountpoint: String?) async {
         do {
-            // Create and attach trigger DMG
-            let dmgPath = try TriggerImageManager.createTrigger(
+            let mount = try await NativeMountManager.mountStoredVault(
                 vaultPath: vaultPath,
-                volumeName: volumeName
+                requestedMountpoint: mountpoint,
+                ownerTeamId: HostAppXPCDelegate.ourTeamId
             )
-            let devicePath = try TriggerImageManager.attachTrigger(dmgPath)
-
-            Self.logger.info("Trigger attached at: \(devicePath)")
-
             NotificationCenter.default.post(
                 name: .oxcryptMountRequested,
                 object: nil,
-                userInfo: [
-                    "vaultPath": vaultPath,
-                    "mountpoint": mountpoint ?? "/Volumes/\(volumeName)",
-                    "status": "trigger_attached"
-                ]
+                userInfo: ["vaultPath": mount.vaultPath, "mountpoint": mount.mountpoint, "status": "mounted"]
             )
         } catch {
-            Self.logger.error("Trigger mount failed: \(error.localizedDescription)")
+            let error = (error as? OxVaultServiceError)?.nsError ?? (error as NSError)
+            Self.logger.error("Public FSKit mount failed: \(error.localizedDescription)")
             NotificationCenter.default.post(
                 name: .oxcryptMountFailed,
                 object: nil,
@@ -403,7 +333,7 @@ final class HostAppXPCDelegate: NSObject, NSXPCListenerDelegate {
     private static let logger = Logger(subsystem: "com.agucova.oxcrypt", category: "HostAppXPC")
 
     /// Our team ID for code signature validation.
-    private static let ourTeamId = "2LR4AGRZW3"
+    static let ourTeamId = "2LR4AGRZW3"
 
     /// Whether to allow unsigned connections (for development).
     /// Set OXCRYPT_ALLOW_UNSIGNED=1 environment variable to enable.

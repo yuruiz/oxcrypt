@@ -65,6 +65,7 @@ enum OxVaultServiceError: Int, Error {
     case permissionDenied = 5
     case alreadyMounted = 6
     case resourceExhausted = 7
+    case unsupportedSystem = 8
     case internalError = 99
 
     var nsError: NSError {
@@ -85,6 +86,8 @@ enum OxVaultServiceError: Int, Error {
             message = "Vault already mounted"
         case .resourceExhausted:
             message = "Too many mounts"
+        case .unsupportedSystem:
+            message = "Native FSKit mounting requires macOS 27 or later and a signed host with the FSKit mount entitlement"
         case .internalError:
             message = "Internal error"
         }

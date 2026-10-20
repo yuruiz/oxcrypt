@@ -251,7 +251,7 @@ impl Drop for XpcConnection {
 /// Check if the FSKit extension is available.
 ///
 /// This performs a quick check:
-/// 1. Checks macOS version (requires 15.4+)
+/// 1. Checks macOS version (requires 27+)
 /// 2. Checks if extension is registered via pluginkit
 ///
 /// Note: This does NOT verify the XPC service is running. The extension
@@ -267,7 +267,7 @@ pub fn is_extension_available() -> bool {
     check_extension_registered()
 }
 
-/// Check if we're running on macOS 15.4+.
+/// Check if we're running on macOS 27+.
 fn check_macos_version() -> bool {
     use std::process::Command;
 
@@ -290,10 +290,9 @@ fn check_macos_version() -> bool {
     }
 
     let major: i64 = parts[0].parse().unwrap_or(0);
-    let minor: i64 = parts[1].parse().unwrap_or(0);
 
-    // Require macOS 15.4+
-    major > 15 || (major == 15 && minor >= 4)
+    // Require macOS 27+
+    major >= 27
 }
 
 /// Check if the FSKit extension is registered with pluginkit.

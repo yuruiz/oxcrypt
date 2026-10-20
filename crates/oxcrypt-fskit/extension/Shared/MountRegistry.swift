@@ -47,34 +47,71 @@ actor MountRegistry {
 
     /// Mounts by vault path (for detecting duplicate mount attempts).
     private var mountsByVault: [String: String] = [:]  // vaultPath -> mountpoint
+    private var pendingVaults: Set<String> = []
+    private var unmounting: Set<String> = []
+    private var detached: Set<String> = []
 
     /// Maximum number of concurrent mounts (resource exhaustion protection).
     private let maxMounts = 10
 
     private let logger = Logger(subsystem: "com.agucova.oxcrypt", category: "MountRegistry")
 
-    private init() {}
+    init() {}
 
-    /// Register a new mount.
-    /// - Throws: If vault is already mounted or max mounts reached.
-    func register(
+    /// Reserve a vault before changing credentials, then publish the system's
+    /// actual mount path only after the mount API succeeds.
+    func mount(
+        vaultPath: String,
+        ownerAuditToken: Data,
+        ownerTeamId: String,
+        prepare: () throws -> Void,
+        performMount: () async throws -> URL,
+        cleanup: () throws -> Void
+    ) async throws -> MountInfo {
+        guard mountsByVault[vaultPath] == nil, !pendingVaults.contains(vaultPath) else {
+            throw OxVaultServiceError.alreadyMounted
+        }
+        guard mounts.count + pendingVaults.count < maxMounts else {
+            throw OxVaultServiceError.resourceExhausted
+        }
+        pendingVaults.insert(vaultPath)
+        defer { pendingVaults.remove(vaultPath) }
+
+        let location: URL
+        do {
+            try prepare()
+            location = try await performMount()
+        } catch {
+            do {
+                try cleanup()
+            } catch let cleanupError {
+                throw NSError(
+                    domain: "com.agucova.oxcrypt.xpc",
+                    code: OxVaultServiceError.mountFailed.rawValue,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Mount failed and its previous Keychain credential state could not be restored",
+                        NSUnderlyingErrorKey: cleanupError
+                    ]
+                )
+            }
+            throw error
+        }
+        // The reservation holds a slot and prevents another mount of this vault.
+        return register(
+            vaultPath: vaultPath,
+            mountpoint: location.path,
+            ownerAuditToken: ownerAuditToken,
+            ownerTeamId: ownerTeamId
+        )
+    }
+
+    /// Publish a mount whose reservation has already been validated.
+    private func register(
         vaultPath: String,
         mountpoint: String,
         ownerAuditToken: Data,
         ownerTeamId: String
-    ) throws -> MountInfo {
-        // Check if vault is already mounted
-        if let existingMountpoint = mountsByVault[vaultPath] {
-            logger.warning("Vault already mounted: \(vaultPath) at \(existingMountpoint)")
-            throw OxVaultServiceError.alreadyMounted
-        }
-
-        // Check max mounts
-        if mounts.count >= maxMounts {
-            logger.warning("Maximum mounts reached (\(self.maxMounts))")
-            throw OxVaultServiceError.resourceExhausted
-        }
-
+    ) -> MountInfo {
         let info = MountInfo(
             mountId: UUID(),
             vaultPath: vaultPath,
@@ -91,9 +128,35 @@ actor MountRegistry {
         return info
     }
 
-    /// Unregister a mount.
-    /// - Returns: The removed mount info, or nil if not found.
-    func unregister(mountpoint: String) -> MountInfo? {
+    /// Keep ownership and credentials available when system detachment fails.
+    func unmount(
+        mountpoint: String,
+        clientAuditToken: Data,
+        clientTeamId: String,
+        detach: () async throws -> Void,
+        removeCredential: (String) throws -> Void
+    ) async throws {
+        guard let info = mounts[mountpoint] else {
+            throw OxVaultServiceError.notFound
+        }
+        guard canAccess(mountpoint: mountpoint, clientAuditToken: clientAuditToken, clientTeamId: clientTeamId) else {
+            throw OxVaultServiceError.permissionDenied
+        }
+        guard unmounting.insert(mountpoint).inserted else {
+            throw OxVaultServiceError.resourceExhausted
+        }
+        defer { unmounting.remove(mountpoint) }
+        if !detached.contains(mountpoint) {
+            try await detach()
+            detached.insert(mountpoint)
+        }
+        // A credential cleanup failure can be retried without detaching twice.
+        try removeCredential(info.vaultPath)
+        _ = unregister(mountpoint: mountpoint)
+        detached.remove(mountpoint)
+    }
+
+    private func unregister(mountpoint: String) -> MountInfo? {
         guard let info = mounts.removeValue(forKey: mountpoint) else {
             return nil
         }

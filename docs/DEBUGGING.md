@@ -254,84 +254,37 @@ About to get current agent for 501
 Attempt to start non-Apple extension <private> on behalf of root
 ```
 
-## FSKit Limitations for Third-Party Developers
+## FSKit Public Mounting (macOS 27+)
 
-**Critical Finding (as of macOS 15.4/26.0.1)**: FSKit extensions **cannot be invoked by third-party applications** without Apple's private entitlements.
+[Apple's public `FSClient.mountSingleVolume` API](https://developer.apple.com/documentation/fskit/fsclient/mountsinglevolume(resource:bundleid:options:completionhandler:))
+is available starting in macOS 27.0. It requires the host's
+`com.apple.developer.fskit.mount` entitlement and a visible, enabled extension.
+The extension still needs `com.apple.developer.fskit.fsmodule`. Entitlement files
+must match the signed app and its provisioning profile.
 
-### The Entitlement Problem
+OxCrypt passes an `FSPathURLResource` for the vault directory. FSKit loads and
+activates the volume, creates its mountpoint under `/Volumes`, and returns the
+actual mount URL. The host registers that returned path only after success. A
+failed mount removes the pending reservation and restores the credential state
+from before that attempt (or deletes a newly created credential); cleanup failures
+are reported. Concurrent requests for
+the same vault are rejected before changing its credential. System unmount commands
+have a 15-second timeout each. A failed unmount retains registry and credentials for
+retry; credential cleanup after successful detachment can be retried independently.
 
-FSKit's architecture requires:
+The host no longer uses trigger disk images or `/sbin/mount -F` for its mount
+requests. macOS versions below 27 receive an explicit unsupported-system error.
+The earlier macOS 15.4/26.0.1 `entitlement no` observations describe the command and
+private-API routes tested on those releases; they do not establish that current
+third-party public mounting is unavailable.
 
-1. **Extension entitlement** (`com.apple.developer.fskit.fsmodule`) - Available to developers via provisioning profile
-2. **Client entitlement** (private) - Required to request fskitd to probe/mount; **NOT available to third-party developers**
+The backend remains disabled unless `OXCRYPT_EXPERIMENTAL_FSKIT=1` is set. Build
+with the Xcode 27 SDK, verify the signed host has the mount entitlement, and enable
+the extension through System Settings before an intentional runtime test. Neither
+a successful build nor extension registration proves that mounting works. An
+end-to-end signed mount, read/write, and unmount cycle remains a separate required
+validation. Use FUSE, WebDAV, or NFS when this environment is not available.
 
-When a third-party app (or the standard `mount` command) tries to mount an FSKit filesystem:
-
-```
-mount -F -t oxcrypt /dev/disk5 /mnt/point
-```
-
-The fskitd logs show:
-```
-Hello FSClient! entitlement no
-About to get current agent for 501
-[10 seconds later: connection invalidated - no probe ever happens]
-```
-
-The mount command lacks the FSKit client entitlement, so fskitd **never probes** the extension.
-
-### What Works vs. What Doesn't
-
-| Approach | Works? | Notes |
-|----------|--------|-------|
-| Extension with fsmodule entitlement | ✓ | Extension registers correctly |
-| Host app stores password in Keychain | ✓ | Shared keychain access works |
-| Host app creates/attaches trigger DMG | ✓ | hdiutil works fine |
-| `mount -F -t fstype` command | ✗ | Lacks client entitlement |
-| `sudo mount` as root | ✗ | "Attempt to start non-Apple extension on behalf of root" |
-| FSClient private APIs | ✗ | Returns EPERM without entitlement |
-
-### Why Content-Based Probing Doesn't Help
-
-FSKit uses `FSMediaTypes` in the extension's Info.plist for content-based detection. Even with correctly configured media types:
-
-```xml
-<key>FSMediaTypes</key>
-<dict>
-    <key>Partitionless</key>
-    <dict>
-        <key>FSMediaProperties</key>
-        <dict><key>Leaf</key><true/><key>Whole</key><true/></dict>
-        <key>FSProbeOrder</key>
-        <integer>5000</integer>
-    </dict>
-</dict>
-```
-
-The mount command itself is rejected before any probing occurs because it lacks entitlements.
-
-### Apple's FSKit Filesystems Work Because
-
-Apple's FSKit filesystems (exfat, msdos, FTP) have special mount helpers (`mount_exfat`, etc.) that:
-1. Are Apple-signed with private entitlements
-2. Are invoked by DiskArbitration when disks are inserted
-3. Have full FSKit client access
-
-Third-party developers cannot obtain these entitlements.
-
-### Current Workarounds
-
-For now, use alternative mount backends that don't require FSKit:
-
-1. **FUSE** (macFUSE) - Works on macOS with kernel extension
-2. **WebDAV** - Cross-platform, mounts via `mount_webdav`
-3. **NFS** - Userspace NFSv3 server, mounts via standard `mount_nfs`
-
-### Future Possibilities
-
-Apple may provide:
-- Public FSKit client entitlement in future macOS versions
-- DiskArbitration hooks for third-party FSKit extensions
-- A way to register custom "mount helpers" with proper entitlements
-
-Until then, FSKit remains effectively Apple-only for invoking filesystem mounts.
+`bash crates/oxcrypt-fskit/extension/test-mount-lifecycle.sh` checks reservations,
+actual-path registration, duplicate requests, and failure cleanup without mounting
+or accessing Keychain.

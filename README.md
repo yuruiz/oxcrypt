@@ -68,7 +68,7 @@ oxcrypt unmount ~/mnt/decrypted
 | Backend | Platforms | Kernel Extension | Best For |
 |---------|-----------|------------------|----------|
 | **FUSE** | Linux, macOS | Yes (macFUSE/libfuse) | Maximum throughput |
-| **FSKit** | macOS 15.4+ | No | Native Finder integration *(WIP)* |
+| **FSKit** | macOS 27+ | No | Native integration *(experimental)* |
 | **WebDAV** | All | No | Windows, Docker, portable |
 | **NFS** | Linux, macOS | No | Headless servers, NAS |
 
@@ -79,7 +79,7 @@ oxcrypt mount ~/vault ~/mnt -b nfs     # NFSv3 server
 # oxcrypt mount ~/vault ~/mnt -b fskit # macOS Sequoia native (WIP)
 ```
 
-> **Note:** FSKit support is experimental and not yet usable. Apple's FSKit framework (macOS 15.4+) is promising for kernel-extension-free mounts with native Finder integration, but the API is still underdocumented and our implementation is incomplete.
+> **Note:** Native FSKit mounting is experimental and disabled by default. The host uses the public macOS 27 mounting API and requires a signed, enabled extension plus the FSKit mount entitlement. Signed end-to-end mounting still needs validation; see [FSKit availability](crates/oxcrypt-fskit/README.md#experimental-availability).
 
 ## Security
 

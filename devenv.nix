@@ -278,11 +278,9 @@ EOF
       set -e
       cd crates/oxcrypt-fskit/extension
 
-      # Regenerate project if needed
-      if [[ ! -f OxVaultFS.xcodeproj/project.pbxproj ]] || [[ project.yml -nt OxVaultFS.xcodeproj/project.pbxproj ]]; then
-        echo "Regenerating Xcode project from project.yml..."
-        xcodegen generate
-      fi
+      # Source-file additions also change the generated project graph.
+      echo "Regenerating Xcode project from project.yml..."
+      xcodegen generate
 
       echo "Building FSKit extension with clean environment..."
       # Use env -i to start with empty environment, then add only essential paths
@@ -293,8 +291,9 @@ EOF
         DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer" \
         /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild \
           -project OxVaultFS.xcodeproj \
-          -scheme OxVaultFSExtension \
+          -scheme OxVaultFS \
           -configuration Release \
+          CODE_SIGNING_ALLOWED=NO \
           build
 
       echo "FSKit extension built successfully!"
@@ -306,11 +305,9 @@ EOF
       set -e
       cd crates/oxcrypt-fskit/extension
 
-      # Regenerate project if needed
-      if [[ ! -f OxVaultFS.xcodeproj/project.pbxproj ]] || [[ project.yml -nt OxVaultFS.xcodeproj/project.pbxproj ]]; then
-        echo "Regenerating Xcode project from project.yml..."
-        xcodegen generate
-      fi
+      # Source-file additions also change the generated project graph.
+      echo "Regenerating Xcode project from project.yml..."
+      xcodegen generate
 
       echo "Building signed FSKit extension with clean environment..."
       env -i \
@@ -319,7 +316,7 @@ EOF
         DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer" \
         /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild \
           -project OxVaultFS.xcodeproj \
-          -scheme OxVaultFSExtension \
+          -scheme OxVaultFS \
           -configuration Release \
           -allowProvisioningUpdates \
           build

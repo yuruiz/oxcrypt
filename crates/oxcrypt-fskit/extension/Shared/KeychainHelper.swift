@@ -28,34 +28,23 @@ struct KeychainHelper {
             throw KeychainError.unexpectedData
         }
 
-        // Delete existing items first - try without access group to catch legacy items
-        let deleteQueryNoGroup: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: vaultPath
-        ]
-        SecItemDelete(deleteQueryNoGroup as CFDictionary)
-
-        // Also try with access group in case there's a matching item
-        let deleteQuery: [String: Any] = [
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
             kSecAttrAccount as String: vaultPath,
             kSecAttrAccessGroup as String: accessGroup
         ]
-        SecItemDelete(deleteQuery as CFDictionary)
-
-        // Add new item with shared access group and accessible after first unlock
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: vaultPath,
+        let attributes: [String: Any] = [
             kSecValueData as String: passwordData,
-            kSecAttrAccessGroup as String: accessGroup,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
         ]
-
-        let status = SecItemAdd(query as CFDictionary, nil)
+        let updated = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updated == errSecSuccess { return }
+        guard updated == errSecItemNotFound else {
+            throw KeychainError.unhandled(updated)
+        }
+        let item = query.merging(attributes) { _, new in new }
+        let status = SecItemAdd(item as CFDictionary, nil)
         guard status == errSecSuccess else {
             throw KeychainError.unhandled(status)
         }

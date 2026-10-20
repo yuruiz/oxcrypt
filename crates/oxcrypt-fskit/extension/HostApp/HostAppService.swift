@@ -66,110 +66,19 @@ final class HostAppService: NSObject, OxVaultServiceProtocol {
 
         Task {
             do {
-                fputs("HostAppService: [Task] Starting mount task...\n", stderr)
-
-                // 1. Store password in Keychain for FSKit extension to use
-                fputs("HostAppService: [Task] Storing password in Keychain...\n", stderr)
-                try KeychainHelper.store(password: password, for: validatedPath)
-                fputs("HostAppService: [Task] Password stored in Keychain\n", stderr)
-                Self.logger.info("Password stored in Keychain")
-
-                // Generate mountpoint in user-accessible location (~/Vaults)
-                // /Volumes requires root to create directories
-                let volumeName = URL(fileURLWithPath: validatedPath).lastPathComponent
-                let vaultsDir = FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent("Vaults")
-                let mountpoint = vaultsDir.appendingPathComponent(volumeName).path
-                fputs("HostAppService: [Task] Mountpoint will be: \(mountpoint)\n", stderr)
-
-                // Register the mount
-                fputs("HostAppService: [Task] Registering mount in registry...\n", stderr)
-                _ = try await MountRegistry.shared.register(
+                let mount = try await NativeMountManager.mount(
                     vaultPath: validatedPath,
-                    mountpoint: mountpoint,
+                    password: password,
                     ownerAuditToken: clientAuditToken,
                     ownerTeamId: clientTeamId
                 )
-                fputs("HostAppService: [Task] Mount registered\n", stderr)
-
-                Self.logger.info("Triggering FSKit mount via trigger DMG: vault=\(validatedPath)")
-                fputs("HostAppService: [Task] Triggering FSKit mount via trigger DMG...\n", stderr)
-
-                // 2. Mount using RAW trigger disk image approach (FSKitBridge style)
-                // - Create a raw disk image (no filesystem)
-                // - Attach with CRawDiskImage + -nomount (no driver claims it)
-                // - Call mount -F -t oxcrypt to trigger fskitd probing
-                var devicePath: String = ""
-                do {
-                    // Create raw trigger DMG
-                    fputs("HostAppService: [Task] Creating RAW trigger DMG...\n", stderr)
-                    let dmgPath = try TriggerImageManager.createTrigger(
-                        vaultPath: validatedPath,
-                        volumeName: volumeName
-                    )
-                    fputs("HostAppService: [Task] Created trigger at: \(dmgPath.path)\n", stderr)
-
-                    // Attach trigger with CRawDiskImage/-nomount
-                    fputs("HostAppService: [Task] Attaching RAW trigger (no mount)...\n", stderr)
-                    devicePath = try TriggerImageManager.attachTrigger(dmgPath)
-                    fputs("HostAppService: [Task] Attached at device: \(devicePath)\n", stderr)
-                    Self.logger.info("Trigger attached at: \(devicePath)")
-
-                    // Write pending mount info for extension to read
-                    fputs("HostAppService: [Task] Writing pending mount info...\n", stderr)
-                    _ = try PendingMountManager.writePending(
-                        vaultPath: validatedPath,
-                        volumeName: volumeName
-                    )
-                    fputs("HostAppService: [Task] Pending mount info written\n", stderr)
-
-                    // Now trigger FSKit by calling mount -F
-                    fputs("HostAppService: [Task] Calling mount -F -t oxcrypt...\n", stderr)
-                    try TriggerImageManager.mountFSKit(
-                        device: devicePath,
-                        mountpoint: mountpoint,
-                        vaultPath: validatedPath
-                    )
-                    fputs("HostAppService: [Task] FSKit mount command succeeded\n", stderr)
-                    Self.logger.info("FSKit mount triggered for: \(mountpoint)")
-
-                } catch {
-                    fputs("HostAppService: [Task] Trigger mount failed: \(error.localizedDescription)\n", stderr)
-                    Self.logger.error("Trigger mount failed: \(error)")
-                    // Clean up device if attached
-                    if !devicePath.isEmpty {
-                        TriggerImageManager.detachTrigger(devicePath)
-                    }
-                    _ = await MountRegistry.shared.unregister(mountpoint: mountpoint)
-                    throw OxVaultServiceError.mountFailed
-                }
-
-                // 3. Verify mount appeared
-                fputs("HostAppService: [Task] Waiting for mount to appear...\n", stderr)
-                let mounted = await waitForMount(mountpoint: mountpoint, timeout: 10.0)
-
-                if mounted {
-                    fputs("HostAppService: [Task] Mount successful: \(mountpoint)\n", stderr)
-                    Self.logger.info("Mount successful: \(mountpoint)")
-                    reply(mountpoint, nil)
-                } else {
-                    fputs("HostAppService: [Task] Mount did not appear within timeout\n", stderr)
-                    Self.logger.warning("Mount did not appear within timeout")
-                    _ = await MountRegistry.shared.unregister(mountpoint: mountpoint)
-                    throw OxVaultServiceError.mountFailed
-                }
-
+                Self.logger.info("Mounted vault at: \(mount.mountpoint)")
+                reply(mount.mountpoint, nil)
             } catch let error as OxVaultServiceError {
-                fputs("HostAppService: [Task] Mount failed with OxVaultServiceError: \(error.nsError.localizedDescription)\n", stderr)
-                Self.logger.error("Mount failed: \(error.nsError.localizedDescription)")
-                try? KeychainHelper.delete(for: validatedPath)
                 reply(nil, error.nsError)
-
             } catch {
-                fputs("HostAppService: [Task] Mount failed with unexpected error: \(error)\n", stderr)
-                Self.logger.error("Mount failed with error: \(error)")
-                try? KeychainHelper.delete(for: validatedPath)
-                reply(nil, OxVaultServiceError.mountFailed.nsError)
+                Self.logger.error("Public FSKit mount failed: \(error)")
+                reply(nil, error as NSError)
             }
         }
     }
@@ -194,55 +103,21 @@ final class HostAppService: NSObject, OxVaultServiceProtocol {
         }
 
         Task {
-            // Check access permission
-            let canAccess = await MountRegistry.shared.canAccess(
-                mountpoint: mountpoint,
-                clientAuditToken: clientAuditToken,
-                clientTeamId: clientTeamId
-            )
-
-            guard canAccess else {
-                Self.logger.warning("Permission denied for unmount: \(mountpoint)")
-                reply(OxVaultServiceError.permissionDenied.nsError)
-                return
-            }
-
-            // Get mount info
-            guard let mountInfo = await MountRegistry.shared.get(mountpoint: mountpoint) else {
-                Self.logger.warning("Mount not found: \(mountpoint)")
-                reply(OxVaultServiceError.notFound.nsError)
-                return
-            }
-
             do {
-                // Unmount via diskutil (FSKit volumes can be unmounted this way)
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-                process.arguments = ["unmount", mountpoint]
-
-                try process.run()
-                process.waitUntilExit()
-
-                if process.terminationStatus != 0 {
-                    Self.logger.warning("diskutil unmount failed with status: \(process.terminationStatus)")
-                    // Try force unmount
-                    let forceProcess = Process()
-                    forceProcess.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-                    forceProcess.arguments = ["unmount", "force", mountpoint]
-                    try forceProcess.run()
-                    forceProcess.waitUntilExit()
-                }
-
-                // Clean up
-                _ = await MountRegistry.shared.unregister(mountpoint: mountpoint)
-                try? KeychainHelper.delete(for: mountInfo.vaultPath)
-
+                try await MountRegistry.shared.unmount(
+                    mountpoint: mountpoint,
+                    clientAuditToken: clientAuditToken,
+                    clientTeamId: clientTeamId,
+                    detach: { try DiskutilUnmount.detach(mountpoint) },
+                    removeCredential: { try KeychainHelper.delete(for: $0) }
+                )
                 Self.logger.info("Unmount successful: \(mountpoint)")
                 reply(nil)
-
+            } catch let error as OxVaultServiceError {
+                reply(error.nsError)
             } catch {
                 Self.logger.error("Unmount failed: \(error)")
-                reply(OxVaultServiceError.mountFailed.nsError)
+                reply(error as NSError)
             }
         }
     }
@@ -307,39 +182,13 @@ final class HostAppService: NSObject, OxVaultServiceProtocol {
 
     // MARK: - Helpers
 
-    /// Wait for a mount to appear at the given mountpoint.
-    private func waitForMount(mountpoint: String, timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        let checkInterval: UInt64 = 200_000_000  // 200ms
-
-        while Date() < deadline {
-            // Check if mountpoint is mounted
-            var statBuf = statfs()
-            if statfs(mountpoint, &statBuf) == 0 {
-                // Check it's not just the directory
-                let mountPath = withUnsafePointer(to: &statBuf.f_mntonname) { ptr in
-                    ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { cString in
-                        String(cString: cString)
-                    }
-                }
-                if mountPath == mountpoint {
-                    return true
-                }
-            }
-
-            try? await Task.sleep(nanoseconds: checkInterval)
-        }
-
-        return false
-    }
-
     /// Validate and canonicalize a vault path.
     private func validateVaultPath(_ path: String) -> String? {
         guard path.hasPrefix("/") else {
             return nil
         }
 
-        let url = URL(fileURLWithPath: path).standardized
+        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         let canonicalPath = url.path
 
         let vaultConfigPath = url.appendingPathComponent("vault.cryptomator").path
@@ -359,15 +208,6 @@ final class HostAppService: NSObject, OxVaultServiceProtocol {
 
         let allowedPrefixes = ["/Volumes/", "/tmp/", NSHomeDirectory() + "/"]
         return allowedPrefixes.contains { path.hasPrefix($0) }
-    }
-
-    /// Generate a mountpoint for a vault.
-    /// Uses ~/Vaults/ to avoid needing admin privileges for /Volumes/
-    private func generateMountpoint(for vaultPath: String) -> String {
-        let vaultName = URL(fileURLWithPath: vaultPath).lastPathComponent
-        let sanitizedName = vaultName.replacingOccurrences(of: " ", with: "_")
-        let vaultsDir = NSHomeDirectory() + "/Vaults"
-        return "\(vaultsDir)/\(sanitizedName)"
     }
 
     /// Check rate limiting.

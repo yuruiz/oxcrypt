@@ -2,7 +2,7 @@
 //!
 //! This module provides a `MountBackend` implementation for FSKit,
 //! allowing CLI and desktop apps to mount Cryptomator vaults using
-//! Apple's native FSKit framework (macOS 15.4+).
+//! Apple's native FSKit framework (macOS 27+).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ impl std::ops::Deref for ThreadSafeClient {
     }
 }
 
-/// FSKit-based mount backend for macOS 15.4+.
+/// FSKit-based mount backend for macOS 27+.
 ///
 /// This backend uses Apple's FSKit framework via XPC communication
 /// with the FSKit extension. It provides native filesystem integration
@@ -48,7 +48,7 @@ impl std::ops::Deref for ThreadSafeClient {
 /// # Availability
 ///
 /// The FSKit backend requires:
-/// - macOS 15.4 or later
+/// - macOS 27 or later
 /// - The FSKit extension to be installed and enabled in System Settings
 ///
 /// Use [`is_available()`](MountBackend::is_available) to check before attempting to mount.
@@ -95,7 +95,7 @@ impl MountBackend for FskitBackend {
 
         // Check macOS version first
         if !check_macos_version() {
-            return Some("Requires macOS 15.4 or later".to_string());
+            return Some("Requires macOS 27 or later".to_string());
         }
 
         // Extension not installed/enabled
@@ -112,7 +112,7 @@ impl MountBackend for FskitBackend {
     }
 
     fn description(&self) -> &'static str {
-        "Apple's native FSKit framework (macOS 15.4+)"
+        "Apple's native FSKit framework (macOS 27+)"
     }
 
     fn mount(
@@ -154,6 +154,7 @@ impl MountBackend for FskitBackend {
         Ok(Box::new(FskitMountHandle {
             client: Arc::new(ThreadSafeClient(client)),
             info,
+            active: true,
         }))
     }
 
@@ -176,6 +177,7 @@ impl MountBackend for FskitBackend {
 pub struct FskitMountHandle {
     client: Arc<ThreadSafeClient>,
     info: MountInfo,
+    active: bool,
 }
 
 impl MountHandle for FskitMountHandle {
@@ -183,10 +185,12 @@ impl MountHandle for FskitMountHandle {
         &self.info.mountpoint
     }
 
-    fn unmount(self: Box<Self>) -> Result<(), MountError> {
+    fn unmount(mut self: Box<Self>) -> Result<(), MountError> {
         self.client
             .unmount(&self.info.mountpoint)
-            .map_err(|e| MountError::UnmountFailed(e.to_string()))
+            .map_err(|e| MountError::UnmountFailed(e.to_string()))?;
+        self.active = false;
+        Ok(())
     }
 
     fn force_unmount(self: Box<Self>) -> Result<(), MountError> {
@@ -202,11 +206,13 @@ impl MountHandle for FskitMountHandle {
 impl Drop for FskitMountHandle {
     fn drop(&mut self) {
         // Best-effort unmount on drop
-        let _ = self.client.unmount(&self.info.mountpoint);
+        if self.active {
+            let _ = self.client.unmount(&self.info.mountpoint);
+        }
     }
 }
 
-/// Check if we're running on macOS 15.4+.
+/// Check if we're running on macOS 27+.
 fn check_macos_version() -> bool {
     use std::process::Command;
 
@@ -228,9 +234,8 @@ fn check_macos_version() -> bool {
     }
 
     let major: i64 = parts[0].parse().unwrap_or(0);
-    let minor: i64 = parts[1].parse().unwrap_or(0);
 
-    major > 15 || (major == 15 && minor >= 4)
+    major >= 27
 }
 
 #[cfg(test)]
