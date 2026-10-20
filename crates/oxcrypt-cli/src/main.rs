@@ -249,7 +249,18 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Set up tracing based on verbosity (skip if quiet)
-    if !cli.quiet {
+    let daemon_child = match &cli.command {
+        #[cfg(any(
+            feature = "fuse",
+            feature = "fskit",
+            feature = "webdav",
+            feature = "nfs",
+            feature = "fileprovider"
+        ))]
+        Commands::Mount(args) => args.internal_daemon_child,
+        _ => false,
+    };
+    if !cli.quiet && !daemon_child {
         setup_tracing(cli.verbose);
     }
 
@@ -257,7 +268,7 @@ fn run() -> Result<()> {
     // Skip if OXCRYPT_NO_STARTUP_CLEANUP=1 (used by tests)
     let skip_cleanup = std::env::var("OXCRYPT_NO_STARTUP_CLEANUP")
         .is_ok_and(|v| v == "1" || v.to_lowercase() == "true");
-    if !skip_cleanup {
+    if !skip_cleanup && !daemon_child {
         if let Err(e) = proactive_cleanup() {
             tracing::warn!("Stale mount cleanup failed: {}", e);
         }
@@ -647,11 +658,17 @@ fn proactive_cleanup() -> Result<()> {
     let tracked_mounts: Vec<TrackedMountInfo> = state
         .mounts
         .iter()
+        .filter(|entry| !entry.is_server_only())
         .map(|e| TrackedMountInfo {
             mountpoint: e.mountpoint.clone(),
             pid: e.pid,
         })
         .collect();
+
+    if tracked_mounts.is_empty() {
+        state_manager.cleanup_stale()?;
+        return Ok(());
+    }
 
     let options = CleanupOptions {
         cleanup_orphans: true,

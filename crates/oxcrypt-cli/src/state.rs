@@ -25,6 +25,9 @@ pub struct MountEntry {
     pub vault_path: PathBuf,
     /// Where the vault is mounted
     pub mountpoint: PathBuf,
+    /// URL or other backend location when no OS mount was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_location: Option<String>,
     /// Backend used (fuse, fskit, webdav, nfs)
     pub backend: String,
     /// Process ID of the mount process
@@ -39,6 +42,16 @@ pub struct MountEntry {
 }
 
 impl MountEntry {
+    pub fn is_server_only(&self) -> bool {
+        self.backend.eq_ignore_ascii_case("webdav") && self.display_location.is_some()
+    }
+
+    pub fn location(&self) -> String {
+        self.display_location
+            .clone()
+            .unwrap_or_else(|| self.mountpoint.display().to_string())
+    }
+
     /// Create a new mount entry with auto-generated ID and current timestamp.
     #[allow(dead_code)]
     pub fn new(
@@ -53,6 +66,7 @@ impl MountEntry {
             id: uuid::Uuid::new_v4().to_string(),
             vault_path,
             mountpoint,
+            display_location: None,
             backend: backend.into(),
             pid,
             started_at: Utc::now(),
@@ -164,19 +178,9 @@ impl MountStateManager {
 
         // Load state, execute function, save if modified
         let mut state = self.load_internal()?;
-        let result = f(&mut state);
-
-        // Always save to persist any changes, even on error path
-        // (caller might have made partial changes)
-        if let Err(e) = self.save_internal(&state) {
-            tracing::warn!("Failed to save state: {}", e);
-        }
-
-        // Release lock (happens automatically when lock_file is dropped,
-        // but explicit unlock is clearer)
-        let _ = lock_file.unlock();
-
-        result
+        let result = f(&mut state)?;
+        self.save_internal(&state)?;
+        Ok(result)
     }
 
     /// Internal load without locking (for use within with_lock).
@@ -194,9 +198,25 @@ impl MountStateManager {
 
     /// Internal save without locking (for use within with_lock).
     fn save_internal(&self, state: &MountState) -> Result<()> {
-        let contents = serde_json::to_string_pretty(state)?;
-        std::fs::write(&self.state_path, contents)
-            .with_context(|| format!("Failed to write state file: {}", self.state_path.display()))
+        use std::io::Write;
+        let contents = serde_json::to_vec_pretty(state)?;
+        let temporary = self
+            .state_path
+            .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&contents)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &self.state_path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result.with_context(|| format!("Failed to write state file: {}", self.state_path.display()))
     }
 
     /// Load the current state, returning default if file doesn't exist.
@@ -215,16 +235,25 @@ impl MountStateManager {
     /// Save the state to disk.
     #[allow(dead_code)]
     pub fn save(&self, state: &MountState) -> Result<()> {
-        let contents = serde_json::to_string_pretty(state)?;
-        std::fs::write(&self.state_path, contents)
-            .with_context(|| format!("Failed to write state file: {}", self.state_path.display()))
+        self.with_lock(|current| {
+            *current = state.clone();
+            Ok(())
+        })
     }
 
     /// Add a new mount entry (thread-safe with file locking).
     #[allow(dead_code)]
     pub fn add_mount(&self, entry: MountEntry) -> Result<()> {
         self.with_lock(|state| {
-            // Remove any existing entry for the same mountpoint (stale)
+            anyhow::ensure!(
+                !state
+                    .mounts
+                    .iter()
+                    .any(|current| current.mountpoint == entry.mountpoint
+                        && is_process_alive(current.pid)),
+                "Mountpoint {} already has a running mount process",
+                entry.mountpoint.display()
+            );
             state.mounts.retain(|m| m.mountpoint != entry.mountpoint);
 
             state.mounts.push(entry);
@@ -275,28 +304,8 @@ impl MountStateManager {
     /// Returns the entries that were removed.
     /// Thread-safe with file locking.
     pub fn cleanup_stale(&self) -> Result<Vec<MountEntry>> {
-        let system_mounts = get_system_mounts()?;
-
         self.with_lock(|state| {
-            let mut stale = Vec::new();
-            let mut active = Vec::new();
-
-            for entry in std::mem::take(&mut state.mounts) {
-                let pid_alive = is_process_alive(entry.pid);
-                // Canonicalize entry mountpoint for comparison (handles /tmp -> /private/tmp)
-                let canonical_mountpoint = entry
-                    .mountpoint
-                    .canonicalize()
-                    .unwrap_or_else(|_| entry.mountpoint.clone());
-                let in_system = system_mounts.contains(&canonical_mountpoint);
-
-                if pid_alive && in_system {
-                    active.push(entry);
-                } else {
-                    stale.push(entry);
-                }
-            }
-
+            let (active, stale) = partition_entries(std::mem::take(&mut state.mounts))?;
             state.mounts = active;
             Ok(stale)
         })
@@ -304,30 +313,34 @@ impl MountStateManager {
 
     /// Validate entries and partition into active vs stale.
     pub fn validate_entries(&self) -> Result<(Vec<MountEntry>, Vec<MountEntry>)> {
-        let state = self.load()?;
-        let system_mounts = get_system_mounts()?;
-
-        let mut active = Vec::new();
-        let mut stale = Vec::new();
-
-        for entry in state.mounts {
-            let pid_alive = is_process_alive(entry.pid);
-            // Canonicalize entry mountpoint for comparison (handles /tmp -> /private/tmp)
-            let canonical_mountpoint = entry
-                .mountpoint
-                .canonicalize()
-                .unwrap_or_else(|_| entry.mountpoint.clone());
-            let in_system = system_mounts.contains(&canonical_mountpoint);
-
-            if pid_alive && in_system {
-                active.push(entry);
-            } else {
-                stale.push(entry);
-            }
-        }
-
-        Ok((active, stale))
+        partition_entries(self.load()?.mounts)
     }
+}
+
+fn partition_entries(entries: Vec<MountEntry>) -> Result<(Vec<MountEntry>, Vec<MountEntry>)> {
+    let system_mounts = if entries
+        .iter()
+        .any(|entry| !entry.is_server_only() && is_process_alive(entry.pid))
+    {
+        get_system_mounts()?
+    } else {
+        std::collections::HashSet::new()
+    };
+    Ok(entries.into_iter().partition(|entry| {
+        is_process_alive(entry.pid)
+            && (entry.is_server_only() || {
+                let path = mount_comparison_path(&entry.mountpoint);
+                system_mounts.contains(&path)
+            })
+    }))
+}
+
+/// Bound subprocess waits with the shared worker limit used for ghost mounts.
+/// A stuck kernel operation must not block the CLI indefinitely.
+pub fn command_output(mut command: std::process::Command) -> std::io::Result<std::process::Output> {
+    command.stdin(std::process::Stdio::null());
+    oxcrypt_mount::bounded_pool::BOUNDED_FS_POOL
+        .run_with_timeout(std::time::Duration::from_secs(10), move || command.output())
 }
 
 fn config_dir_override() -> Option<PathBuf> {
@@ -347,25 +360,81 @@ pub fn is_process_alive(pid: u32) -> bool {
 
     // kill(pid, 0) checks if process exists without sending a signal
     // Returns Ok(()) if process exists, Err with ESRCH if it doesn't
-    #[allow(clippy::cast_possible_wrap)] // PID is system-provided, values are valid
-    kill(Pid::from_raw(pid as i32), None).is_ok()
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    matches!(
+        kill(Pid::from_raw(pid), None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    )
 }
 
 #[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
-    // On Windows, try to open the process with minimal permissions
-    // If it fails, the process doesn't exist or we can't access it
-    use std::process::Command;
-
-    // Use tasklist to check if PID exists
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-        .output()
-        .map(|o| {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            !stdout.contains("No tasks") && stdout.contains(&pid.to_string())
+    if pid == 0 {
+        return false;
+    }
+    oxcrypt_mount::bounded_pool::BOUNDED_FS_POOL
+        .run_with_timeout(std::time::Duration::from_secs(5), move || {
+            std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .stdin(std::process::Stdio::null())
+                .output()
         })
-        .unwrap_or(false)
+        .map(|output| tasklist_reports_alive(pid, output.status.success(), &output.stdout))
+        .unwrap_or(true)
+}
+
+#[cfg(any(windows, test))]
+fn tasklist_reports_alive(pid: u32, success: bool, output: &[u8]) -> bool {
+    // Inspection failure is not evidence that the process is dead.
+    if !success {
+        return true;
+    }
+    let Ok(output) = std::str::from_utf8(output) else {
+        return true;
+    };
+    output.lines().any(|line| {
+        line.strip_prefix('"')
+            .and_then(|line| line.split_once("\",\""))
+            .and_then(|(_, fields)| fields.split('"').next())
+            .and_then(|value| value.parse::<u32>().ok())
+            == Some(pid)
+    })
+}
+
+#[cfg(any(windows, test))]
+fn windows_mount_path(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let text = text
+        .strip_prefix(r"\\?\")
+        .unwrap_or(text)
+        .trim_end_matches(['/', '\\']);
+    let bytes = text.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        PathBuf::from(format!("{}:", (bytes[0] as char).to_ascii_uppercase()))
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn mount_comparison_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        windows_mount_path(path)
+    }
+    #[cfg(not(windows))]
+    {
+        oxcrypt_mount::TimeoutFs::default()
+            .canonicalize(path)
+            .map(|resolved| oxcrypt_mount::normalize_mount_path(&resolved))
+            .unwrap_or_else(|_| oxcrypt_mount::normalize_mount_path(path))
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -380,58 +449,31 @@ pub fn is_process_alive(_pid: u32) -> bool {
 pub fn get_system_mounts() -> Result<std::collections::HashSet<PathBuf>> {
     let mut mounts = std::collections::HashSet::new();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        // Parse /proc/mounts
-        let contents =
-            std::fs::read_to_string("/proc/mounts").context("Failed to read /proc/mounts")?;
-        for line in contents.lines() {
-            // Format: device mountpoint fstype options dump pass
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let path = PathBuf::from(parts[1]);
-                // Canonicalize to resolve symlinks
-                let canonical = path.canonicalize().unwrap_or(path);
-                mounts.insert(canonical);
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // Run `mount` command and parse output
-        let output = std::process::Command::new("mount")
-            .output()
-            .context("Failed to run mount command")?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            // Format: /dev/disk1s1 on /path (type, options)
-            if let Some(on_idx) = line.find(" on ") {
-                let rest = &line[on_idx + 4..];
-                if let Some(paren_idx) = rest.find(" (") {
-                    let path = PathBuf::from(&rest[..paren_idx]);
-                    // Canonicalize to resolve symlinks (e.g., /tmp -> /private/tmp)
-                    let canonical = path.canonicalize().unwrap_or(path);
-                    mounts.insert(canonical);
-                }
-            }
+        for mount in oxcrypt_mount::get_system_mounts_detailed()? {
+            mounts.insert(mount_comparison_path(&mount.mountpoint));
         }
     }
 
     #[cfg(target_os = "windows")]
     {
         // Parse `net use` for network drives
-        let output = std::process::Command::new("net")
-            .args(["use"])
-            .output()
-            .context("Failed to run net use command")?;
+        let mut command = std::process::Command::new("net");
+        command.arg("use");
+        let output = command_output(command).context("Failed to run net use command")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "net use failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             // Look for drive letters like "OK           Z:        \\server\share"
             let parts: Vec<&str> = line.split_whitespace().collect();
             for part in parts {
                 if part.len() == 2 && part.ends_with(':') {
-                    mounts.insert(PathBuf::from(part));
+                    mounts.insert(windows_mount_path(Path::new(part)));
                 }
             }
         }
@@ -442,7 +484,7 @@ pub fn get_system_mounts() -> Result<std::collections::HashSet<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::state::*;
 
     #[test]
     fn test_mount_entry_creation() {
@@ -488,5 +530,122 @@ mod tests {
 
         // Very high PID should not exist
         assert!(!is_process_alive(u32::MAX - 1));
+    }
+
+    fn isolated_manager(dir: &Path) -> MountStateManager {
+        MountStateManager {
+            state_path: dir.join("mounts.json"),
+            lock_path: dir.join("mounts.lock"),
+        }
+    }
+
+    #[test]
+    fn old_state_without_display_location_remains_readable() {
+        let mut entry = serde_json::to_value(MountEntry::new(
+            "/vault".into(),
+            "/mount".into(),
+            "webdav",
+            42,
+            true,
+            None,
+        ))
+        .unwrap();
+        entry.as_object_mut().unwrap().remove("display_location");
+        let loaded: MountEntry = serde_json::from_value(entry).unwrap();
+        assert!(loaded.display_location.is_none());
+        assert!(!loaded.is_server_only());
+        assert_eq!(loaded.location(), "/mount");
+    }
+
+    #[test]
+    fn live_server_only_mount_survives_validation_and_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = isolated_manager(dir.path());
+        let mut entry = MountEntry::new(
+            dir.path().join("vault"),
+            dir.path().join("absent-mount"),
+            "webdav",
+            std::process::id(),
+            true,
+            None,
+        );
+        entry.display_location = Some("http://127.0.0.1:43210".to_owned());
+        manager.add_mount(entry.clone()).unwrap();
+        assert!(
+            manager.add_mount(entry).is_err(),
+            "a live mount must not be overwritten"
+        );
+        let (active, stale) = manager.validate_entries().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(stale.is_empty());
+        assert_eq!(active[0].location(), "http://127.0.0.1:43210");
+        assert!(manager.cleanup_stale().unwrap().is_empty());
+        assert_eq!(manager.list_mounts().unwrap().len(), 1);
+        manager
+            .with_lock(|state| {
+                state.mounts[0].pid = u32::MAX;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(manager.cleanup_stale().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn state_write_failure_is_reported_and_failed_mutations_are_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = isolated_manager(dir.path());
+        let result: Result<()> = manager.with_lock(|state| {
+            state.version = 99;
+            anyhow::bail!("mutation failed")
+        });
+        assert!(result.is_err());
+        assert!(!manager.state_path.exists());
+        let result = manager.with_lock(|_| {
+            std::fs::create_dir(&manager.state_path)?;
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "save failure must not be returned as success"
+        );
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "tmp")
+        }));
+    }
+
+    #[test]
+    fn windows_drive_comparison_and_unknown_process_state_are_conservative() {
+        use std::path::{Path, PathBuf};
+        for spelling in ["X:", "x:/", "X:\\", r"\\?\x:\"] {
+            assert_eq!(
+                crate::state::windows_mount_path(Path::new(spelling)),
+                PathBuf::from("X:")
+            );
+        }
+        assert_eq!(
+            crate::state::windows_mount_path(Path::new(r"X:\folder")),
+            PathBuf::from(r"X:\folder")
+        );
+        assert!(crate::state::tasklist_reports_alive(42, false, b""));
+        assert!(crate::state::tasklist_reports_alive(42, true, &[0xff]));
+        assert!(crate::state::tasklist_reports_alive(
+            42,
+            true,
+            b"\"odd,name.exe\",\"42\",\"Console\""
+        ));
+        assert!(!crate::state::tasklist_reports_alive(
+            42,
+            true,
+            b"\"other.exe\",\"142\",\"Console\""
+        ));
+        assert!(!crate::state::tasklist_reports_alive(
+            42,
+            true,
+            b"INFO: No tasks are running which match the specified criteria."
+        ));
     }
 }

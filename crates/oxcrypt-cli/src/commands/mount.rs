@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tracing::instrument;
 
 use oxcrypt_mount::{
@@ -77,7 +77,7 @@ pub struct Args {
     /// Path to the Cryptomator vault
     pub vault: PathBuf,
 
-    /// Directory where the vault will be mounted
+    /// Mount directory, or a drive letter such as X: for Windows WebDAV
     #[arg(value_name = "MOUNTPOINT")]
     pub mountpoint: Option<PathBuf>,
 
@@ -129,29 +129,18 @@ fn build_backends(_args: &Args) -> Vec<Box<dyn MountBackend>> {
 
 #[instrument(level = "info", name = "cmd::mount", skip_all, fields(vault = %args.vault.display()))]
 pub fn execute(args: &Args, password: &str) -> Result<()> {
-    // Validate vault path
-    if !args.vault.exists() {
-        anyhow::bail!("Vault path does not exist: {}", args.vault.display());
-    }
-    if !args.vault.is_dir() {
+    let filesystem = oxcrypt_mount::TimeoutFs::default();
+    let vault_metadata = filesystem
+        .metadata(&args.vault)
+        .with_context(|| format!("Failed to inspect vault: {}", args.vault.display()))?;
+    if !vault_metadata.is_dir() {
         anyhow::bail!("Vault path is not a directory: {}", args.vault.display());
     }
 
     // Compute mountpoint - default to ~/Vaults/<vault-name>
     let mountpoint = match args.mountpoint.clone() {
         Some(mp) => mp,
-        None => {
-            let vault_name = args
-                .vault
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("vault");
-            directories::BaseDirs::new()
-                .map(|d| d.home_dir().to_path_buf())
-                .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-                .join("Vaults")
-                .join(vault_name)
-        }
+        None => default_mountpoint(&args.vault)?,
     };
 
     // Handle daemon mode: spawn child process and exit (unless foreground or already child)
@@ -165,12 +154,6 @@ pub fn execute(args: &Args, password: &str) -> Result<()> {
     } else {
         None
     };
-
-    // Create mountpoint if needed
-    if !mountpoint.exists() {
-        std::fs::create_dir_all(&mountpoint)
-            .with_context(|| format!("Failed to create mountpoint: {}", mountpoint.display()))?;
-    }
 
     // Get backend
     let backends = build_backends(args);
@@ -188,6 +171,28 @@ pub fn execute(args: &Args, password: &str) -> Result<()> {
         None => first_available_backend(&backends).context("No mount backend available")?,
     };
 
+    // WebDAV manages platform-specific mapping itself; an unused Windows drive
+    // is not a directory that can be created before `net use` maps it.
+    if !matches!(
+        backend.backend_type(),
+        BackendType::WebDav | BackendType::FSKit
+    ) {
+        match filesystem.metadata(&mountpoint) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => anyhow::bail!("Mountpoint is not a directory: {}", mountpoint.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                filesystem.create_dir_all(&mountpoint).with_context(|| {
+                    format!("Failed to create mountpoint: {}", mountpoint.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to inspect mountpoint: {}", mountpoint.display())
+                });
+            }
+        }
+    }
+
     eprintln!("Using {} backend", backend.name());
 
     // Generate a vault ID from the path
@@ -202,8 +207,14 @@ pub fn execute(args: &Args, password: &str) -> Result<()> {
     let handle: Box<dyn MountHandle> = backend
         .mount(vault_id, &args.vault, password, &mountpoint)
         .context("Failed to mount vault")?;
+    // FSKit chooses a path under /Volumes; FUSE may select an available suffix.
+    let mountpoint = handle.mountpoint().to_path_buf();
 
-    eprintln!("Vault mounted at {}", handle.mountpoint().display());
+    if let Some(location) = handle.display_location() {
+        eprintln!("Vault available at {location}");
+    } else {
+        eprintln!("Vault mounted at {}", handle.mountpoint().display());
+    }
 
     // Get stats from the mount handle (if supported by backend)
     let stats: Option<Arc<VaultStats>> = handle.stats();
@@ -238,7 +249,7 @@ pub fn execute(args: &Args, password: &str) -> Result<()> {
     // Register in state file
     let state_manager =
         crate::state::MountStateManager::new().context("Failed to initialize state manager")?;
-    let mount_entry = crate::state::MountEntry::new(
+    let mut mount_entry = crate::state::MountEntry::new(
         args.vault.clone(),
         mountpoint.clone(),
         backend.id(),
@@ -246,9 +257,14 @@ pub fn execute(args: &Args, password: &str) -> Result<()> {
         args.internal_daemon_child,
         socket_path.clone(),
     );
-    state_manager
-        .add_mount(mount_entry)
-        .context("Failed to register mount in state file")?;
+    mount_entry.display_location = handle.display_location();
+    signal::install_signal_handler().context("Failed to set signal handler")?;
+    if let Err(error) = state_manager.add_mount(mount_entry) {
+        handle
+            .unmount()
+            .context("Failed to unmount after state registration failed")?;
+        return Err(error).context("Failed to register mount in state file");
+    }
 
     if args.internal_daemon_child {
         eprintln!("Daemon mount started (PID: {})", std::process::id());
@@ -258,9 +274,6 @@ pub fn execute(args: &Args, password: &str) -> Result<()> {
     } else {
         eprintln!("Press Ctrl+C to unmount and exit");
     }
-
-    // Set up signal handler for graceful shutdown
-    signal::install_signal_handler().context("Failed to set signal handler")?;
 
     // Main loop: wait for signal while handling IPC requests
     // Use event-driven wait with periodic wakeups for IPC polling
@@ -294,13 +307,38 @@ pub fn execute(args: &Args, password: &str) -> Result<()> {
     eprintln!("Unmounted successfully");
 
     // Remove from state file after successful unmount
-    if let Ok(manager) = crate::state::MountStateManager::new()
-        && let Err(e) = manager.remove_by_mountpoint(&mountpoint)
-    {
-        tracing::warn!("Failed to remove mount from state file: {}", e);
-    }
+    state_manager
+        .remove_by_mountpoint(&mountpoint)
+        .context("Failed to remove stopped mount from state file")?;
 
     Ok(())
+}
+
+/// Choose a mount location usable by the platform's filesystem client.
+fn default_mountpoint(vault: &std::path::Path) -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = vault;
+        for letter in ('D'..='Z').rev() {
+            let path = PathBuf::from(format!("{letter}:\\"));
+            if !path.exists() {
+                return Ok(path);
+            }
+        }
+        anyhow::bail!("No free drive letter; specify a mountpoint explicitly");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let vault_name = vault
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("vault");
+        Ok(directories::BaseDirs::new()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+            .home_dir()
+            .join("Vaults")
+            .join(vault_name))
+    }
 }
 
 /// Spawn a daemon process to run the mount in background.
@@ -335,19 +373,71 @@ fn spawn_daemon_mount(args: &Args, mountpoint: &PathBuf, password: &str) -> Resu
     // Pass password via env var (not in command line args for security)
     cmd.env("OXCRYPT_PASSWORD", password);
 
+    let manager = crate::state::MountStateManager::new()?;
+    let existing_mount_ids: std::collections::HashSet<_> = manager
+        .list_mounts()?
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
     // Spawn using proper daemonization
     let pid = daemon::spawn_as_daemon(&mut cmd).context("Failed to spawn daemon process")?;
-
-    // Give daemon time to start
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
+    let started = std::time::Instant::now();
+    let entry = loop {
+        if let Some(entry) = manager
+            .list_mounts()?
+            .into_iter()
+            .find(|entry| entry.pid == pid && !existing_mount_ids.contains(&entry.id))
+        {
+            if daemon_running(pid) {
+                break entry;
+            }
+        }
+        if !daemon_running(pid) {
+            anyhow::bail!(
+                "Mount process exited before becoming ready; see logs in {}",
+                get_daemon_log_directory().display()
+            );
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(30) {
+            anyhow::bail!(
+                "Mount process {pid} has not reported readiness. Check 'oxcrypt mounts --include-stale' and logs in {}",
+                get_daemon_log_directory().display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
     eprintln!("Mount started in background (PID: {pid})");
-    eprintln!("Mountpoint: {}", mountpoint.display());
+    eprintln!("Location: {}", entry.location());
     eprintln!();
     eprintln!("Use 'oxcrypt mounts' to list active mounts");
-    eprintln!("Use 'oxcrypt unmount {}' to stop", mountpoint.display());
+    eprintln!(
+        "Use 'oxcrypt unmount {}' to stop",
+        entry.mountpoint.display()
+    );
 
     Ok(())
+}
+
+/// Reap a child that failed before registration so a zombie is not mistaken
+/// for a daemon that is still starting.
+fn daemon_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::{
+            sys::wait::{WaitPidFlag, WaitStatus, waitpid},
+            unistd::Pid,
+        };
+        let Ok(raw_pid) = i32::try_from(pid) else {
+            return false;
+        };
+        match waitpid(Pid::from_raw(raw_pid), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => return true,
+            Ok(_) => return false,
+            Err(nix::errno::Errno::ECHILD) => {}
+            Err(_) => return crate::state::is_process_alive(pid),
+        }
+    }
+    crate::state::is_process_alive(pid)
 }
 
 /// List available backends and their status
@@ -363,9 +453,6 @@ pub fn list_backends() -> Vec<BackendInfo> {
     list_backend_info(&build_backends(&default_args))
 }
 
-/// Global log guard to keep daemon logs alive
-static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
-
 /// Set up file-based logging for daemon processes.
 ///
 /// When running as a daemon, stderr may be closed or redirected to /dev/null,
@@ -376,7 +463,7 @@ static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLo
 /// Returns a guard that must be kept alive for the duration of the daemon.
 fn setup_daemon_logging(
     vault_path: &std::path::Path,
-) -> Result<&'static tracing_appender::non_blocking::WorkerGuard> {
+) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
     use tracing_subscriber::{
         EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt,
@@ -402,9 +489,6 @@ fn setup_daemon_logging(
     // Make file appender non-blocking
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    // Store guard in static to keep it alive
-    let guard = LOG_GUARD.get_or_init(|| guard);
-
     // Set up tracing with file output only (no stderr in daemon mode)
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -427,6 +511,9 @@ fn setup_daemon_logging(
 
 /// Get the platform-appropriate log directory for daemon processes.
 fn get_daemon_log_directory() -> PathBuf {
+    if let Some(config) = std::env::var_os("OXCRYPT_CONFIG_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(config).join("logs");
+    }
     // Use directories crate to get platform-appropriate paths
     if let Some(proj_dirs) = directories::ProjectDirs::from("com", "oxidized", "oxcrypt") {
         // On macOS: ~/Library/Application Support/com.oxidized.oxcrypt/logs/

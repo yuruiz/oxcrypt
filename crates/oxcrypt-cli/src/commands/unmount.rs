@@ -30,22 +30,12 @@ pub struct Args {
 pub fn execute(args: &Args) -> Result<()> {
     let mountpoint = &args.mountpoint;
 
-    // Check if mountpoint exists
-    if !mountpoint.exists() {
-        // Maybe it's already unmounted but still in state file - try cleanup
-        if let Ok(manager) = MountStateManager::new()
-            && manager.remove_by_mountpoint(mountpoint)?
-        {
-            eprintln!("Removed stale mount entry for {}", mountpoint.display());
-            return Ok(());
-        }
+    // Server-only WebDAV entries have a URL but no filesystem mountpoint.
+    let manager = MountStateManager::new()?;
+    let mount_entry = manager.find_by_mountpoint(mountpoint)?;
+    if mount_entry.is_none() && !oxcrypt_mount::TimeoutFs::default().exists(mountpoint) {
         anyhow::bail!("Mountpoint does not exist: {}", mountpoint.display());
     }
-
-    // Check state file for this mount
-    let mount_entry = MountStateManager::new()
-        .ok()
-        .and_then(|m| m.find_by_mountpoint(mountpoint).ok().flatten());
 
     // If this is a daemon mount with a live process, try graceful shutdown first
     if let Some(ref entry) = mount_entry
@@ -62,11 +52,9 @@ pub fn execute(args: &Args) -> Result<()> {
             use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
 
-            // SAFETY: PIDs are always positive in practice. We use wrapping cast here
-            // because the system may theoretically have very large PIDs, though this
-            // is extremely rare. The nix crate requires i32, but system PIDs are u32.
-            #[allow(clippy::cast_possible_wrap)]
-            let pid = Pid::from_raw(entry.pid as i32);
+            let raw_pid = i32::try_from(entry.pid).context("Invalid daemon process ID")?;
+            anyhow::ensure!(raw_pid > 0, "Invalid daemon process ID");
+            let pid = Pid::from_raw(raw_pid);
 
             // Send SIGTERM for graceful shutdown
             if kill(pid, Signal::SIGTERM).is_ok() {
@@ -76,11 +64,9 @@ pub fn execute(args: &Args) -> Result<()> {
                     if !is_process_alive(entry.pid) {
                         eprintln!("Daemon process exited gracefully");
                         // Clean up state file
-                        if let Ok(manager) = MountStateManager::new() {
-                            let _ = manager.remove_by_mountpoint(mountpoint);
-                        }
+                        manager.remove_by_mountpoint(mountpoint)?;
                         // Check if mountpoint is still mounted
-                        if !is_still_mounted(mountpoint) {
+                        if entry.is_server_only() || !is_still_mounted(mountpoint) {
                             eprintln!("Unmounted successfully");
                             return Ok(());
                         }
@@ -97,9 +83,7 @@ pub fn execute(args: &Args) -> Result<()> {
                             std::thread::sleep(Duration::from_millis(100));
                             if !is_process_alive(entry.pid) {
                                 eprintln!("Daemon process killed");
-                                if let Ok(manager) = MountStateManager::new() {
-                                    let _ = manager.remove_by_mountpoint(mountpoint);
-                                }
+                                manager.remove_by_mountpoint(mountpoint)?;
                                 break;
                             }
                         }
@@ -110,9 +94,28 @@ pub fn execute(args: &Args) -> Result<()> {
 
         #[cfg(windows)]
         {
-            // On Windows, just proceed with net use /delete
-            eprintln!("Note: Windows daemon mounts will be stopped via net use");
+            let mut command = Command::new("taskkill");
+            command.args(["/PID", &entry.pid.to_string(), "/T", "/F"]);
+            let output = crate::state::command_output(command).context("Failed to stop daemon")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Failed to stop daemon: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
+    }
+
+    if let Some(entry) = &mount_entry
+        && entry.is_server_only()
+    {
+        anyhow::ensure!(
+            !is_process_alive(entry.pid),
+            "WebDAV process {} is still running",
+            entry.pid
+        );
+        manager.remove_mount(&entry.id)?;
+        eprintln!("WebDAV server stopped");
+        return Ok(());
     }
 
     eprintln!("Unmounting {}...", mountpoint.display());
@@ -138,9 +141,7 @@ pub fn execute(args: &Args) -> Result<()> {
     }
 
     // Remove from state file after successful unmount
-    if let Ok(manager) = MountStateManager::new() {
-        let _ = manager.remove_by_mountpoint(mountpoint);
-    }
+    manager.remove_by_mountpoint(mountpoint)?;
 
     eprintln!("Unmounted successfully");
     Ok(())
@@ -150,7 +151,10 @@ pub fn execute(args: &Args) -> Result<()> {
 #[allow(dead_code)]
 fn is_still_mounted(mountpoint: &PathBuf) -> bool {
     if let Ok(system_mounts) = crate::state::get_system_mounts() {
-        system_mounts.contains(mountpoint)
+        let canonical = oxcrypt_mount::TimeoutFs::default()
+            .canonicalize(mountpoint)
+            .unwrap_or_else(|_| mountpoint.clone());
+        system_mounts.contains(&canonical)
     } else {
         // If we can't check, assume it's still mounted
         true
@@ -167,7 +171,7 @@ fn unmount_macos(mountpoint: &PathBuf, force: bool) -> Result<()> {
     }
     cmd.arg(mountpoint);
 
-    let output = cmd.output().context("Failed to execute diskutil unmount")?;
+    let output = crate::state::command_output(cmd).context("Failed to execute diskutil unmount")?;
 
     if output.status.success() {
         return Ok(());
@@ -180,7 +184,7 @@ fn unmount_macos(mountpoint: &PathBuf, force: bool) -> Result<()> {
     }
     cmd.arg(mountpoint);
 
-    let output = cmd.output().context("Failed to execute umount")?;
+    let output = crate::state::command_output(cmd).context("Failed to execute umount")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -200,7 +204,7 @@ fn unmount_linux(mountpoint: &PathBuf, force: bool) -> Result<()> {
     }
     cmd.arg(mountpoint);
 
-    let output = cmd.output();
+    let output = crate::state::command_output(cmd);
 
     if let Ok(output) = output
         && output.status.success()
@@ -215,7 +219,7 @@ fn unmount_linux(mountpoint: &PathBuf, force: bool) -> Result<()> {
     }
     cmd.arg(mountpoint);
 
-    let output = cmd.output().context("Failed to execute umount")?;
+    let output = crate::state::command_output(cmd).context("Failed to execute umount")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -237,7 +241,7 @@ fn unmount_windows(mountpoint: &PathBuf, _force: bool) -> Result<()> {
         let mut cmd = Command::new("net");
         cmd.args(["use", drive, "/delete", "/yes"]);
 
-        let output = cmd.output().context("Failed to execute net use")?;
+        let output = crate::state::command_output(cmd).context("Failed to execute net use")?;
 
         if output.status.success() {
             return Ok(());

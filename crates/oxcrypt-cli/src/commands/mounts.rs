@@ -79,7 +79,7 @@ pub fn execute(args: &Args) -> Result<()> {
 
 fn output_table(entries: &[MountEntry], title: &str) {
     let mut table = Table::new();
-    table.set_header(vec!["Vault", "Mountpoint", "Backend", "PID", "Started"]);
+    table.set_header(vec!["Vault", "Location", "Backend", "PID", "Started"]);
 
     for entry in entries {
         let vault_display = entry
@@ -88,7 +88,7 @@ fn output_table(entries: &[MountEntry], title: &str) {
             .and_then(|n| n.to_str())
             .unwrap_or_else(|| entry.vault_path.to_str().unwrap_or("?"));
 
-        let mountpoint_display = entry.mountpoint.display().to_string();
+        let mountpoint_display = entry.location();
 
         let backend_cell = Cell::new(&entry.backend).fg(match entry.backend.as_str() {
             "fuse" | "FUSE" => Color::Blue,
@@ -134,6 +134,8 @@ fn entry_to_json(entry: &MountEntry) -> serde_json::Value {
         "id": entry.id,
         "vault_path": entry.vault_path,
         "mountpoint": entry.mountpoint,
+        "display_location": entry.display_location,
+        "location": entry.location(),
         "backend": entry.backend,
         "pid": entry.pid,
         "started_at": entry.started_at.to_rfc3339(),
