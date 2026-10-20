@@ -22,7 +22,7 @@
 //!
 //! - pjdfstest must be in PATH (available via devenv, or set PJDFSTEST_BIN env var)
 //! - FUSE must be installed (fuse3 on Linux, macFUSE on macOS)
-//! - The test_vault directory must exist
+//! - Each test creates its own disposable vault
 //!
 //! ## Running Tests
 //!
@@ -39,27 +39,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
 
 use fuser::{BackgroundSession, MountOption};
 use oxcrypt_fuse::filesystem::CryptomatorFS;
+use oxcrypt_mount::testing::TempVault;
 use tempfile::TempDir;
-
-const TEST_PASSWORD: &str = "123456789";
-const MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const MOUNT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Get the path to the test vault.
-fn test_vault_path() -> PathBuf {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest_dir)
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("test_vault")
-}
 
 /// Get the path to the pjdfstest binary.
 fn pjdfstest_bin() -> Option<PathBuf> {
@@ -121,13 +105,22 @@ fn fuse_available() -> bool {
 struct MountGuard {
     session: Option<BackgroundSession>,
     mount_point: PathBuf,
+    _vault: TempVault,
+    _mount_dir: TempDir,
 }
 
 impl MountGuard {
-    fn new(session: BackgroundSession, mount_point: PathBuf) -> Self {
+    fn new(
+        session: BackgroundSession,
+        mount_point: PathBuf,
+        vault: TempVault,
+        mount_dir: TempDir,
+    ) -> Self {
         Self {
             session: Some(session),
             mount_point,
+            _vault: vault,
+            _mount_dir: mount_dir,
         }
     }
 
@@ -139,21 +132,24 @@ impl MountGuard {
 impl Drop for MountGuard {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
-            session.join();
+            if let Err(error) = session.umount_and_join() {
+                eprintln!("Failed to unmount disposable test vault: {error}");
+                assert!(
+                    std::thread::panicking(),
+                    "FUSE test cleanup failed: {error}"
+                );
+            }
         }
     }
 }
 
 /// Mount the test vault with read-write access.
-fn mount_test_vault_rw(mount_dir: &Path) -> Result<MountGuard, String> {
-    let vault_path = test_vault_path();
-
-    if !vault_path.exists() {
-        return Err(format!("Test vault not found at: {}", vault_path.display()));
-    }
-
-    let fs = CryptomatorFS::new(&vault_path, TEST_PASSWORD)
-        .map_err(|e| format!("Failed to create CryptomatorFS: {}", e))?;
+fn mount_test_vault_rw(temp_dir: TempDir) -> Result<MountGuard, String> {
+    let mount_dir = temp_dir.path().join("mnt");
+    fs::create_dir(&mount_dir).map_err(|error| error.to_string())?;
+    let vault = TempVault::new();
+    let fs = CryptomatorFS::new(vault.path(), TempVault::password())
+        .map_err(|e| format!("Failed to create CryptomatorFS: {e}"))?;
 
     let options = vec![MountOption::FSName("cryptomator".to_string())];
 
@@ -163,27 +159,10 @@ fn mount_test_vault_rw(mount_dir: &Path) -> Result<MountGuard, String> {
     let mut config = fuser::Config::default();
     config.mount_options = options;
 
-    let session = fuser::spawn_mount(fs, mount_dir, &config)
+    let session = fuser::spawn_mount(fs, &mount_dir, &config)
         .map_err(|e| format!("Failed to mount: {}", e))?;
 
-    let deadline = std::time::Instant::now() + MOUNT_READY_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        if let Ok(entries) = fs::read_dir(mount_dir) {
-            let names: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
-            if names
-                .iter()
-                .any(|n| n == "test_folder" || n == "aes-wrap.c" || n == "new_folder")
-            {
-                return Ok(MountGuard::new(session, mount_dir.to_path_buf()));
-            }
-        }
-        thread::sleep(MOUNT_CHECK_INTERVAL);
-    }
-
-    Err("Mount did not become ready in time".to_string())
+    Ok(MountGuard::new(session, mount_dir, vault, temp_dir))
 }
 
 /// Run a pjdfstest syscall and return (success, stdout, stderr).
@@ -220,6 +199,16 @@ fn run_pjdfstest(workdir: &Path, syscall: &str, args: &[&str]) -> Result<bool, S
     Ok(success)
 }
 
+/// A missing fixture invalidates every assertion that depends on it.
+fn require_pjdfstest_success(workdir: &Path, syscall: &str, args: &[&str]) {
+    let (success, stdout, stderr) = run_pjdfstest_raw(workdir, syscall, args)
+        .unwrap_or_else(|error| panic!("Fixture {syscall} {args:?} failed: {error}"));
+    assert!(
+        success,
+        "Fixture {syscall} {args:?} failed: stdout={stdout:?}, stderr={stderr:?}"
+    );
+}
+
 /// Result of a pjdfstest category.
 #[derive(Debug, Default, Clone)]
 struct TestResult {
@@ -248,8 +237,14 @@ impl TestResult {
         self.errors.push(msg);
     }
 
-    fn add_skip(&mut self) {
-        self.skipped += 1;
+    fn expect_errno(&mut self, workdir: &Path, syscall: &str, args: &[&str], errors: &[&str]) {
+        match run_pjdfstest_raw(workdir, syscall, args) {
+            Ok((false, stdout, _)) if errors.contains(&stdout.trim()) => self.add_pass(),
+            Ok((success, stdout, stderr)) => self.add_fail(format!(
+                "{syscall} {args:?}: expected {errors:?}, success={success}, stdout={stdout:?}, stderr={stderr:?}"
+            )),
+            Err(error) => self.add_fail(error),
+        }
     }
 
     fn print_summary(&self, category: &str) {
@@ -264,6 +259,7 @@ impl TestResult {
         for err in &self.errors {
             eprintln!("  - {}", err);
         }
+        assert_eq!(self.failed, 0, "{category} tests failed: {self:?}");
     }
 }
 
@@ -271,10 +267,18 @@ impl TestResult {
 macro_rules! skip_if_not_ready {
     () => {
         if !fuse_available() {
+            assert!(
+                std::env::var_os("OXCRYPT_REQUIRE_FUSE").is_none(),
+                "FUSE is required but unavailable"
+            );
             eprintln!("Skipping: FUSE not available");
             return;
         }
         if !pjdfstest_available() {
+            assert!(
+                std::env::var_os("OXCRYPT_REQUIRE_FUSE").is_none(),
+                "pjdfstest is required but unavailable"
+            );
             eprintln!("Skipping: pjdfstest not in PATH (run with devenv or set PJDFSTEST_BIN)");
             return;
         }
@@ -282,23 +286,14 @@ macro_rules! skip_if_not_ready {
 }
 
 /// Setup test directory and return guard + test dir path.
-fn setup_test(name: &str) -> Option<(MountGuard, TempDir, PathBuf)> {
+fn setup_test(name: &str) -> Option<(MountGuard, PathBuf)> {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let mount_point = temp_dir.path().join("mnt");
-    fs::create_dir(&mount_point).expect("Failed to create mount point");
-
-    let guard = match mount_test_vault_rw(&mount_point) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("Skipping: {}", e);
-            return None;
-        }
-    };
+    let guard = mount_test_vault_rw(temp_dir).expect("Failed to mount disposable test vault");
 
     let test_dir = guard.mount_point().join(format!("pjdfstest_{}", name));
-    fs::create_dir_all(&test_dir).ok();
+    fs::create_dir_all(&test_dir).expect("Failed to create test directory");
 
-    Some((guard, temp_dir, test_dir))
+    Some((guard, test_dir))
 }
 
 // ============================================================================
@@ -311,7 +306,7 @@ fn setup_test(name: &str) -> Option<(MountGuard, TempDir, PathBuf)> {
 fn test_pjdfstest_mkdir() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("mkdir") {
+    let (_guard, test_dir) = match setup_test("mkdir") {
         Some(t) => t,
         None => return,
     };
@@ -326,7 +321,7 @@ fn test_pjdfstest_mkdir() {
             Ok(false) => result.add_fail(format!("mkdir {} {}", dir_name, mode)),
             Err(e) => {
                 eprintln!("Error: {}", e);
-                result.add_skip();
+                result.add_fail(e);
             }
         }
         // Clean up
@@ -334,26 +329,17 @@ fn test_pjdfstest_mkdir() {
     }
 
     // Test nested mkdir (should fail - parent doesn't exist)
-    match run_pjdfstest(&test_dir, "mkdir", &["nested/deep/dir", "0755"]) {
-        Ok(false) => result.add_pass(), // Expected to fail with ENOENT
-        Ok(true) => result.add_fail("mkdir nested should fail".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+    result.expect_errno(
+        &test_dir,
+        "mkdir",
+        &["nested/deep/dir", "0755"],
+        &["ENOENT"],
+    );
 
     // Test rmdir on non-empty dir (should fail)
-    let _ = run_pjdfstest(&test_dir, "mkdir", &["nonempty", "0755"]);
-    let _ = run_pjdfstest(&test_dir, "open", &["nonempty/file", "O_CREAT", "0644"]);
-    match run_pjdfstest(&test_dir, "rmdir", &["nonempty"]) {
-        Ok(false) => result.add_pass(), // Expected to fail with ENOTEMPTY
-        Ok(true) => result.add_fail("rmdir nonempty should fail".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+    require_pjdfstest_success(&test_dir, "mkdir", &["nonempty", "0755"]);
+    require_pjdfstest_success(&test_dir, "open", &["nonempty/file", "O_CREAT", "0644"]);
+    result.expect_errno(&test_dir, "rmdir", &["nonempty"], &["ENOTEMPTY", "EEXIST"]);
     // Clean up
     let _ = run_pjdfstest(&test_dir, "unlink", &["nonempty/file"]);
     let _ = run_pjdfstest(&test_dir, "rmdir", &["nonempty"]);
@@ -368,7 +354,7 @@ fn test_pjdfstest_mkdir() {
 fn test_pjdfstest_open() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("open") {
+    let (_guard, test_dir) = match setup_test("open") {
         Some(t) => t,
         None => return,
     };
@@ -383,22 +369,20 @@ fn test_pjdfstest_open() {
             Ok(false) => result.add_fail(format!("open {} O_CREAT {}", filename, mode)),
             Err(e) => {
                 eprintln!("Error: {}", e);
-                result.add_skip();
+                result.add_fail(e);
             }
         }
         let _ = run_pjdfstest(&test_dir, "unlink", &[&filename]);
     }
 
     // O_CREAT|O_EXCL - should fail if file exists
-    let _ = run_pjdfstest(&test_dir, "open", &["excl_test", "O_CREAT", "0644"]);
-    match run_pjdfstest(&test_dir, "open", &["excl_test", "O_CREAT|O_EXCL", "0644"]) {
-        Ok(false) => result.add_pass(), // Expected EEXIST
-        Ok(true) => result.add_fail("O_EXCL on existing file should fail".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+    require_pjdfstest_success(&test_dir, "open", &["excl_test", "O_CREAT", "0644"]);
+    result.expect_errno(
+        &test_dir,
+        "open",
+        &["excl_test", "O_CREAT|O_EXCL", "0644"],
+        &["EEXIST"],
+    );
     let _ = run_pjdfstest(&test_dir, "unlink", &["excl_test"]);
 
     // O_CREAT|O_EXCL on new file - should succeed
@@ -407,7 +391,7 @@ fn test_pjdfstest_open() {
         Ok(false) => result.add_fail("O_EXCL on new file should succeed".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
     let _ = run_pjdfstest(&test_dir, "unlink", &["excl_new"]);
@@ -422,7 +406,7 @@ fn test_pjdfstest_open() {
 fn test_pjdfstest_symlink() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("symlink") {
+    let (_guard, test_dir) = match setup_test("symlink") {
         Some(t) => t,
         None => return,
     };
@@ -438,22 +422,15 @@ fn test_pjdfstest_symlink() {
             Ok(false) => result.add_fail(format!("symlink {} -> {}", link_name, target)),
             Err(e) => {
                 eprintln!("Error: {}", e);
-                result.add_skip();
+                result.add_fail(e);
             }
         }
         let _ = run_pjdfstest(&test_dir, "unlink", &[&link_name]);
     }
 
     // Symlink over existing file should fail
-    let _ = run_pjdfstest(&test_dir, "open", &["existing", "O_CREAT", "0644"]);
-    match run_pjdfstest(&test_dir, "symlink", &["target", "existing"]) {
-        Ok(false) => result.add_pass(), // Expected EEXIST
-        Ok(true) => result.add_fail("symlink over file should fail".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+    require_pjdfstest_success(&test_dir, "open", &["existing", "O_CREAT", "0644"]);
+    result.expect_errno(&test_dir, "symlink", &["target", "existing"], &["EEXIST"]);
     let _ = run_pjdfstest(&test_dir, "unlink", &["existing"]);
 
     result.print_summary("symlink");
@@ -465,13 +442,12 @@ fn test_pjdfstest_symlink() {
 // ============================================================================
 
 /// rename - File and directory renaming.
-/// Status: KNOWN BUG - files created via pjdfstest open aren't visible for rename
-/// TODO: Fix cache invalidation issue
+/// Checks immediate visibility and replacement after file creation.
 #[test]
 fn test_pjdfstest_rename() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("rename") {
+    let (_guard, test_dir) = match setup_test("rename") {
         Some(t) => t,
         None => return,
     };
@@ -479,56 +455,52 @@ fn test_pjdfstest_rename() {
     let mut result = TestResult::default();
 
     // Create file and rename it
-    let _ = run_pjdfstest(&test_dir, "open", &["src_file", "O_CREAT", "0644"]);
+    require_pjdfstest_success(&test_dir, "open", &["src_file", "O_CREAT", "0644"]);
     match run_pjdfstest(&test_dir, "rename", &["src_file", "dst_file"]) {
         Ok(true) => result.add_pass(),
         Ok(false) => result.add_fail("rename src_file -> dst_file".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
     let _ = run_pjdfstest(&test_dir, "unlink", &["dst_file"]);
 
     // Rename directory
-    let _ = run_pjdfstest(&test_dir, "mkdir", &["src_dir", "0755"]);
+    require_pjdfstest_success(&test_dir, "mkdir", &["src_dir", "0755"]);
     match run_pjdfstest(&test_dir, "rename", &["src_dir", "dst_dir"]) {
         Ok(true) => result.add_pass(),
         Ok(false) => result.add_fail("rename src_dir -> dst_dir".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
     let _ = run_pjdfstest(&test_dir, "rmdir", &["dst_dir"]);
 
     // Rename over existing file (should succeed, replacing target)
-    let _ = run_pjdfstest(&test_dir, "open", &["src2", "O_CREAT", "0644"]);
-    let _ = run_pjdfstest(&test_dir, "open", &["dst2", "O_CREAT", "0644"]);
+    require_pjdfstest_success(&test_dir, "open", &["src2", "O_CREAT", "0644"]);
+    require_pjdfstest_success(&test_dir, "open", &["dst2", "O_CREAT", "0644"]);
     match run_pjdfstest(&test_dir, "rename", &["src2", "dst2"]) {
         Ok(true) => result.add_pass(),
         Ok(false) => result.add_fail("rename over existing should succeed".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
     let _ = run_pjdfstest(&test_dir, "unlink", &["dst2"]);
 
     result.print_summary("rename");
-    if result.failed > 0 {
-        eprintln!("BUG: rename fails due to cache invalidation issue after file creation");
-    }
 }
 
 /// unlink - File deletion.
-/// Status: KNOWN BUG - same cache issue as rename
-/// TODO: Fix cache invalidation issue
+/// Checks immediate deletion after file creation.
 #[test]
 fn test_pjdfstest_unlink() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("unlink") {
+    let (_guard, test_dir) = match setup_test("unlink") {
         Some(t) => t,
         None => return,
     };
@@ -538,43 +510,26 @@ fn test_pjdfstest_unlink() {
     // Create and immediately unlink files
     for i in 0..5 {
         let filename = format!("file_{}", i);
-        let _ = run_pjdfstest(&test_dir, "open", &[&filename, "O_CREAT", "0644"]);
+        require_pjdfstest_success(&test_dir, "open", &[&filename, "O_CREAT", "0644"]);
         match run_pjdfstest(&test_dir, "unlink", &[&filename]) {
             Ok(true) => result.add_pass(),
             Ok(false) => result.add_fail(format!("unlink {}", filename)),
             Err(e) => {
                 eprintln!("Error: {}", e);
-                result.add_skip();
+                result.add_fail(e);
             }
         }
     }
 
     // Unlink non-existent file should fail
-    match run_pjdfstest(&test_dir, "unlink", &["nonexistent"]) {
-        Ok(false) => result.add_pass(), // Expected ENOENT
-        Ok(true) => result.add_fail("unlink nonexistent should fail".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+    result.expect_errno(&test_dir, "unlink", &["nonexistent"], &["ENOENT"]);
 
     // Unlink directory should fail (use rmdir instead)
-    let _ = run_pjdfstest(&test_dir, "mkdir", &["adir", "0755"]);
-    match run_pjdfstest(&test_dir, "unlink", &["adir"]) {
-        Ok(false) => result.add_pass(), // Expected EISDIR or EPERM
-        Ok(true) => result.add_fail("unlink directory should fail".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+    require_pjdfstest_success(&test_dir, "mkdir", &["adir", "0755"]);
+    result.expect_errno(&test_dir, "unlink", &["adir"], &["EISDIR", "EPERM"]);
     let _ = run_pjdfstest(&test_dir, "rmdir", &["adir"]);
 
     result.print_summary("unlink");
-    if result.failed > 0 {
-        eprintln!("BUG: unlink after create fails due to cache invalidation");
-    }
 }
 
 /// truncate - File size modification.
@@ -583,7 +538,7 @@ fn test_pjdfstest_unlink() {
 fn test_pjdfstest_truncate() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("truncate") {
+    let (_guard, test_dir) = match setup_test("truncate") {
         Some(t) => t,
         None => return,
     };
@@ -591,7 +546,7 @@ fn test_pjdfstest_truncate() {
     let mut result = TestResult::default();
 
     // Create a file and truncate to various sizes
-    let _ = run_pjdfstest(&test_dir, "open", &["trunc_file", "O_CREAT", "0644"]);
+    require_pjdfstest_success(&test_dir, "open", &["trunc_file", "O_CREAT", "0644"]);
 
     for size in ["0", "100", "1024", "65536", "0"] {
         match run_pjdfstest(&test_dir, "truncate", &["trunc_file", size]) {
@@ -599,7 +554,7 @@ fn test_pjdfstest_truncate() {
             Ok(false) => result.add_fail(format!("truncate to {}", size)),
             Err(e) => {
                 eprintln!("Error: {}", e);
-                result.add_skip();
+                result.add_fail(e);
             }
         }
     }
@@ -607,14 +562,7 @@ fn test_pjdfstest_truncate() {
     let _ = run_pjdfstest(&test_dir, "unlink", &["trunc_file"]);
 
     // Truncate non-existent file should fail
-    match run_pjdfstest(&test_dir, "truncate", &["nonexistent", "0"]) {
-        Ok(false) => result.add_pass(), // Expected ENOENT
-        Ok(true) => result.add_fail("truncate nonexistent should fail".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+    result.expect_errno(&test_dir, "truncate", &["nonexistent", "0"], &["ENOENT"]);
 
     result.print_summary("truncate");
     assert!(result.failed == 0, "truncate tests failed: {:?}", result);
@@ -626,33 +574,38 @@ fn test_pjdfstest_truncate() {
 fn test_pjdfstest_ftruncate() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("ftruncate") {
+    let (_guard, test_dir) = match setup_test("ftruncate") {
         Some(t) => t,
         None => return,
     };
 
     let mut result = TestResult::default();
 
-    // ftruncate requires an open file descriptor, pjdfstest syntax:
-    // ftruncate <fd> <length> - but we need to get an fd first
-    // pjdfstest open returns the fd, so we need a different approach
-
-    // Try basic ftruncate - this likely won't work without special handling
-    let _ = run_pjdfstest(
+    // Descriptor 0 refers to the first file opened in this pjdfstest process.
+    match run_pjdfstest(
         &test_dir,
         "open",
-        &["ftrunc_file", "O_CREAT|O_RDWR", "0644"],
-    );
-
-    // Note: pjdfstest's ftruncate tests may need special handling
-    match run_pjdfstest(&test_dir, "truncate", &["ftrunc_file", "1024"]) {
+        &[
+            "ftrunc_file",
+            "O_CREAT|O_RDWR",
+            "0644",
+            ":",
+            "ftruncate",
+            "0",
+            "1024",
+        ],
+    ) {
         Ok(true) => result.add_pass(),
-        Ok(false) => result.add_fail("ftruncate via truncate".into()),
+        Ok(false) => result.add_fail("ftruncate through an open descriptor".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
+    assert_eq!(
+        fs::metadata(test_dir.join("ftrunc_file")).unwrap().len(),
+        1024
+    );
 
     let _ = run_pjdfstest(&test_dir, "unlink", &["ftrunc_file"]);
 
@@ -667,7 +620,7 @@ fn test_pjdfstest_ftruncate() {
 fn test_pjdfstest_chmod() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("chmod") {
+    let (_guard, test_dir) = match setup_test("chmod") {
         Some(t) => t,
         None => return,
     };
@@ -675,18 +628,16 @@ fn test_pjdfstest_chmod() {
     let mut result = TestResult::default();
 
     // Create a file and try to change permissions
-    let _ = run_pjdfstest(&test_dir, "open", &["chmod_file", "O_CREAT", "0644"]);
+    require_pjdfstest_success(&test_dir, "open", &["chmod_file", "O_CREAT", "0644"]);
 
     // chmod should fail with ENOTSUP - Cryptomator doesn't store permissions
     for mode in ["0755", "0700", "0600"] {
-        match run_pjdfstest(&test_dir, "chmod", &["chmod_file", mode]) {
-            Ok(false) => result.add_pass(), // Expected: ENOTSUP
-            Ok(true) => result.add_fail(format!("chmod {} should fail with ENOTSUP", mode)),
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                result.add_skip();
-            }
-        }
+        result.expect_errno(
+            &test_dir,
+            "chmod",
+            &["chmod_file", mode],
+            &["ENOTSUP", "EOPNOTSUPP"],
+        );
     }
 
     let _ = run_pjdfstest(&test_dir, "unlink", &["chmod_file"]);
@@ -701,7 +652,7 @@ fn test_pjdfstest_chmod() {
 fn test_pjdfstest_chown() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("chown") {
+    let (_guard, test_dir) = match setup_test("chown") {
         Some(t) => t,
         None => return,
     };
@@ -709,24 +660,18 @@ fn test_pjdfstest_chown() {
     let mut result = TestResult::default();
 
     // Create a file
-    let _ = run_pjdfstest(&test_dir, "open", &["chown_file", "O_CREAT", "0644"]);
+    require_pjdfstest_success(&test_dir, "open", &["chown_file", "O_CREAT", "0644"]);
 
     // chown should fail with ENOTSUP - Cryptomator doesn't store ownership
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    match run_pjdfstest(
+    result.expect_errno(
         &test_dir,
         "chown",
         &["chown_file", &uid.to_string(), &gid.to_string()],
-    ) {
-        Ok(false) => result.add_pass(), // Expected: ENOTSUP
-        Ok(true) => result.add_fail("chown should fail with ENOTSUP".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+        &["ENOTSUP", "EOPNOTSUPP"],
+    );
 
     let _ = run_pjdfstest(&test_dir, "unlink", &["chown_file"]);
     result.print_summary("chown");
@@ -740,7 +685,7 @@ fn test_pjdfstest_chown() {
 fn test_pjdfstest_link() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("link") {
+    let (_guard, test_dir) = match setup_test("link") {
         Some(t) => t,
         None => return,
     };
@@ -748,14 +693,14 @@ fn test_pjdfstest_link() {
     let mut result = TestResult::default();
 
     // Create a file and try to hard link it
-    let _ = run_pjdfstest(&test_dir, "open", &["link_src", "O_CREAT", "0644"]);
+    require_pjdfstest_success(&test_dir, "open", &["link_src", "O_CREAT", "0644"]);
 
     match run_pjdfstest(&test_dir, "link", &["link_src", "link_dst"]) {
         Ok(true) => result.add_pass(),
         Ok(false) => result.add_fail("link src -> dst".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
 
@@ -777,7 +722,7 @@ fn test_pjdfstest_link() {
 fn test_pjdfstest_utimensat() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("utimensat") {
+    let (_guard, test_dir) = match setup_test("utimensat") {
         Some(t) => t,
         None => return,
     };
@@ -785,19 +730,27 @@ fn test_pjdfstest_utimensat() {
     let mut result = TestResult::default();
 
     // Create a file
-    let _ = run_pjdfstest(&test_dir, "open", &["utime_file", "O_CREAT", "0644"]);
+    require_pjdfstest_success(&test_dir, "open", &["utime_file", "O_CREAT", "0644"]);
 
-    // Set specific timestamps (atime_sec, atime_nsec, mtime_sec, mtime_nsec)
+    // utimensat takes dirfd, path, both timestamps, and flags.
     match run_pjdfstest(
         &test_dir,
         "utimensat",
-        &["utime_file", "1000000000", "0", "1000000000", "0"],
+        &[
+            "AT_FDCWD",
+            "utime_file",
+            "1000000000",
+            "0",
+            "1000000000",
+            "0",
+            "0",
+        ],
     ) {
         Ok(true) => result.add_pass(),
         Ok(false) => result.add_fail("utimensat specific time".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
 
@@ -805,13 +758,21 @@ fn test_pjdfstest_utimensat() {
     match run_pjdfstest(
         &test_dir,
         "utimensat",
-        &["utime_file", "AT_FDCWD", "0", "AT_FDCWD", "0"],
+        &[
+            "AT_FDCWD",
+            "utime_file",
+            "0",
+            "UTIME_NOW",
+            "0",
+            "UTIME_NOW",
+            "0",
+        ],
     ) {
         Ok(true) => result.add_pass(),
         Ok(false) => result.add_fail("utimensat UTIME_NOW".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
 
@@ -828,7 +789,7 @@ fn test_pjdfstest_utimensat() {
 fn test_pjdfstest_mknod() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("mknod") {
+    let (_guard, test_dir) = match setup_test("mknod") {
         Some(t) => t,
         None => return,
     };
@@ -845,24 +806,18 @@ fn test_pjdfstest_mknod() {
         Ok(false) => result.add_fail("mknod S_IFREG".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
     let _ = run_pjdfstest(&test_dir, "unlink", &["mknod_file"]);
 
     // Character device (likely to fail - needs root and we don't support it)
-    match run_pjdfstest(
+    result.expect_errno(
         &test_dir,
         "mknod",
         &["char_dev", "S_IFCHR", "0644", "1", "3"],
-    ) {
-        Ok(false) => result.add_pass(), // Expected to fail
-        Ok(true) => result.add_fail("mknod S_IFCHR should fail".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+        &["ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EPERM"],
+    );
 
     result.print_summary("mknod");
     if result.failed > 0 {
@@ -877,21 +832,19 @@ fn test_pjdfstest_mknod() {
 fn test_pjdfstest_mkfifo() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("mkfifo") {
+    let (_guard, test_dir) = match setup_test("mkfifo") {
         Some(t) => t,
         None => return,
     };
 
     let mut result = TestResult::default();
 
-    match run_pjdfstest(&test_dir, "mkfifo", &["test_fifo", "0644"]) {
-        Ok(false) => result.add_pass(), // Expected to fail - not supported
-        Ok(true) => result.add_fail("mkfifo should fail (not supported)".into()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            result.add_skip();
-        }
-    }
+    result.expect_errno(
+        &test_dir,
+        "mkfifo",
+        &["test_fifo", "0644"],
+        &["ENOSYS", "ENOTSUP", "EOPNOTSUPP"],
+    );
 
     result.print_summary("mkfifo");
     eprintln!("NOT SUPPORTED: FIFOs not supported by Cryptomator");
@@ -900,35 +853,43 @@ fn test_pjdfstest_mkfifo() {
 /// posix_fallocate - Preallocate file space.
 /// Status: IMPLEMENTED (mode=0 only)
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "macOS does not provide posix_fallocate")]
 fn test_pjdfstest_posix_fallocate() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("fallocate") {
+    let (_guard, test_dir) = match setup_test("fallocate") {
         Some(t) => t,
         None => return,
     };
 
     let mut result = TestResult::default();
 
-    let _ = run_pjdfstest(
-        &test_dir,
-        "open",
-        &["falloc_file", "O_CREAT|O_RDWR", "0644"],
-    );
-
-    // Allocate 1MB
+    // Allocate 1MB using the descriptor opened in the same process.
     match run_pjdfstest(
         &test_dir,
-        "posix_fallocate",
-        &["falloc_file", "0", "1048576"],
+        "open",
+        &[
+            "falloc_file",
+            "O_CREAT|O_RDWR",
+            "0644",
+            ":",
+            "posix_fallocate",
+            "0",
+            "0",
+            "1048576",
+        ],
     ) {
         Ok(true) => result.add_pass(),
         Ok(false) => result.add_fail("posix_fallocate 1MB".into()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            result.add_skip();
+            result.add_fail(e);
         }
     }
+    assert_eq!(
+        fs::metadata(test_dir.join("falloc_file")).unwrap().len(),
+        1048576
+    );
 
     let _ = run_pjdfstest(&test_dir, "unlink", &["falloc_file"]);
 
@@ -951,7 +912,7 @@ fn test_pjdfstest_posix_fallocate() {
 fn test_pjdfstest_all_operations() {
     skip_if_not_ready!();
 
-    let (_guard, _temp, test_dir) = match setup_test("all") {
+    let (_guard, test_dir) = match setup_test("all") {
         Some(t) => t,
         None => return,
     };
@@ -987,7 +948,7 @@ fn test_pjdfstest_all_operations() {
         ),
         (
             "rename",
-            "BUG:CACHE",
+            "IMPLEMENTED",
             vec![
                 ("open", vec!["rename_src", "O_CREAT", "0644"]),
                 ("rename", vec!["rename_src", "rename_dst"]),

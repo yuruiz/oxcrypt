@@ -203,8 +203,8 @@ sudo ./scripts/run-pjdfstest.sh --quick
 | mkdir | ✅ 100% pass | Directory create/remove operations |
 | open | ✅ 100% pass | File create with O_CREAT |
 | symlink | ✅ 100% pass | Symlink create/unlink (readlink not supported by pjdfstest on macOS) |
-| unlink | ⚠️ Known issues | File visibility after create (cache issue) |
-| rename | ⚠️ Known issues | File visibility after create (cache issue) |
+| unlink | Regression coverage | Immediate unlink after create; failures fail the test |
+| rename | Regression coverage | Immediate rename and replacement after create; failures fail the test |
 | truncate | ❌ Not implemented | setattr returns ENOSYS |
 
 ### Mount Tests Coverage

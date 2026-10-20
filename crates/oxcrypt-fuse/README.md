@@ -253,12 +253,16 @@ MPL-2.0 - see the repository root for details.
 
 ### Large writable files
 
-Writable handles retain the plaintext file in memory for random access. Flush snapshots
-share that allocation; a concurrent modification can require a copy. GCM writes of at
-least 1 MiB stream encrypted chunks to an atomic replacement file, avoiding a second
-whole-file ciphertext allocation. This reduces flush memory overhead, but does not make
-random-access writes constant-memory or eliminate whole-file rewrite I/O. Read-only
-handles use streaming reads. Benchmark representative file sizes before deployment.
+Ordinary file handles use authenticated 32 KiB chunks and share one editor per
+inode. Each editor retains at most one dirty chunk and four clean chunks (160 KiB
+of plaintext), excluding caller-owned I/O buffers. Reads and writes support both
+SIV_GCM and SIV_CTRMAC; unmodified ciphertext is preserved.
+
+Commits publish a complete encrypted file atomically. APFS cloning or Linux
+reflinks avoid copying unchanged ciphertext when available; other filesystems
+use bounded-memory copying. Small writes still have chunk-level amplification,
+and cloud clients may upload the entire changed file. See
+[chunked I/O](../../docs/CHUNKED_IO.md) for the memory and persistence guarantees.
 
 The mount does not enable `noappledouble` or `noapplexattr`: blocking sidecars would
 break Finder metadata and some file-copy operations. No new vault format is introduced.
