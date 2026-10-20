@@ -119,6 +119,22 @@ cargo test -p oxcrypt-desktop
 
 This project is licensed under the [Mozilla Public License 2.0](../../LICENSE).
 
+## Linux startup acceptance
+
+Build the Linux backends and run the GUI on an isolated X11 display:
+
+```sh
+cargo build --locked -p oxcrypt-desktop --no-default-features --features mimalloc,fuse,webdav,nfs
+xvfb-run -a dbus-run-session -- python3 scripts/test-linux-desktop.py target/debug/oxcrypt-desktop
+```
+
+The test requires `xvfb`, `xauth`, `xdotool`, and a D-Bus session, in addition to
+the GTK/WebKit libraries needed by the desktop app. It uses temporary configuration
+directories, verifies a visible OxCrypt window belonging to the launched process,
+and requires a clean exit after SIGINT. Missing prerequisites fail the test.
+The `Linux Desktop Startup` workflow provides the same check on Ubuntu and can
+also be started manually. Harness tests alone do not validate GTK or the real GUI.
+
 ## macOS Keychain
 
 The unlock dialog can save a password in macOS Keychain after a successful mount.

@@ -6086,6 +6086,7 @@ dependencies = [
  "directories",
  "dirs",
  "fs2",
+ "gtk",
  "image 0.25.10",
  "mimalloc",
  "muda",

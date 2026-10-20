@@ -46,6 +46,13 @@ pub fn menu_receiver() -> Option<&'static Receiver<MenuBarEvent>> {
 }
 
 fn main() {
+    // muda and tray-icon create GTK objects before Dioxus starts its event loop.
+    #[cfg(target_os = "linux")]
+    if let Err(error) = gtk::init() {
+        eprintln!("Failed to initialize GTK: {error}");
+        std::process::exit(1);
+    }
+
     // Initialize tracing for logging
     #[cfg(feature = "tokio-console")]
     {
