@@ -6,10 +6,11 @@
 #![allow(dead_code)] // Vault state APIs for future use
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
 use std::time::Duration;
 
-use super::config::{AppConfig, BackendType, ConfigLoadStatus, VaultConfig};
 use crate::backend::{DesktopMountState, mount_manager};
+use crate::state::config::{AppConfig, BackendType, ConfigLoadStatus, VaultConfig};
 
 /// The runtime state of a vault
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -259,7 +260,7 @@ impl AppState {
     }
 
     /// Save the current configuration to disk
-    pub fn save(&self) -> Result<(), super::config::ConfigError> {
+    pub fn save(&self) -> Result<(), crate::state::config::ConfigError> {
         self.config.save()
     }
 
@@ -283,12 +284,10 @@ impl AppState {
 /// For each orphaned mount (where the process is dead):
 /// 1. Attempt force unmount with a timeout
 /// 2. If timeout expires, give up on unmount (the mount may be in a bad state)
-/// 3. Remove from state file regardless
+/// 3. Remove from state only after successful cleanup
 ///
 /// Vaults are left as Locked so the user can re-authenticate.
 fn cleanup_orphaned_mounts(config: &AppConfig) {
-    const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
-
     // Get the state manager
     let state_manager = match DesktopMountState::new() {
         Ok(m) => m,
@@ -328,36 +327,23 @@ fn cleanup_orphaned_mounts(config: &AppConfig) {
             orphan.backend
         );
 
-        // Attempt force unmount with timeout
-        let mp_clone = mountpoint.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        std::thread::spawn(move || {
-            let result = force_unmount_path(&mp_clone);
-            let _ = tx.send(result);
-        });
-
-        match rx.recv_timeout(UNMOUNT_TIMEOUT) {
-            Ok(Ok(())) => {
-                tracing::info!("Successfully unmounted orphan at {}", mountpoint.display());
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "Failed to unmount orphan at {}: {}",
-                    mountpoint.display(),
-                    e
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Unmount of orphan at {} timed out after {:?}, giving up",
-                    mountpoint.display(),
-                    UNMOUNT_TIMEOUT
-                );
+        if !orphan.is_server_only() {
+            match state_manager.mountpoint_is_active(&mountpoint) {
+                Err(error) => {
+                    tracing::warn!(%error, mountpoint = %mountpoint.display(), "Cannot inspect orphan mount; retaining state");
+                    continue;
+                }
+                Ok(false) => {}
+                Ok(true) => {
+                    if let Err(error) = force_unmount_path(&mountpoint) {
+                        tracing::warn!(%error, mountpoint = %mountpoint.display(), "Orphan cleanup failed; retaining state for recovery");
+                        continue;
+                    }
+                    tracing::info!(mountpoint = %mountpoint.display(), "Successfully unmounted orphan");
+                }
             }
         }
 
-        // Always remove from state file, regardless of unmount success
         if let Err(e) = state_manager.remove_mount(&mountpoint) {
             tracing::warn!("Failed to remove orphan from state file: {}", e);
         }
@@ -366,79 +352,42 @@ fn cleanup_orphaned_mounts(config: &AppConfig) {
 
 /// Force unmount a path using platform-specific tools.
 fn force_unmount_path(mountpoint: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        // Try diskutil first (handles FUSE mounts better)
-        let output = std::process::Command::new("diskutil")
-            .args(["unmount", "force", &mountpoint.to_string_lossy()])
-            .output()
-            .map_err(|e| format!("Failed to run diskutil: {e}"))?;
-
-        if output.status.success() {
-            return Ok(());
-        }
-
-        // Fall back to umount
-        let output = std::process::Command::new("umount")
-            .args(["-f", &mountpoint.to_string_lossy()])
-            .output()
-            .map_err(|e| format!("Failed to run umount: {e}"))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "umount failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
+        oxcrypt_mount::force_unmount(mountpoint)
+            .map_err(|error| format!("Force unmount failed: {error:#}"))
     }
-
-    #[cfg(target_os = "linux")]
-    {
-        let output = std::process::Command::new("umount")
-            .args(["-f", "-l", &mountpoint.to_string_lossy()])
-            .output()
-            .map_err(|e| format!("Failed to run umount: {e}"))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "umount failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
-    }
-
     #[cfg(target_os = "windows")]
     {
-        // Windows doesn't have force unmount in the same way
-        // For WebDAV, we could try net use /delete
-        let output = std::process::Command::new("net")
-            .args(["use", &mountpoint.to_string_lossy(), "/delete", "/y"])
-            .output()
-            .map_err(|e| format!("Failed to run net use: {}", e))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "net use /delete failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
+        let mountpoint = mountpoint.to_path_buf();
+        oxcrypt_mount::bounded_pool::BOUNDED_FS_POOL
+            .run_with_timeout(Duration::from_secs(7), move || {
+                let output = std::process::Command::new("net")
+                    .arg("use")
+                    .arg(&mountpoint)
+                    .args(["/delete", "/y"])
+                    .output()?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "net use /delete failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )))
+                }
+            })
+            .map_err(|error| format!("Force unmount failed: {error}"))
     }
-
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        Err("Force unmount not implemented for this platform".to_string())
+        let _ = mountpoint;
+        Err("Force unmount is unsupported".into())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::state::vault_manager::*;
     use std::path::PathBuf;
 
     #[test]

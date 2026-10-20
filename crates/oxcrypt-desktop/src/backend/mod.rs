@@ -43,6 +43,34 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+/// Register before exposing a new handle. A rejected duplicate or failed state
+/// write must clean up the new mount without replacing another owner's record.
+fn register_gui_mount(
+    state_manager: anyhow::Result<DesktopMountState>,
+    vault_path: &std::path::Path,
+    backend: &str,
+    handle: Box<dyn MountHandle>,
+) -> Result<Box<dyn MountHandle>, MountError> {
+    let result = state_manager.and_then(|manager| {
+        manager.add_mount(MountEntry::from_gui_handle(
+            vault_path.to_path_buf(),
+            backend,
+            handle.as_ref(),
+        ))
+    });
+    if let Err(error) = result {
+        let cleanup = handle.unmount();
+        let detail = match cleanup {
+            Ok(()) => format!("Failed to persist mount state: {error:#}"),
+            Err(cleanup) => format!(
+                "Failed to persist mount state: {error:#}; new mount cleanup failed: {cleanup}"
+            ),
+        };
+        return Err(MountError::Mount(std::io::Error::other(detail)));
+    }
+    Ok(handle)
+}
+
 /// Manager for active filesystem mounts
 ///
 /// Coordinates mounting/unmounting of vaults using the configured backend.
@@ -129,14 +157,8 @@ impl MountManager {
         let handle = backend.mount(vault_id, vault_path, password, mountpoint)?;
         let mp = handle.mountpoint().to_path_buf();
 
-        // Persist mount state for crash recovery
-        if let Ok(state_manager) = DesktopMountState::new() {
-            let entry =
-                MountEntry::new_gui_mount(vault_path.to_path_buf(), mp.clone(), backend.id());
-            if let Err(e) = state_manager.add_mount(entry) {
-                tracing::warn!("Failed to persist mount state: {}", e);
-            }
-        }
+        let handle =
+            register_gui_mount(DesktopMountState::new(), vault_path, backend.id(), handle)?;
 
         // Store the handle
         let mut mounts = self.mounts.lock();
@@ -173,14 +195,8 @@ impl MountManager {
             backend.mount_with_options(vault_id, vault_path, password, mountpoint, options)?;
         let mp = handle.mountpoint().to_path_buf();
 
-        // Persist mount state for crash recovery
-        if let Ok(state_manager) = DesktopMountState::new() {
-            let entry =
-                MountEntry::new_gui_mount(vault_path.to_path_buf(), mp.clone(), backend.id());
-            if let Err(e) = state_manager.add_mount(entry) {
-                tracing::warn!("Failed to persist mount state: {}", e);
-            }
-        }
+        let handle =
+            register_gui_mount(DesktopMountState::new(), vault_path, backend.id(), handle)?;
 
         // Store the handle
         let mut mounts = self.mounts.lock();
@@ -217,14 +233,8 @@ impl MountManager {
         let handle = backend.mount(vault_id, vault_path, password, mountpoint)?;
         let mp = handle.mountpoint().to_path_buf();
 
-        // Persist mount state for crash recovery
-        if let Ok(state_manager) = DesktopMountState::new() {
-            let entry =
-                MountEntry::new_gui_mount(vault_path.to_path_buf(), mp.clone(), backend.id());
-            if let Err(e) = state_manager.add_mount(entry) {
-                tracing::warn!("Failed to persist mount state: {}", e);
-            }
-        }
+        let handle =
+            register_gui_mount(DesktopMountState::new(), vault_path, backend.id(), handle)?;
 
         // Store the handle
         let mut mounts = self.mounts.lock();
