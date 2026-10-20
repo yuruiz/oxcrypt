@@ -34,7 +34,7 @@
 
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 /// Maximum threads that can be leaked before we start rejecting operations.
@@ -47,13 +47,6 @@ use std::time::Duration;
 /// still providing protection against runaway resource consumption.
 pub const MAX_LEAKED_THREADS: usize = 32;
 
-/// Counter of currently-blocked threads (potential leaks).
-///
-/// This counter is incremented when a thread is spawned and decremented when
-/// it completes successfully. If a timeout occurs, the counter stays elevated
-/// because the thread is still running (blocked in kernel).
-static BLOCKED_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 /// A thread pool that tracks and limits leaked threads from timeout operations.
 ///
 /// When operations time out, the spawned thread may be stuck in D-state
@@ -63,20 +56,22 @@ static BLOCKED_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug, Clone)]
 pub struct BoundedFsPool {
     max_leaked: usize,
+    blocked: Arc<AtomicUsize>,
 }
 
 impl Default for BoundedFsPool {
     fn default() -> Self {
-        Self {
-            max_leaked: MAX_LEAKED_THREADS,
-        }
+        Self::new(MAX_LEAKED_THREADS)
     }
 }
 
 impl BoundedFsPool {
     /// Create a new pool with a custom max leaked thread limit.
     pub fn new(max_leaked: usize) -> Self {
-        Self { max_leaked }
+        Self {
+            max_leaked,
+            blocked: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Run an operation with timeout, tracking potential thread leaks.
@@ -100,40 +95,46 @@ impl BoundedFsPool {
         T: Send + 'static,
         F: FnOnce() -> io::Result<T> + Send + 'static,
     {
-        // Check if we've exceeded the leak threshold
-        let current_blocked = BLOCKED_THREAD_COUNT.load(Ordering::Acquire);
-        if current_blocked >= self.max_leaked {
-            return Err(io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                format!(
-                    "Too many blocked filesystem threads ({}/{}). \
-                    Possible ghost mounts detected. Please check your mounts \
-                    and consider rebooting to clear stale mounts.",
-                    current_blocked, self.max_leaked
-                ),
-            ));
-        }
+        self.blocked
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < self.max_leaked).then(|| count + 1)
+            })
+            .map_err(|count| {
+                io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    format!(
+                        "Too many blocked filesystem threads ({count}/{}); possible ghost mounts",
+                        self.max_leaked
+                    ),
+                )
+            })?;
 
-        let (tx, rx) = mpsc::channel();
-
-        // Increment blocked count before spawning
-        // The thread will decrement it when it completes
-        BLOCKED_THREAD_COUNT.fetch_add(1, Ordering::AcqRel);
-
-        std::thread::spawn(move || {
-            let result = op();
-            // Decrement count - this thread completed successfully
-            BLOCKED_THREAD_COUNT.fetch_sub(1, Ordering::AcqRel);
-            let _ = tx.send(result);
-        });
+        // The reservation follows the worker, including spawn failure, panic and
+        // completion after the caller has already timed out.
+        let slot = WorkerSlot(Arc::clone(&self.blocked));
+        // A rendezvous prevents queued file handles from being dropped on the
+        // caller when its receive deadline expires.
+        let (tx, rx) = mpsc::sync_channel(0);
+        std::thread::Builder::new()
+            .name("oxcrypt-fs-check".into())
+            .spawn(move || {
+                let reservation = slot;
+                let result = op();
+                // On failed delivery tuple fields drop left to right, keeping
+                // the reservation through any blocking result destructor.
+                let _ = tx.send((result, reservation));
+            })?;
 
         match rx.recv_timeout(timeout) {
-            Ok(result) => result,
+            Ok((result, reservation)) => {
+                drop(reservation);
+                result
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Thread is blocked - count stays elevated (leak tracked)
                 // Note: we don't decrement here because the thread is still running
                 tracing::warn!(
-                    blocked_threads = BLOCKED_THREAD_COUNT.load(Ordering::Acquire),
+                    blocked_threads = self.blocked.load(Ordering::Acquire),
                     max_allowed = self.max_leaked,
                     "Filesystem operation timed out. Thread may be blocked on ghost mount."
                 );
@@ -142,13 +143,9 @@ impl BoundedFsPool {
                     "Filesystem operation timed out - path may be on a stale mount",
                 ))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Thread panicked or was dropped - decrement count
-                BLOCKED_THREAD_COUNT.fetch_sub(1, Ordering::AcqRel);
-                Err(io::Error::other(
-                    "Filesystem operation thread terminated unexpectedly",
-                ))
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                "Filesystem operation thread terminated unexpectedly",
+            )),
         }
     }
 
@@ -156,7 +153,7 @@ impl BoundedFsPool {
     ///
     /// This can be used for monitoring and diagnostics.
     pub fn blocked_count(&self) -> usize {
-        BLOCKED_THREAD_COUNT.load(Ordering::Acquire)
+        self.blocked.load(Ordering::Acquire)
     }
 
     /// Get the maximum allowed blocked threads for this pool.
@@ -178,6 +175,14 @@ impl BoundedFsPool {
     /// Check if the pool is exhausted (at or above threshold).
     pub fn is_exhausted(&self) -> bool {
         self.blocked_count() >= self.max_leaked
+    }
+}
+
+struct WorkerSlot(Arc<AtomicUsize>);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -216,7 +221,7 @@ pub struct BlockedThreadDiagnostics {
 ///
 /// This is useful for health checks and monitoring.
 pub fn get_blocked_thread_diagnostics() -> BlockedThreadDiagnostics {
-    let blocked_count = BLOCKED_THREAD_COUNT.load(Ordering::Acquire);
+    let blocked_count = BOUNDED_FS_POOL.blocked_count();
     let status = if blocked_count == 0 {
         "healthy"
     } else if blocked_count < MAX_LEAKED_THREADS {
@@ -232,24 +237,170 @@ pub fn get_blocked_thread_diagnostics() -> BlockedThreadDiagnostics {
     }
 }
 
-/// Reset the blocked thread counter.
+/// Check whether the shared pool has recovered.
 ///
-/// # Safety
-///
-/// Only call this after confirming all ghost mounts have been cleared
-/// (e.g., after a reboot or successful force-unmount of all stale mounts).
-///
-/// Calling this while threads are actually blocked will cause the counter
-/// to become inaccurate.
+/// Active worker reservations cannot be reset: even a timed-out thread retains
+/// its slot until it exits. This function never forgets live workers or allows
+/// their eventual completion to underflow the counter.
 pub fn reset_blocked_count() {
-    BLOCKED_THREAD_COUNT.store(0, Ordering::Release);
-    tracing::info!("Blocked thread counter reset");
+    let count = BOUNDED_FS_POOL.blocked_count();
+    if count != 0 {
+        tracing::warn!(
+            blocked_threads = count,
+            "Cannot reset reservations held by filesystem workers"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::bounded_pool::{BoundedFsPool, MAX_LEAKED_THREADS, get_blocked_thread_diagnostics};
     use std::time::Duration;
+    use std::{
+        io,
+        sync::{Arc, Barrier, Condvar, Mutex},
+        thread,
+    };
+
+    #[test]
+    fn concurrent_reservations_never_exceed_capacity() {
+        let pool = BoundedFsPool::new(2);
+        let start = Arc::new(Barrier::new(13));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut workers = Vec::new();
+        for _ in 0..12 {
+            let pool = pool.clone();
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            workers.push(thread::spawn(move || {
+                start.wait();
+                pool.run_with_timeout(Duration::from_millis(30), move || {
+                    let (lock, wake) = &*release;
+                    let _guard = wake
+                        .wait_while(lock.lock().unwrap(), |done| !*done)
+                        .unwrap();
+                    Ok(())
+                })
+            }));
+        }
+        start.wait();
+        let errors: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap_err().kind())
+            .collect();
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|kind| **kind == io::ErrorKind::TimedOut)
+                .count(),
+            2
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|kind| **kind == io::ErrorKind::ResourceBusy)
+                .count(),
+            10
+        );
+        assert_eq!(pool.blocked_count(), 2);
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while pool.blocked_count() != 0 && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(pool.blocked_count(), 0);
+    }
+
+    #[test]
+    fn panicking_workers_release_their_reservation() {
+        let pool = BoundedFsPool::new(1);
+        let result: io::Result<()> =
+            pool.run_with_timeout(Duration::from_secs(1), || panic!("worker failure"));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(pool.blocked_count(), 0);
+        pool.run_with_timeout(Duration::from_secs(1), || Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn panic_after_caller_timeout_still_releases_capacity() {
+        let pool = BoundedFsPool::new(1);
+        let (release, wait) = std::sync::mpsc::channel();
+        let result: io::Result<()> = pool.run_with_timeout(Duration::from_millis(10), move || {
+            wait.recv().unwrap();
+            panic!("failure after timeout");
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(pool.blocked_count(), 1);
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while pool.blocked_count() != 0 && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(pool.blocked_count(), 0);
+        pool.run_with_timeout(Duration::from_secs(1), || Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn timed_out_result_destructors_retain_the_worker_slot() {
+        struct SlowDrop {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                let (lock, wake) = &*self.release;
+                let _guard = wake
+                    .wait_while(lock.lock().unwrap(), |done| !*done)
+                    .unwrap();
+            }
+        }
+        let pool = BoundedFsPool::new(1);
+        let (complete, completion) = std::sync::mpsc::channel();
+        let (entered, dropped) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let result = pool.run_with_timeout(Duration::from_millis(10), move || {
+            completion.recv().unwrap();
+            Ok(SlowDrop {
+                entered,
+                release: worker_release,
+            })
+        });
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+        complete.send(()).unwrap();
+        dropped.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(pool.blocked_count(), 1);
+        assert_eq!(
+            pool.run_with_timeout(Duration::from_millis(10), || Ok(()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ResourceBusy
+        );
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while pool.blocked_count() != 0 && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(pool.blocked_count(), 0);
+    }
+
+    #[test]
+    fn successful_calls_immediately_release_capacity_for_the_next_call() {
+        let pool = BoundedFsPool::new(1);
+        for value in 0..100 {
+            assert_eq!(
+                pool.run_with_timeout(Duration::from_secs(1), move || Ok(value))
+                    .unwrap(),
+                value
+            );
+            assert_eq!(pool.blocked_count(), 0);
+        }
+    }
 
     #[test]
     fn test_successful_operation() {
@@ -272,7 +423,7 @@ mod tests {
     fn test_timeout() {
         let pool = BoundedFsPool::new(10);
         let result: io::Result<i32> = pool.run_with_timeout(Duration::from_millis(10), || {
-            std::thread::sleep(Duration::from_secs(10));
+            thread::sleep(Duration::from_secs(10));
             Ok(42)
         });
         assert!(result.is_err());

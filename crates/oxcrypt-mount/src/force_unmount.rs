@@ -20,8 +20,6 @@
 use std::path::Path;
 use std::process::Command;
 
-#[cfg(target_os = "linux")]
-use anyhow::Context;
 use anyhow::Result;
 
 /// Force unmount a filesystem at the given path.
@@ -89,208 +87,72 @@ pub fn lazy_unmount(mountpoint: &Path) -> Result<()> {
     }
 }
 
-// ============================================================================
-// macOS implementation
-// ============================================================================
-
-#[cfg(target_os = "macos")]
-fn force_unmount_macos(mountpoint: &Path) -> Result<()> {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    // NOTE: We intentionally skip checking mountpoint.exists() here because:
-    // 1. On ghost mounts, exists() blocks forever waiting for dead FUSE daemon
-    // 2. The unmount commands will fail gracefully if there's nothing to unmount
-    // 3. If the directory was deleted, diskutil/umount will just return an error
-
-    // Try diskutil unmount force first (most reliable on macOS)
-    // Use timeout to avoid hanging on ghost mounts
-    let (tx, rx) = mpsc::channel();
-    let mountpoint_clone = mountpoint.to_path_buf();
-
-    std::thread::spawn(move || {
-        let result = Command::new("diskutil")
-            .args(["unmount", "force"])
-            .arg(&mountpoint_clone)
-            .output();
-        let _ = tx.send(result);
-    });
-
-    if let Ok(Ok(result)) = rx.recv_timeout(Duration::from_secs(3)) {
-        if result.status.success() {
-            tracing::debug!(
-                "Force unmount via diskutil succeeded for {}",
-                mountpoint.display()
-            );
-            return Ok(());
-        }
-
-        // Log diskutil failure and try fallback
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        tracing::debug!(
-            "diskutil unmount failed for {}: {}",
-            mountpoint.display(),
-            stderr.trim()
+/// Each blocked command retains a shared pool slot until it actually exits.
+/// Timing out the caller never creates an untracked command waiter.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn attempt_unmount(mountpoint: &Path, commands: &[(&str, &[&str])]) -> Result<()> {
+    let mut errors = Vec::new();
+    for (program, args) in commands {
+        let program_name = (*program).to_owned();
+        let arguments: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let path = mountpoint.to_path_buf();
+        let result = crate::bounded_pool::BOUNDED_FS_POOL.run_with_timeout(
+            std::time::Duration::from_secs(3),
+            move || {
+                Command::new(program_name)
+                    .args(arguments)
+                    .arg(path)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+            },
         );
-    } else {
-        tracing::warn!(
-            "diskutil unmount timed out for {} (possible ghost mount)",
-            mountpoint.display()
-        );
-    }
-
-    // Fallback to umount -f with timeout
-    let (tx, rx) = mpsc::channel();
-    let mountpoint_clone = mountpoint.to_path_buf();
-
-    std::thread::spawn(move || {
-        let result = Command::new("umount")
-            .arg("-f")
-            .arg(&mountpoint_clone)
-            .output();
-        let _ = tx.send(result);
-    });
-
-    if let Ok(Ok(result)) = rx.recv_timeout(Duration::from_secs(3)) {
-        if result.status.success() {
-            tracing::debug!(
-                "Force unmount via umount -f succeeded for {}",
-                mountpoint.display()
-            );
-            return Ok(());
+        match result {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => errors.push(format!(
+                "{program}: {} ({})",
+                String::from_utf8_lossy(&output.stderr).trim(),
+                output.status
+            )),
+            Err(error) => errors.push(format!("{program}: {error}")),
         }
-
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        anyhow::bail!(
-            "Failed to force unmount {}: {}",
-            mountpoint.display(),
-            stderr.trim()
-        )
     }
-
-    // Both methods timed out - likely a ghost mount
     anyhow::bail!(
-        "Failed to force unmount {} (timed out - possible ghost mount). \
-        You may need to reboot to clear this mount.",
-        mountpoint.display()
+        "Failed to unmount {}: {}",
+        mountpoint.display(),
+        errors.join("; ")
     )
 }
 
-// ============================================================================
-// Linux implementation
-// ============================================================================
+#[cfg(target_os = "macos")]
+fn force_unmount_macos(mountpoint: &Path) -> Result<()> {
+    // Do not probe the mounted path: metadata calls can block on ghost mounts.
+    attempt_unmount(
+        mountpoint,
+        &[("diskutil", &["unmount", "force"]), ("umount", &["-f"])],
+    )
+}
 
 #[cfg(target_os = "linux")]
 fn force_unmount_linux(mountpoint: &Path) -> Result<()> {
-    // Try fusermount -uz first (FUSE-specific, with lazy unmount)
-    let result = Command::new("fusermount")
-        .args(["-uz"])
-        .arg(mountpoint)
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            tracing::debug!(
-                "Force unmount via fusermount -uz succeeded for {}",
-                mountpoint.display()
-            );
-            return Ok(());
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::debug!(
-                "fusermount -uz failed for {}: {}",
-                mountpoint.display(),
-                stderr.trim()
-            );
-        }
-        Err(e) => {
-            tracing::debug!("fusermount not available: {}", e);
-        }
-    }
-
-    // Fallback to umount -l (lazy unmount, works for any filesystem)
-    let result = Command::new("umount")
-        .arg("-l")
-        .arg(mountpoint)
-        .output()
-        .context("Failed to run umount")?;
-
-    if result.status.success() {
-        tracing::debug!(
-            "Force unmount via umount -l succeeded for {}",
-            mountpoint.display()
-        );
-        return Ok(());
-    }
-
-    // Last resort: umount -f (force)
-    let result = Command::new("umount")
-        .arg("-f")
-        .arg(mountpoint)
-        .output()
-        .context("Failed to run umount -f")?;
-
-    if result.status.success() {
-        tracing::debug!(
-            "Force unmount via umount -f succeeded for {}",
-            mountpoint.display()
-        );
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    anyhow::bail!(
-        "Failed to force unmount {}: {}",
-        mountpoint.display(),
-        stderr.trim()
+    attempt_unmount(
+        mountpoint,
+        &[
+            ("fusermount", &["-uz"]),
+            ("umount", &["-l"]),
+            ("umount", &["-f"]),
+        ],
     )
 }
 
 #[cfg(target_os = "linux")]
 fn lazy_unmount_linux(mountpoint: &Path) -> Result<()> {
-    // Try fusermount -uz first
-    let result = Command::new("fusermount")
-        .args(["-uz"])
-        .arg(mountpoint)
-        .output();
-
-    if let Ok(output) = result
-        && output.status.success()
-    {
-        tracing::debug!(
-            "Lazy unmount via fusermount -uz succeeded for {}",
-            mountpoint.display()
-        );
-        return Ok(());
-    }
-
-    // Fallback to umount -l
-    let result = Command::new("umount")
-        .arg("-l")
-        .arg(mountpoint)
-        .output()
-        .context("Failed to run umount -l")?;
-
-    if result.status.success() {
-        tracing::debug!(
-            "Lazy unmount via umount -l succeeded for {}",
-            mountpoint.display()
-        );
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    anyhow::bail!(
-        "Failed to lazy unmount {}: {}",
-        mountpoint.display(),
-        stderr.trim()
-    )
+    attempt_unmount(mountpoint, &[("fusermount", &["-uz"]), ("umount", &["-l"])])
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::force_unmount::force_unmount;
+    use std::path::Path;
 
     #[test]
     fn test_force_unmount_nonexistent_path() {

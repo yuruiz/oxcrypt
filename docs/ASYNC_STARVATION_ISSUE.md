@@ -1,5 +1,16 @@
 # FUSE Backend Async Runtime Starvation on Cloud Storage
 
+## Applicability
+
+This report describes the async runtime architecture used during the original
+Google Drive hang investigation. The current FUSE implementation has bounded
+scheduler lanes, request deadlines, and a dedicated syscall executor; the stack
+and thread-pool counts below are not a description of the current implementation.
+Use [the runtime specification](fuse_runtime_spec.md) and
+`crates/oxcrypt-fuse/src/scheduler/` when investigating a new hang. Deadline replies
+cannot cancel a syscall blocked inside the kernel, so ghost mounts still require
+OS-level recovery. A recurrence of the reported workload needs a fresh trace.
+
 ## Problem Summary
 
 OxCrypt is a Cryptomator client written in Rust. Our FUSE backend under macOS hangs after 20-80 seconds when reading a directory with many large video files stored on Google Drive. While the folder is initially read fine and the throughput stays high, the system then appears to experience complete tokio async runtime starvation where all workers become idle while waiting for blocking I/O operations to complete on slow cloud storage.

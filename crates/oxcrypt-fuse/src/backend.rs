@@ -11,6 +11,7 @@ use oxcrypt_mount::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -76,39 +77,46 @@ impl FuseMountHandle {
 
     /// Force unmount the filesystem using system tools.
     /// This is a fallback when the normal unmount is blocked.
-    fn force_unmount_impl(&self) {
-        #[cfg(target_os = "macos")]
-        {
-            // Try diskutil unmount force first (more reliable on macOS)
-            let result = std::process::Command::new("diskutil")
-                .args(["unmount", "force"])
-                .arg(&self.mountpoint)
-                .output();
+    fn force_unmount_impl(&self) -> std::io::Result<()> {
+        oxcrypt_mount::force_unmount(&self.mountpoint).map_err(std::io::Error::other)
+    }
 
-            match result {
-                Ok(output) if output.status.success() => {
-                    tracing::debug!("Force unmount via diskutil succeeded");
-                    return;
-                }
-                _ => {
-                    tracing::debug!("diskutil unmount failed, trying umount");
+    fn finish_session(&mut self, force: bool) -> Result<(), MountError> {
+        let mut failures = Vec::new();
+        if let Some(session) = self.session.take() {
+            let forced = if force {
+                Some(self.force_unmount_impl())
+            } else {
+                None
+            };
+            let externally_unmounted = forced.as_ref().is_some_and(Result::is_ok);
+            if let Some(Err(error)) = forced {
+                failures.push(format!("force unmount failed: {error}"));
+            }
+            let result = cleanup_owned(
+                &oxcrypt_mount::bounded_pool::BOUNDED_FS_POOL,
+                JOIN_TIMEOUT,
+                session,
+                move |session| {
+                    if externally_unmounted {
+                        session.join()
+                    } else {
+                        session.umount_and_join()
+                    }
+                },
+            );
+            if let Err(error) = result {
+                failures.push(format!("FUSE session shutdown did not complete: {error}"));
+                if !force && let Err(error) = self.force_unmount_impl() {
+                    failures.push(format!("fallback force unmount failed: {error}"));
                 }
             }
-
-            // Fallback to umount
-            let _ = std::process::Command::new("umount")
-                .arg("-f")
-                .arg(&self.mountpoint)
-                .output();
         }
-
-        #[cfg(target_os = "linux")]
-        {
-            // Try lazy unmount on Linux
-            let _ = std::process::Command::new("fusermount")
-                .args(["-uz"])
-                .arg(&self.mountpoint)
-                .output();
+        failures.extend(self.close_reports.lock().iter().cloned());
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(MountError::UnmountFailed(failures.join("; ")))
         }
     }
 }
@@ -134,89 +142,63 @@ impl MountHandle for FuseMountHandle {
 
     fn unmount(mut self: Box<Self>) -> Result<(), MountError> {
         tracing::info!(mountpoint = %self.mountpoint.display(), "Unmounting FUSE filesystem");
-        if let Some(session) = self.session.take() {
-            // Unmount and join the session for clean shutdown
-            // This may block if files are open
-            session
-                .umount_and_join()
-                .map_err(|e| MountError::UnmountFailed(e.to_string()))?;
-        }
-        let reports = self.close_reports.lock();
-        if !reports.is_empty() {
-            return Err(MountError::UnmountFailed(reports.join("; ")));
-        }
+        self.finish_session(false)?;
         tracing::info!(mountpoint = %self.mountpoint.display(), "FUSE unmount successful");
         Ok(())
     }
 
     fn force_unmount(mut self: Box<Self>) -> Result<(), MountError> {
         tracing::info!(mountpoint = %self.mountpoint.display(), "Force unmounting FUSE filesystem");
-        if let Some(session) = self.session.take() {
-            // First, force unmount using OS tools to release any busy handles
-            self.force_unmount_impl();
-
-            // Brief pause to let the force unmount take effect
-            std::thread::sleep(Duration::from_millis(100));
-
-            // Now join the session (should complete quickly after force unmount).
-            // The volume is already gone, so a failure here is expected and not fatal.
-            if let Err(e) = session.umount_and_join() {
-                tracing::debug!(error = %e, "Session join after force unmount reported an error");
-            }
-        }
-        let reports = self.close_reports.lock();
-        if !reports.is_empty() {
-            return Err(MountError::UnmountFailed(reports.join("; ")));
-        }
+        self.finish_session(true)?;
         tracing::info!(mountpoint = %self.mountpoint.display(), "FUSE force unmount successful");
         Ok(())
     }
 }
 
-/// Timeout for graceful session.join() before forcing unmount.
-/// Thread may leak on timeout, but this is acceptable vs blocking forever.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Transfer a resource with a potentially blocking destructor to a bounded
+/// worker. If no worker can be started, retaining the resource until process
+/// exit is preferable to running that destructor on the caller's thread. The
+/// returned error leaves the mount registered for explicit recovery.
+fn cleanup_owned<T, F>(
+    pool: &oxcrypt_mount::BoundedFsPool,
+    timeout: Duration,
+    resource: T,
+    cleanup: F,
+) -> std::io::Result<()>
+where
+    T: Send + 'static,
+    F: FnOnce(T) -> std::io::Result<()> + Send + 'static,
+{
+    let resource = std::mem::ManuallyDrop::new(resource);
+    pool.run_with_timeout(timeout, move || {
+        cleanup(std::mem::ManuallyDrop::into_inner(resource))
+    })
+}
 
 impl Drop for FuseMountHandle {
     fn drop(&mut self) {
-        // Ensure session is dropped even if unmount() wasn't called
-        if let Some(session) = self.session.take() {
-            tracing::debug!(
-                "Unmounting FUSE filesystem at {}",
-                self.mountpoint.display()
-            );
-
-            // Spawn thread for potentially blocking join() so we can timeout
-            let (tx, rx) = mpsc::channel();
-            let mountpoint_for_log = self.mountpoint.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = session.umount_and_join() {
-                    tracing::debug!(error = %e, "Background unmount reported an error");
-                }
-                let _ = tx.send(());
-            });
-
-            // Wait for graceful unmount with timeout
-            match rx.recv_timeout(JOIN_TIMEOUT) {
-                Ok(()) => {
-                    tracing::debug!(
-                        "Graceful unmount completed for {}",
-                        self.mountpoint.display()
-                    );
-                }
-                Err(_) => {
-                    // Timeout - force unmount to unblock the join thread
-                    tracing::warn!(
-                        "session unmount timed out after {:?} for {}, forcing unmount",
-                        JOIN_TIMEOUT,
-                        mountpoint_for_log.display()
-                    );
-                    self.force_unmount_impl();
-                    // Note: join thread will eventually complete or leak,
-                    // which is acceptable vs blocking the entire program
-                }
-            }
+        if self.session.is_some()
+            && let Err(error) = self.finish_session(false)
+        {
+            tracing::error!(mountpoint = %self.mountpoint.display(), %error, "FUSE cleanup incomplete; mount may require manual recovery");
         }
+    }
+}
+
+/// Probe only through bounded filesystem calls: a path may be below a ghost
+/// mount even when it is not itself listed in the system mount table.
+fn prepare_mountpoint(path: &Path) -> std::io::Result<()> {
+    let fs = oxcrypt_mount::TimeoutFs::default();
+    match fs.metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("Mountpoint is not a directory: {}", path.display()),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs.create_dir_all(path),
+        Err(error) => Err(error),
     }
 }
 
@@ -317,26 +299,11 @@ impl FuseBackend {
         let mut config = fuser::Config::default();
         config.mount_options = options.to_vec();
 
-        let (tx, rx) = mpsc::channel();
-
-        // Spawn the mount in a separate thread so we can timeout
-        std::thread::spawn(move || {
-            let result = fuser::spawn_mount(fs, &mountpoint, &config);
-            let _ = tx.send(result);
-        });
-
-        // Wait for mount with timeout
-        match rx.recv_timeout(self.mount_timeout) {
-            Ok(Ok(session)) => Ok(session),
-            Ok(Err(e)) => Err(MountError::Mount(e)),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(MountError::Mount(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Mount operation timed out - the mountpoint may be on a stale FUSE mount",
-            ))),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(MountError::Mount(
-                std::io::Error::other("Mount thread terminated unexpectedly"),
-            )),
-        }
+        oxcrypt_mount::bounded_pool::BOUNDED_FS_POOL
+            .run_with_timeout(self.mount_timeout, move || {
+                fuser::spawn_mount(fs, &mountpoint, &config)
+            })
+            .map_err(MountError::Mount)
     }
 }
 
@@ -429,9 +396,7 @@ impl MountBackend for FuseBackend {
         }
 
         // Create mount point directory if it doesn't exist
-        if !actual_mountpoint.exists() {
-            std::fs::create_dir_all(&actual_mountpoint)?;
-        }
+        prepare_mountpoint(&actual_mountpoint)?;
 
         // Create the CryptomatorFS filesystem
         let fs = CryptomatorFS::new(vault_path, password)
@@ -481,7 +446,19 @@ impl MountBackend for FuseBackend {
         }
 
         // Wait for mount to become ready (also with timeout protection)
-        self.wait_for_mount(&actual_mountpoint)?;
+        if let Err(error) = self.wait_for_mount(&actual_mountpoint) {
+            if let Err(cleanup_error) = cleanup_owned(
+                &oxcrypt_mount::bounded_pool::BOUNDED_FS_POOL,
+                JOIN_TIMEOUT,
+                session,
+                BackgroundSession::umount_and_join,
+            ) {
+                return Err(MountError::UnmountFailed(format!(
+                    "{error}; mount readiness cleanup failed: {cleanup_error}"
+                )));
+            }
+            return Err(error);
+        }
 
         tracing::info!(
             mountpoint = %actual_mountpoint.display(),
@@ -535,9 +512,7 @@ impl MountBackend for FuseBackend {
         }
 
         // Create mount point directory if it doesn't exist
-        if !actual_mountpoint.exists() {
-            std::fs::create_dir_all(&actual_mountpoint)?;
-        }
+        prepare_mountpoint(&actual_mountpoint)?;
 
         // Convert MountOptions to MountConfig
         let mut config = if options.local_mode {
@@ -605,7 +580,19 @@ impl MountBackend for FuseBackend {
         }
 
         // Wait for mount to become ready (also with timeout protection)
-        self.wait_for_mount(&actual_mountpoint)?;
+        if let Err(error) = self.wait_for_mount(&actual_mountpoint) {
+            if let Err(cleanup_error) = cleanup_owned(
+                &oxcrypt_mount::bounded_pool::BOUNDED_FS_POOL,
+                JOIN_TIMEOUT,
+                session,
+                BackgroundSession::umount_and_join,
+            ) {
+                return Err(MountError::UnmountFailed(format!(
+                    "{error}; mount readiness cleanup failed: {cleanup_error}"
+                )));
+            }
+            return Err(error);
+        }
 
         tracing::info!(
             mountpoint = %actual_mountpoint.display(),
@@ -659,5 +646,64 @@ mod tests {
             FuseBackend::with_timeouts(Duration::from_secs(5), Duration::from_millis(100));
         assert_eq!(backend.mount_timeout, Duration::from_secs(5));
         assert_eq!(backend.poll_interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn session_cleanup_propagates_errors_and_bounds_a_stalled_worker() {
+        let pool = oxcrypt_mount::BoundedFsPool::new(1);
+        let error = cleanup_owned(&pool, Duration::from_secs(1), (), |()| {
+            Err(std::io::Error::other("session error"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "session error");
+        let (release, wait) = mpsc::channel();
+        let started = Instant::now();
+        let error = cleanup_owned(&pool, Duration::from_millis(20), (), move |()| {
+            wait.recv().unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(pool.blocked_count(), 1);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pool.blocked_count() != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(pool.blocked_count(), 0);
+    }
+
+    #[test]
+    fn rejected_cleanup_never_runs_a_blocking_destructor_on_the_caller() {
+        struct MustNotDrop;
+        impl Drop for MustNotDrop {
+            fn drop(&mut self) {
+                panic!("resource destructor ran on rejected cleanup");
+            }
+        }
+        let pool = oxcrypt_mount::BoundedFsPool::new(0);
+        let error =
+            cleanup_owned(&pool, Duration::from_millis(20), MustNotDrop, |_| Ok(())).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
+    }
+
+    #[test]
+    fn mountpoint_preflight_creates_missing_directories_and_rejects_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("new/mount");
+        prepare_mountpoint(&directory).unwrap();
+        assert!(directory.is_dir());
+        prepare_mountpoint(&directory).unwrap();
+        let file = temporary.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert_eq!(
+            prepare_mountpoint(&file).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert_eq!(
+            prepare_mountpoint(&file.join("child")).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
     }
 }

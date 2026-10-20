@@ -124,18 +124,7 @@ pub fn is_path_mounted(path: &Path) -> Option<SystemMount> {
 /// `Some(mountpoint)` if the path is under a FUSE mount, `None` otherwise.
 pub fn is_under_fuse_mount(path: &Path) -> Option<PathBuf> {
     let system_mounts = get_system_mounts_detailed().ok()?;
-    let normalized = normalize_mount_path(path);
-    let path_str = normalized.to_string_lossy();
-
-    for mount in system_mounts {
-        if crate::mount_markers::is_fuse_fstype(&mount.fstype) {
-            let mount_str = mount.mountpoint.to_string_lossy();
-            if path_str.starts_with(mount_str.as_ref()) {
-                return Some(mount.mountpoint);
-            }
-        }
-    }
-    None
+    enclosing_fuse_mount(path, &system_mounts)
 }
 
 // ============================================================================
@@ -248,69 +237,22 @@ pub fn check_mountpoint_status(path: &Path, timeout: Duration) -> MountPointStat
     }
 }
 
-/// Check if a path is likely on a FUSE filesystem by parsing mount table.
-///
-/// This is a non-blocking check that reads system mount information.
-#[cfg(target_os = "macos")]
+/// Find the enclosing FUSE mount without probing the mounted filesystem.
+/// Mount-table queries use the shared timeout-protected implementation.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn is_on_fuse_mount(path: &Path) -> Option<PathBuf> {
-    use std::process::Command;
-
-    // Get mount table
-    let output = Command::new("mount").output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    let path_str = path.to_string_lossy();
-
-    // Look for FUSE mounts that are parents of our path
-    for line in stdout.lines() {
-        // macOS mount output: /dev/xxx on /path (type, options)
-        // macFUSE: mount_macfuse@xxx on /path (macfuse, options)
-        if line.contains("macfuse") || line.contains("osxfuse") || line.contains("fuse") {
-            // Extract mount point (between "on " and " (")
-            if let Some(start) = line.find(" on ") {
-                let rest = &line[start + 4..];
-                if let Some(end) = rest.find(" (") {
-                    let mount_point = &rest[..end];
-                    // Check if our path is under this mount point
-                    if path_str.starts_with(mount_point) || path_str == mount_point {
-                        return Some(PathBuf::from(mount_point));
-                    }
-                }
-            }
-        }
-    }
-
-    None
+    let mounts = get_system_mounts_detailed().ok()?;
+    enclosing_fuse_mount(path, &mounts)
 }
 
-/// Check if a path is likely on a FUSE filesystem by parsing mount table.
-#[cfg(target_os = "linux")]
-pub fn is_on_fuse_mount(path: &Path) -> Option<PathBuf> {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let path_str = path.to_string_lossy();
-
-    // Read /proc/mounts
-    let file = File::open("/proc/mounts").ok()?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines().map_while(Result::ok) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 {
-            let mount_point = parts[1];
-            let fs_type = parts[2];
-
-            // Check for FUSE filesystem types
-            if (fs_type.starts_with("fuse") || fs_type == "fuseblk")
-                && (path_str.starts_with(mount_point) || path_str == mount_point)
-            {
-                return Some(PathBuf::from(mount_point));
-            }
-        }
-    }
-
-    None
+fn enclosing_fuse_mount(path: &Path, mounts: &[SystemMount]) -> Option<PathBuf> {
+    let path = normalize_mount_path(path);
+    mounts
+        .iter()
+        .filter(|mount| path.starts_with(normalize_mount_path(&mount.mountpoint)))
+        .max_by_key(|mount| normalize_mount_path(&mount.mountpoint).components().count())
+        .filter(|mount| crate::mount_markers::is_fuse_fstype(&mount.fstype))
+        .map(|mount| mount.mountpoint.clone())
 }
 
 /// Stub for unsupported platforms
@@ -346,12 +288,20 @@ pub fn is_on_fuse_mount(_path: &Path) -> Option<PathBuf> {
 ///
 /// The first path that is not already a mount point, or an error if none found.
 pub fn find_available_mountpoint(base_path: &Path) -> Result<PathBuf, MountPointError> {
+    let mounts = get_system_mounts_detailed()
+        .map_err(|error| MountPointError::MountTableQueryFailed(error.to_string()))?;
+    let is_mounted = |path: &Path| {
+        let path = normalize_mount_path(path);
+        mounts
+            .iter()
+            .any(|mount| normalize_mount_path(&mount.mountpoint) == path)
+    };
     // Check if parent is under a FUSE mount (potential ghost mount issue)
     // This is informational only - we can't know if it's stale without probing
     if let Some(parent) = base_path.parent()
         && !parent.as_os_str().is_empty()
         && parent != Path::new("/")
-        && let Some(fuse_mount) = is_under_fuse_mount(parent)
+        && let Some(fuse_mount) = enclosing_fuse_mount(parent, &mounts)
     {
         tracing::debug!(
             "Parent {} is under FUSE mount {}",
@@ -362,7 +312,7 @@ pub fn find_available_mountpoint(base_path: &Path) -> Result<PathBuf, MountPoint
     }
 
     // Try the base path first
-    if is_path_mounted(base_path).is_none() {
+    if !is_mounted(base_path) {
         // Not a mount point - available
         return Ok(base_path.to_path_buf());
     }
@@ -377,7 +327,7 @@ pub fn find_available_mountpoint(base_path: &Path) -> Result<PathBuf, MountPoint
     for suffix in 2..=MAX_SUFFIX {
         let suffixed_path = PathBuf::from(format!("{base_str}-{suffix}"));
 
-        if is_path_mounted(&suffixed_path).is_none() {
+        if !is_mounted(&suffixed_path) {
             tracing::info!("Using alternative mount point: {}", suffixed_path.display());
             return Ok(suffixed_path);
         }
@@ -392,6 +342,9 @@ pub fn find_available_mountpoint(base_path: &Path) -> Result<PathBuf, MountPoint
 /// Errors that can occur when finding a mount point.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum MountPointError {
+    /// Mount availability cannot be established when the mount table is unavailable.
+    #[error("Could not inspect system mounts: {0}")]
+    MountTableQueryFailed(String),
     /// Could not find any available mount point path
     #[error(
         "Could not find available mount point. Tried {} through {}-{}",
@@ -409,7 +362,45 @@ pub enum MountPointError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn enclosing_mount_uses_path_components_and_the_closest_parent() {
+        use crate::mount_markers::SystemMount;
+        let mut mounts: Vec<_> = ["/mnt/vault", "/mnt/vault/nested"]
+            .into_iter()
+            .map(|path| SystemMount {
+                mountpoint: std::path::PathBuf::from(path),
+                fstype: "fuse".into(),
+                fsname: "test".into(),
+            })
+            .collect();
+        assert_eq!(
+            crate::mount_utils::enclosing_fuse_mount(
+                std::path::Path::new("/mnt/vault/nested/file"),
+                &mounts
+            ),
+            Some(std::path::PathBuf::from("/mnt/vault/nested"))
+        );
+        assert!(
+            crate::mount_utils::enclosing_fuse_mount(
+                std::path::Path::new("/mnt/vault-other/file"),
+                &mounts
+            )
+            .is_none()
+        );
+        mounts[1].fstype = "apfs".into();
+        assert!(enclosing_fuse_mount(Path::new("/mnt/vault/nested/file"), &mounts).is_none());
+        #[cfg(target_os = "macos")]
+        {
+            mounts[0].mountpoint = PathBuf::from("/private/tmp/vault");
+            assert_eq!(
+                enclosing_fuse_mount(Path::new("/tmp/vault/file"), &mounts),
+                Some(mounts[0].mountpoint.clone())
+            );
+        }
+    }
+
+    use crate::mount_utils::*;
     use std::fs;
     use tempfile::TempDir;
 
